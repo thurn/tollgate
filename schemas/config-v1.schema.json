@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tollgate.dev/schema/config-v1.json",
+  "title": "Tollgate repository configuration v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version"],
+  "properties": {
+    "version": { "const": 1 },
+    "runner": { "$ref": "#/$defs/argv" },
+    "allow_no_job": { "type": "boolean", "default": false },
+    "allow_concurrent_roots": { "type": "boolean", "default": false },
+    "resources": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "max_buildsets": { "type": "integer", "minimum": 1, "maximum": 64, "default": 4 },
+        "cpu_tokens": { "type": "integer", "minimum": 0, "default": 0 },
+        "memory_bytes": { "type": "integer", "minimum": 0, "default": 0 },
+        "repository_concurrency": { "type": "integer", "minimum": 1, "maximum": 64, "default": 2 },
+        "scheduler_weight": { "type": "integer", "minimum": 1, "maximum": 100, "default": 1 },
+        "volume_warning_bytes": { "type": "integer", "exclusiveMinimum": 1073741824, "default": 16106127360 },
+        "volume_critical_bytes": { "type": "integer", "minimum": 1073741824, "default": 10737418240 },
+        "volume_emergency_bytes": { "type": "integer", "minimum": 1, "default": 536870912 }
+      }
+    },
+    "remote": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean", "default": false },
+        "name": { "type": "string", "minLength": 1, "default": "origin" },
+        "branch": { "type": "string", "minLength": 1, "default": "master" }
+      }
+    },
+    "cache": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "epoch": { "type": "integer", "minimum": 0, "default": 0 },
+        "paths": { "type": "array", "items": { "$ref": "#/$defs/cachePath" } }
+      }
+    },
+    "step": { "type": "array", "maxItems": 100, "items": { "$ref": "#/$defs/step" } }
+  },
+  "allOf": [
+    {
+      "if": {
+        "anyOf": [
+          { "not": { "required": ["step"] } },
+          { "properties": { "step": { "maxItems": 0 } }, "required": ["step"] }
+        ]
+      },
+      "then": {
+        "properties": { "allow_no_job": { "const": true } },
+        "required": ["allow_no_job"]
+      }
+    }
+  ],
+  "$defs": {
+    "name": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" },
+    "argv": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+    "relativePath": { "type": "string", "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$" },
+    "cachePath": {
+      "type": "object", "additionalProperties": false, "required": ["path"],
+      "properties": { "path": { "$ref": "#/$defs/relativePath" }, "policy": { "enum": ["preserve", "clone", "shared", "discard", "sensitive"], "default": "clone" } }
+    },
+    "artifact": {
+      "type": "object", "additionalProperties": false, "required": ["name", "patterns"],
+      "properties": { "name": { "$ref": "#/$defs/name" }, "patterns": { "type": "array", "minItems": 1, "items": { "type": "string" } }, "required": { "type": "boolean", "default": false }, "retention_days": { "type": "integer", "minimum": 1, "default": 30 } }
+    },
+    "step": {
+      "type": "object", "additionalProperties": false, "required": ["name"],
+      "oneOf": [{ "required": ["run"], "not": { "required": ["argv"] } }, { "required": ["argv"], "not": { "required": ["run"] } }],
+      "properties": {
+        "name": { "$ref": "#/$defs/name" }, "run": { "type": "string", "minLength": 1 }, "argv": { "$ref": "#/$defs/argv" },
+        "working_directory": { "$ref": "#/$defs/relativePath" }, "needs": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/name" } },
+        "soft_needs": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/name" } }, "timeout": { "type": "string", "pattern": "^[0-9]+[smhd]$", "default": "60m" },
+        "voting": { "type": "boolean", "default": true }, "final": { "type": "boolean", "default": false }, "cpu_tokens": { "type": "integer", "minimum": 0, "default": 0 },
+        "memory_bytes": { "type": "integer", "minimum": 0, "default": 0 }, "rss_limit_bytes": { "type": "integer", "minimum": 1048576 },
+        "semaphores": { "type": "array", "uniqueItems": true, "default": [], "items": { "$ref": "#/$defs/name" } },
+        "include": { "type": "array", "items": { "type": "string" } }, "exclude": { "type": "array", "items": { "type": "string" } },
+        "environment": { "type": "object", "additionalProperties": { "type": "string" }, "propertyNames": { "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" } },
+        "remove_environment": { "type": "array", "uniqueItems": true, "items": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" } },
+        "artifact": { "type": "array", "items": { "$ref": "#/$defs/artifact" } }
+      }
+    }
+  }
+}

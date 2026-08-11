@@ -1,0 +1,19 @@
+[package]
+name = "tollgate-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+blake3.workspace = true
+rusqlite.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tollgate-domain = { path = "../tollgate-domain" }
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

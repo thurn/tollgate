@@ -1,0 +1,19 @@
+[package]
+name = "tg"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+directories.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tollgate-domain = { path = "../../crates/tollgate-domain" }
+tollgate-ipc = { path = "../../crates/tollgate-ipc" }
+tollgate-service = { path = "../../crates/tollgate-service" }
+uuid.workspace = true

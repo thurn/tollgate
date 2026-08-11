@@ -1,0 +1,28 @@
+[package]
+name = "tollgate-runner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+base64 = "0.22"
+blake3.workspace = true
+bytes.workspace = true
+futures.workspace = true
+globset.workspace = true
+libc.workspace = true
+nix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tollgate-config = { path = "../tollgate-config" }
+tollgate-domain = { path = "../tollgate-domain" }
+tollgate-scheduler = { path = "../tollgate-scheduler" }
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

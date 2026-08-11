@@ -1,0 +1,18 @@
+[package]
+name = "tollgate-git"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+blake3.workspace = true
+hex.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tollgate-domain = { path = "../tollgate-domain" }
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

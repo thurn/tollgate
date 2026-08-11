@@ -1,0 +1,13 @@
+[package]
+name = "tollgate-scheduler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+parking_lot.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tollgate-domain = { path = "../tollgate-domain" }

@@ -1,0 +1,56 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/tollgate-domain",
+  "crates/tollgate-config",
+  "crates/tollgate-git",
+  "crates/tollgate-store",
+  "crates/tollgate-runner",
+  "crates/tollgate-scheduler",
+  "crates/tollgate-service",
+  "crates/tollgate-ipc",
+  "apps/tg",
+  "apps/tollgate-worker",
+  "src-tauri",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["Tollgate contributors"]
+repository = "https://github.com/tollgate-dev/tollgate"
+
+[workspace.dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+blake3 = "1.8"
+bytes = { version = "1.10", features = ["serde"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+directories = "6.0"
+futures = "0.3"
+globset = "0.4"
+hex = "0.4"
+libc = "0.2"
+nix = { version = "0.30", features = ["fs", "process", "signal", "socket", "user"] }
+parking_lot = "0.12"
+proptest = "1.7"
+rand = "0.9"
+rusqlite = { version = "0.40.0", features = ["bundled", "backup", "uuid", "time"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+tempfile = "3.20"
+thiserror = "2.0"
+time = { version = "0.3", features = ["serde", "formatting", "macros"] }
+tokio = { version = "1.47", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec", "rt"] }
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1.18", features = ["v7", "serde"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

@@ -1,0 +1,48 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Tollgate",
+  "version": "0.1.0",
+  "identifier": "dev.tollgate.desktop",
+  "build": {
+    "beforeDevCommand": "./scripts/prepare-sidecar.sh debug && npm --prefix ui run dev",
+    "devUrl": "http://127.0.0.1:1420",
+    "beforeBuildCommand": "./scripts/prepare-sidecar.sh release && npm --prefix ui run build",
+    "frontendDist": "../ui/dist"
+  },
+  "app": {
+    "macOSPrivateApi": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "Tollgate",
+        "width": 1440,
+        "height": 920,
+        "minWidth": 840,
+        "minHeight": 620,
+        "center": true,
+        "decorations": true,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "trafficLightPosition": { "x": 17, "y": 18 },
+        "backgroundColor": "#10161f",
+        "visible": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost; img-src 'self' asset: http://asset.localhost data:; style-src 'self' 'unsafe-inline'; font-src 'self' data:"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "icon": ["icons/icon.icns"],
+    "externalBin": ["binaries/tollgate-worker", "binaries/tg"],
+    "targets": ["app", "dmg"],
+    "category": "DeveloperTool",
+    "shortDescription": "Local dependent gate and continuous integration",
+    "longDescription": "Tollgate validates exact speculative Git prefixes locally and promotes only certified commits.",
+    "macOS": {
+      "minimumSystemVersion": "26.0",
+      "hardenedRuntime": true
+    }
+  }
+}

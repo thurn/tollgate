@@ -1,0 +1,20 @@
+[package]
+name = "tollgate-ipc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bytes.workspace = true
+futures.workspace = true
+nix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tollgate-domain = { path = "../tollgate-domain" }
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

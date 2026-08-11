@@ -1,0 +1,30 @@
+[package]
+name = "tollgate-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "tollgate_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[dependencies]
+directories.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tauri = { version = "2", features = ["macos-private-api"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-notification = "2"
+tauri-plugin-opener = "2"
+tauri-plugin-single-instance = "2"
+tauri-plugin-window-state = "2"
+tokio.workspace = true
+tokio-util.workspace = true
+tollgate-domain = { path = "../crates/tollgate-domain" }
+tollgate-ipc = { path = "../crates/tollgate-ipc" }
+tollgate-service = { path = "../crates/tollgate-service" }
+uuid.workspace = true
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
