@@ -477,7 +477,7 @@ The buildset transition table is:
 | `preparing` | durable worker start handshake completes | `running` |
 | `pending` or `preparing` | canceled before user command starts | `canceled` |
 | `preparing` or `running` | structural generation invalidation | `invalidated` |
-| `preparing` or `running` | app quit/crash, supervisor relationship loss, or retriable setup failure below its retry limit | `interrupted` |
+| `preparing` or `running` | app quit/crash, supervisor relationship loss, externally delivered HUP/INT/KILL/TERM (including a shell's conventional `128 + signal` status), or retriable setup failure below its retry limit | `interrupted` |
 | `preparing` or `running` | infrastructure failure consumes the final allowed attempt | `infrastructure-exhausted` |
 | `running` | all applicable voting steps and final verification succeed, no warnings | `passed` |
 | `running` | all applicable voting steps and final verification succeed, non-voting failure exists | `passed-with-warnings` |
@@ -749,7 +749,8 @@ Commands that deliberately daemonize, create a new session, or otherwise escape 
 | Result | Queue meaning |
 | --- | --- |
 | Exit 0 | Provisional step success; certificate eligibility still requires all applicable voting steps, finalizers, artifacts, log completion, and the buildset-level final clean check. |
-| Nonzero exit | Conclusive validation failure; no automatic retry. |
+| Ordinary nonzero exit | Conclusive validation failure; no automatic retry. |
+| External HUP/INT/KILL/TERM, including a shell's conventional `128 + signal` exit | Interrupted infrastructure attempt; whole-buildset retry. |
 | Timeout | Conclusive validation failure; no automatic retry. |
 | Configured hard RSS violation | Conclusive validation failure. |
 | Final checkout discrepancy | Conclusive `workspace-dirty` buildset failure even when every command exited zero. |

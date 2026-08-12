@@ -7264,16 +7264,17 @@ impl TollgateService {
             None
         };
         let finalization_guard = runtime.mutation.lock().await;
-        let generation_is_current = {
+        let current_item = {
             let data = runtime.data.lock();
             data.items
                 .iter()
                 .find(|candidate| candidate.id == item_id)
-                .is_some_and(|candidate| {
-                    candidate.current_generation_id == Some(generation.id)
-                        && candidate.state == QueueItemState::Running
-                })
+                .cloned()
         };
+        let generation_is_current = current_item.as_ref().is_some_and(|candidate| {
+            candidate.current_generation_id == Some(generation.id)
+                && candidate.state == QueueItemState::Running
+        });
         if !generation_is_current {
             buildset.state = BuildsetState::Invalidated;
             runtime.store.update_buildset(&buildset)?;
@@ -7292,6 +7293,7 @@ impl TollgateService {
             }
             return Ok(());
         }
+        item = current_item.ok_or(ServiceError::ItemNotFound(item_id))?;
         if item.kind == QueueItemKind::IndependentCheck {
             let bootstrap = item.metadata.purpose.as_deref() == Some("bootstrap");
             let bootstrap_passed = bootstrap && outcome.passed;
@@ -12309,6 +12311,155 @@ policy = "clone"
                 .count(),
             2
         );
+    }
+
+    #[tokio::test]
+    async fn authorization_granted_while_running_survives_worker_completion() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        let candidate_worktree = temporary.path().join("candidate");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", "master"]);
+        std::fs::write(repository.join("base.txt"), "base\n").unwrap();
+        git(&repository, &["add", "base.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "candidate",
+                candidate_worktree.to_str().unwrap(),
+                "master",
+            ],
+        );
+        std::fs::write(candidate_worktree.join("candidate.txt"), "candidate\n").unwrap();
+        git(&candidate_worktree, &["add", "candidate.txt"]);
+        git(&candidate_worktree, &["commit", "-m", "candidate"]);
+
+        let service = TollgateService::open(temporary.path().join("support"))
+            .await
+            .unwrap();
+        let initialized = service
+            .initialize_repository(&repository, Some("sleep 2; false".into()))
+            .await
+            .unwrap();
+        let candidate = service
+            .submit_candidate_from(
+                initialized.state.id,
+                "HEAD".into(),
+                Some(candidate_worktree.to_string_lossy().into_owned()),
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let revision = loop {
+            let snapshot = service
+                .repository_snapshot(initialized.state.id)
+                .await
+                .unwrap();
+            let view = snapshot
+                .queue
+                .iter()
+                .find(|view| view.item.id == candidate.item_id)
+                .unwrap();
+            if view.item.state == QueueItemState::Running {
+                break snapshot.state.queue_revision;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        };
+
+        let authorization_command = CommandId::new();
+        service
+            .authorize_candidate(
+                initialized.state.id,
+                candidate.item_id,
+                revision,
+                authorization_command,
+            )
+            .await
+            .unwrap();
+
+        loop {
+            let snapshot = service
+                .repository_snapshot(initialized.state.id)
+                .await
+                .unwrap();
+            let view = snapshot
+                .history_items
+                .iter()
+                .find(|view| view.item.id == candidate.item_id);
+            if let Some(view) = view {
+                assert_eq!(view.item.state, QueueItemState::Failed);
+                assert!(view.item.promotion_authorized);
+                assert_eq!(
+                    view.item.promotion_authorized_by,
+                    Some(authorization_command)
+                );
+                assert!(view.item.promotion_authorized_at.is_some());
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_wrapped_termination_retries_the_authorized_candidate() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        let marker = temporary.path().join("interrupted-once");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", "master"]);
+        std::fs::write(repository.join("base.txt"), "base\n").unwrap();
+        git(&repository, &["add", "base.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+        git(&repository, &["switch", "-c", "feature"]);
+        std::fs::write(repository.join("feature.txt"), "feature\n").unwrap();
+        git(&repository, &["add", "feature.txt"]);
+        git(&repository, &["commit", "-m", "feature"]);
+        let command = format!(
+            "if test -f '{}'; then true; else touch '{}'; exit 143; fi",
+            marker.display(),
+            marker.display()
+        );
+
+        let service = TollgateService::open(temporary.path().join("support"))
+            .await
+            .unwrap();
+        let initialized = service
+            .initialize_repository_with_options(&repository, Some(command), false)
+            .await
+            .unwrap();
+        let approved = service
+            .approve(initialized.state.id, "feature".into(), CommandId::new())
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let snapshot = service
+                .repository_snapshot(initialized.state.id)
+                .await
+                .unwrap();
+            if let Some(view) = snapshot
+                .history_items
+                .iter()
+                .find(|view| view.item.id == approved.item_id)
+            {
+                assert_eq!(view.item.state, QueueItemState::Promoted);
+                assert!(view.item.promotion_authorized);
+                assert_eq!(view.attempts.len(), 2);
+                assert_eq!(view.attempts[0].state, BuildsetState::Interrupted);
+                assert_eq!(view.attempts[1].state, BuildsetState::Passed);
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
     }
 
     #[tokio::test]

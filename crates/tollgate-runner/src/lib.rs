@@ -386,6 +386,27 @@ pub struct StepResult {
     pub log: SealedLog,
 }
 
+fn externally_terminated(
+    command: &EffectiveCommand,
+    exit_code: Option<i32>,
+    signal: Option<i32>,
+) -> bool {
+    #[cfg(unix)]
+    {
+        const EXTERNAL_CONTROL_SIGNALS: [i32; 4] = [1, 2, 9, 15];
+        signal.is_some_and(|value| EXTERNAL_CONTROL_SIGNALS.contains(&value))
+            || matches!(command, EffectiveCommand::Shell { .. })
+                && exit_code
+                    .and_then(|value| value.checked_sub(128))
+                    .is_some_and(|value| EXTERNAL_CONTROL_SIGNALS.contains(&value))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (command, exit_code, signal);
+        false
+    }
+}
+
 pub async fn run_step(
     step: &EffectiveStep,
     context: ExecutionContext,
@@ -635,6 +656,8 @@ async fn run_step_via_worker(
         StepResultClass::Canceled
     } else if exit_code == Some(0) && signal.is_none() {
         StepResultClass::Success
+    } else if externally_terminated(&step.command, exit_code, signal) {
+        StepResultClass::Interrupted
     } else {
         StepResultClass::ExitFailure
     };
@@ -797,10 +820,8 @@ async fn run_step_direct(
     let (class, exit_code, signal) = match termination {
         Termination::TimedOut => (StepResultClass::Timeout, None, None),
         Termination::Canceled => (StepResultClass::Canceled, None, None),
-        Termination::Exited(status) if status.success() => {
-            (StepResultClass::Success, status.code(), None)
-        }
         Termination::Exited(status) => {
+            let exit_code = status.code();
             #[cfg(unix)]
             let signal = {
                 use std::os::unix::process::ExitStatusExt;
@@ -808,7 +829,14 @@ async fn run_step_direct(
             };
             #[cfg(not(unix))]
             let signal = None;
-            (StepResultClass::ExitFailure, status.code(), signal)
+            let class = if status.success() {
+                StepResultClass::Success
+            } else if externally_terminated(&step.command, exit_code, signal) {
+                StepResultClass::Interrupted
+            } else {
+                StepResultClass::ExitFailure
+            };
+            (class, exit_code, signal)
         }
     };
     Ok(StepResult {
@@ -1005,6 +1033,12 @@ pub async fn run_buildset_scheduled(
                 };
                 let name = step.name.clone();
                 let result = run_step(step, context, cancellation).await?;
+                if result.class == StepResultClass::Interrupted {
+                    return Err(RunnerError::Interrupted(format!(
+                        "step `{name}` was externally terminated (exit {:?}, signal {:?})",
+                        result.exit_code, result.signal
+                    )));
+                }
                 Ok::<_, RunnerError>((name, result))
             }
         });
@@ -1331,6 +1365,20 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.class, StepResultClass::Timeout);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_wrapped_external_control_signals_are_interruptions() {
+        let config =
+            EffectiveConfig::parse("version=1\n[[step]]\nname=\"ci\"\nrun=\"true\"\n").unwrap();
+        let command = &config.steps[0].command;
+
+        assert!(externally_terminated(command, Some(143), None));
+        assert!(externally_terminated(command, Some(137), None));
+        assert!(externally_terminated(command, None, Some(15)));
+        assert!(!externally_terminated(command, Some(1), None));
+        assert!(!externally_terminated(command, Some(139), None));
     }
 
     #[tokio::test]
