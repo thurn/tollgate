@@ -14,7 +14,9 @@ pub struct CommandEnvelope<T> {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RepositoryCommand {
+    SubmitCandidate { revision: String },
     Approve { revision: String },
+    AuthorizeCandidate { item_id: QueueItemId },
     Cancel { item_id: QueueItemId },
     Retry { item_id: QueueItemId, cold: bool },
     Reorder { ordered_item_ids: Vec<QueueItemId> },

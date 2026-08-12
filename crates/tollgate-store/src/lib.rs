@@ -420,7 +420,11 @@ impl RepositoryStore {
             sequence: new_sequence as u64,
             actor,
             command_id: Some(command_id),
-            kind: "queue.item-enqueued".into(),
+            kind: if command_kind == "candidate" {
+                "candidate.created".into()
+            } else {
+                "queue.item-enqueued".into()
+            },
             payload: serde_json::to_value(item)?,
             created_at: OffsetDateTime::now_utc(),
         };
@@ -504,10 +508,7 @@ impl RepositoryStore {
     pub fn replace_generation(&self, generation: &ValidationGeneration) -> Result<(), StoreError> {
         let mut connection = self.connection.lock();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute(
-            "UPDATE validation_generations SET current=0 WHERE item_id=?1 AND current=1",
-            [generation.item_id.to_string()],
-        )?;
+        invalidate_current_generation(&transaction, generation)?;
         transaction.execute(
             "INSERT INTO validation_generations (generation_id, item_id, identity_digest, tested_format, tested_oid, expected_parent_format, expected_parent_oid, configuration_digest, step_graph_digest, engine_epoch, generation_json, current) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1)",
             params![generation.id.to_string(), generation.item_id.to_string(), generation.identity_digest, format!("{:?}", generation.tested_oid.format).to_lowercase(), generation.tested_oid.as_bytes(), format!("{:?}", generation.expected_parent_oid.format).to_lowercase(), generation.expected_parent_oid.as_bytes(), generation.configuration_digest, generation.step_graph_digest, generation.engine_epoch as i64, encode(generation)?],
@@ -546,6 +547,64 @@ impl RepositoryStore {
         Ok(event)
     }
 
+    pub fn authorize_candidate(
+        &self,
+        state: &RepositoryState,
+        item: &QueueItem,
+        expected_revision: u64,
+        command_id: CommandId,
+        request_digest: &str,
+        response: &impl Serialize,
+    ) -> Result<DomainEvent, StoreError> {
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (revision, sequence): (i64, i64) = transaction.query_row(
+            "SELECT queue_revision, event_sequence FROM repository_state WHERE repository_id=?1",
+            [state.id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if revision as u64 != expected_revision {
+            return Err(StoreError::Integrity(format!(
+                "candidate authorization revision changed from {expected_revision} to {revision}"
+            )));
+        }
+        let new_revision = revision + 1;
+        let new_sequence = sequence + 1;
+        let changed = transaction.execute(
+            "UPDATE queue_items SET item_json=?2 WHERE item_id=?1 AND active=1",
+            params![item.id.to_string(), encode(item)?],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::Integrity(
+                "candidate authorization did not update exactly one active item".into(),
+            ));
+        }
+        let mut persisted_state = state.clone();
+        persisted_state.queue_revision = new_revision as u64;
+        persisted_state.event_sequence = new_sequence as u64;
+        transaction.execute(
+            "UPDATE repository_state SET state_json=?2, queue_revision=?3, event_sequence=?4, updated_at=?5 WHERE repository_id=?1",
+            params![state.id.to_string(), encode(&persisted_state)?, new_revision, new_sequence, now()],
+        )?;
+        let event = DomainEvent {
+            id: EventId::new(),
+            repository_id: state.id,
+            sequence: new_sequence as u64,
+            actor: Actor::Cli,
+            command_id: Some(command_id),
+            kind: "candidate.promotion-authorized".into(),
+            payload: serde_json::to_value(response)?,
+            created_at: OffsetDateTime::now_utc(),
+        };
+        insert_event(&transaction, &event)?;
+        transaction.execute(
+            "INSERT INTO command_results (command_id, command_kind, request_digest, response_json, event_sequence, created_at) VALUES (?1, 'candidate-authorize', ?2, ?3, ?4, ?5)",
+            params![command_id.to_string(), request_digest, encode(response)?, new_sequence, now()],
+        )?;
+        transaction.commit()?;
+        Ok(event)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn replace_queue_structure(
         &self,
@@ -561,10 +620,7 @@ impl RepositoryStore {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let sequence = state.event_sequence + 1;
         for generation in generations {
-            transaction.execute(
-                "UPDATE validation_generations SET current=0 WHERE item_id=?1 AND current=1",
-                [generation.item_id.to_string()],
-            )?;
+            invalidate_current_generation(&transaction, generation)?;
             transaction.execute(
                 "INSERT INTO validation_generations (generation_id, item_id, identity_digest, tested_format, tested_oid, expected_parent_format, expected_parent_oid, configuration_digest, step_graph_digest, engine_epoch, generation_json, current) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1)",
                 params![generation.id.to_string(), generation.item_id.to_string(), generation.identity_digest, format!("{:?}", generation.tested_oid.format).to_lowercase(), generation.tested_oid.as_bytes(), format!("{:?}", generation.expected_parent_oid.format).to_lowercase(), generation.expected_parent_oid.as_bytes(), generation.configuration_digest, generation.step_graph_digest, generation.engine_epoch as i64, encode(generation)?],
@@ -1724,6 +1780,28 @@ fn insert_event(
     event: &DomainEvent,
 ) -> Result<(), StoreError> {
     transaction.execute("INSERT INTO events (event_id, repository_id, sequence, actor, command_id, kind, event_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)", params![event.id.to_string(), event.repository_id.to_string(), event.sequence as i64, enum_json(&event.actor)?, event.command_id.map(|id| id.to_string()), event.kind, encode(event)?, event.created_at.unix_timestamp_nanos().to_string()])?;
+    Ok(())
+}
+
+fn invalidate_current_generation(
+    transaction: &rusqlite::Transaction<'_>,
+    replacement: &ValidationGeneration,
+) -> Result<(), StoreError> {
+    let current: Option<(String, String)> = transaction
+        .query_row(
+            "SELECT generation_id, generation_json FROM validation_generations WHERE item_id=?1 AND current=1",
+            [replacement.item_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if let Some((generation_id, encoded)) = current {
+        let mut generation: ValidationGeneration = decode(&encoded)?;
+        generation.invalidated_by = Some(replacement.id);
+        transaction.execute(
+            "UPDATE validation_generations SET current=0, generation_json=?2 WHERE generation_id=?1",
+            params![generation_id, encode(&generation)?],
+        )?;
+    }
     Ok(())
 }
 

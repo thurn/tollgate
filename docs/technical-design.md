@@ -152,9 +152,9 @@ The app may supervise several repositories concurrently using one global resourc
 
 1. The user creates or opens a feature worktree based on an appropriate `master` or queued dependency.
 2. The worktree contains one source commit. Ignored build output is allowed; staged changes, tracked modifications, and non-ignored untracked files are not.
-3. `tg approve` captures `HEAD`, validates its shape and dependencies, creates `refs/tollgate/sources/<item-id>`, durably enqueues the item, and returns its ID.
+3. `tg candidate` captures `HEAD`, validates its shape and dependencies, creates `refs/tollgate/sources/<item-id>`, durably enqueues a non-promotable item, and returns its ID. `tg approve HEAD` remains a combined submit-and-authorize convenience.
 4. The app constructs synthetic prefixes, assigns new validation generations to affected items, and schedules eligible buildsets.
-5. A passing head is promoted automatically; optional remote push forms a barrier.
+5. `tg approve <candidate-id>` durably grants promotion authority to that exact retained source. A passing authorized head is promoted automatically; an unauthorized ready head remains queued with its certificate and does not modify `master`.
 6. After local promotion, or after push succeeds when push is enabled, Tollgate automatically cleans up the source worktree and branch if all safety checks still pass.
 
 Automatic cleanup requires a non-primary linked worktree that is still at the captured source OID and has no tracked, staged, or non-ignored untracked changes. Branch deletion is an old-OID compare-and-swap. Ignored files in an eligible linked worktree are disposable by default. If any check fails, cleanup becomes `needs-attention`; promotion is never rolled back. The hidden source ref retains the commit for audit.
@@ -406,7 +406,7 @@ Each active item is instead assigned an immutable validation generation identifi
 
 Appending or changing an item after a given item does not change that earlier item's validation generation. Removing, inserting, reordering, replacing, failing, or conflicting an item changes the generations of exactly the items whose prefix inputs changed. Those items' existing buildsets become immutable invalidated history and new buildsets are created. Staleness is structural and has no age-based TTL.
 
-Successful promotion advances the queue revision and removes the promoted head from the active queue, but it does not change a surviving descendant's validation generation when the descendant's expected parent is the exact promoted OID and every other validation input remains unchanged. The descendant keeps its existing buildset and certificate. A later reconstruction may use the promoted OID as a new anchor, but it cannot transfer the old certificate to a differently identified validation generation.
+Successful promotion advances the queue revision and removes the promoted head from the active queue, but it does not change a surviving descendant's validation generation when the descendant's expected parent is the exact promoted OID and every other validation input remains unchanged. The descendant keeps its existing buildset and certificate. Candidate authorization likewise reuses a completed certificate only when it still belongs to the current immutable generation. A later reconstruction may use the promoted OID as a new anchor, but it cannot transfer the old certificate to a differently identified validation generation.
 
 Approval, cancellation/dequeue, conclusive failure, conflict, re-approval, retry enqueue, and manual reorder recompute only affected validation generations. An accepted external `master` movement, an applied configuration change, an engine-epoch change, or recovery that cannot prove inputs unchanged invalidates every affected unpromoted generation.
 

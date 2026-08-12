@@ -230,6 +230,18 @@ pub enum IpcCommand {
         worktree_path: Option<String>,
         command_id: CommandId,
     },
+    Candidate {
+        repository_id: RepositoryId,
+        revision: String,
+        worktree_path: Option<String>,
+        command_id: CommandId,
+    },
+    AuthorizeCandidate {
+        repository_id: RepositoryId,
+        item_id: QueueItemId,
+        expected_revision: u64,
+        command_id: CommandId,
+    },
     Check {
         repository_id: RepositoryId,
         revision: String,

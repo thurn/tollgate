@@ -25,7 +25,8 @@ export interface SourceMetadata {
 export interface QueueItem {
   id: string; repository_id: string; kind: QueueItemKind; enqueue_sequence: number; source_oid: GitOid; source_ref: string;
   metadata: SourceMetadata; state: QueueItemState; terminal_reason?: string; remote_state: RemoteState;
-  cleanup_state: CleanupState; dependencies: string[]; current_generation_id?: string;
+  cleanup_state: CleanupState; dependencies: string[]; promotion_authorized: boolean;
+  promotion_authorized_at?: string; promotion_authorized_by?: string; current_generation_id?: string;
   buildset_id?: string; certificate_id?: string;
 }
 export interface ValidationGeneration {

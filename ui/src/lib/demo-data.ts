@@ -14,6 +14,7 @@ function item(index: number, state: QueueItemState, subject: string, branch: str
       id, repository_id: "019fef58-aaaa-7000-8000-e6aff447a5ba", kind: "gate", enqueue_sequence: index,
       source_oid: source, source_ref: `refs/tollgate/sources/${id}`,
       metadata: { subject, message_hash: "e15bc42", author_name: index === 3 ? "Mira Chen" : "You", author_email: "dev@example.com", branch, worktree_path: `/Users/dev/worktrees/${branch}`, signature_state: "verified", approved_at: ago(32 - index * 3) },
+      promotion_authorized: true,
       state, remote_state: state === "ready" ? "ready" as const : "disabled" as const,
       cleanup_state: "not-eligible" as const, dependencies: index === 3 ? ["019fef58-7147-7273-9c03-e6aff447a5b2"] : [],
       current_generation_id: `019fef58-9000-7${index}00-8000-e6aff447a5ba`,

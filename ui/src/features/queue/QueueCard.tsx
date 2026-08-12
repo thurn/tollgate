@@ -22,9 +22,9 @@ export function QueueCard({ view, position, selected, eligible, onSelect }: { vi
       <div className="queue-card__header">
         <div className="queue-card__identity">
           <div className="queue-card__title-line"><h3><button className="queue-card__disclosure" onClick={onSelect} aria-expanded={selected} aria-controls="item-inspector">{item.metadata.subject}</button></h3>{item.dependencies.length > 0 && <Tooltip label="This change has a hard Git dependency"><span className="dependency-mark"><Network size={13} />stacked</span></Tooltip>}</div>
-          <div className="queue-card__meta"><span><GitBranch size={13} />{branch}</span><span><GitCommitHorizontal size={13} /><code>{shortId(oidHex(item.source_oid), 8)}</code></span><span>{item.metadata.author_name}</span><span>approved {formatDuration(Date.now() - new Date(item.metadata.approved_at).getTime())} ago</span></div>
+          <div className="queue-card__meta"><span><GitBranch size={13} />{branch}</span><span><GitCommitHorizontal size={13} /><code>{shortId(oidHex(item.source_oid), 8)}</code></span><span>{item.metadata.author_name}</span><span>{item.promotion_authorized ? "approved" : "submitted"} {formatDuration(Date.now() - new Date(item.metadata.approved_at).getTime())} ago</span></div>
         </div>
-        <div className="queue-card__state"><Badge tone={status.tone} dot={item.state === "running"}>{status.label}</Badge>{warning && <Badge tone="warning">warnings</Badge>}{item.remote_state === "push-blocked" && <Badge tone="danger">push blocked</Badge>}{item.cleanup_state === "needs-attention" && <Badge tone="warning">cleanup</Badge>}</div>
+        <div className="queue-card__state"><Badge tone={status.tone} dot={item.state === "running"}>{status.label}</Badge>{!item.promotion_authorized && <Badge tone="neutral">awaiting approval</Badge>}{warning && <Badge tone="warning">warnings</Badge>}{item.remote_state === "push-blocked" && <Badge tone="danger">push blocked</Badge>}{item.cleanup_state === "needs-attention" && <Badge tone="warning">cleanup</Badge>}</div>
       </div>
       <div className="prefix-strip">
         <Tooltip label={`Anchored base ${oidHex(generation?.anchored_base_oid)}`}><span><Box size={13} /><small>base</small><code>{shortId(oidHex(generation?.anchored_base_oid), 7)}</code></span></Tooltip>

@@ -32,7 +32,7 @@
     "request": {
       "type": "object", "additionalProperties": false, "required": ["command"],
       "properties": {
-        "command": { "enum": ["snapshot", "item-status", "initialize", "approve", "check", "cancel", "retry", "reorder", "pull", "push", "reconcile", "update", "worktree-create", "worktree-remove", "reset-slot", "snapshot-cache", "purge-cache", "artifact-pin", "artifact-prune", "remove-repository", "apply-configuration", "validate-configuration", "regenerate-configuration", "logs", "doctor", "pause", "resume", "reload-environment"] },
+        "command": { "enum": ["snapshot", "item-status", "initialize", "candidate", "approve", "authorize-candidate", "check", "cancel", "retry", "reorder", "pull", "push", "reconcile", "update", "worktree-create", "worktree-remove", "reset-slot", "snapshot-cache", "purge-cache", "artifact-pin", "artifact-prune", "remove-repository", "apply-configuration", "validate-configuration", "regenerate-configuration", "logs", "doctor", "pause", "resume", "reload-environment"] },
         "repository_id": { "$ref": "#/$defs/uuid" },
         "item_id": { "$ref": "#/$defs/uuid" },
         "buildset_id": { "$ref": "#/$defs/uuid" },
@@ -60,7 +60,8 @@
       "allOf": [
         { "if": { "properties": { "command": { "const": "item-status" } } }, "then": { "required": ["repository_id", "item_id"] } },
         { "if": { "properties": { "command": { "const": "initialize" } } }, "then": { "required": ["path"] } },
-        { "if": { "properties": { "command": { "enum": ["approve", "check"] } } }, "then": { "required": ["repository_id", "revision", "command_id"] } },
+        { "if": { "properties": { "command": { "enum": ["candidate", "approve", "check"] } } }, "then": { "required": ["repository_id", "revision", "command_id"] } },
+        { "if": { "properties": { "command": { "const": "authorize-candidate" } } }, "then": { "required": ["repository_id", "item_id", "expected_revision", "command_id"] } },
         { "if": { "properties": { "command": { "const": "cancel" } } }, "then": { "required": ["repository_id", "item_id", "expected_revision", "command_id"] } },
         { "if": { "properties": { "command": { "const": "retry" } } }, "then": { "required": ["repository_id", "item_id", "cold", "command_id"] } },
         { "if": { "properties": { "command": { "const": "reorder" } } }, "then": { "required": ["repository_id", "selected_ids", "expected_revision", "command_id"] } },

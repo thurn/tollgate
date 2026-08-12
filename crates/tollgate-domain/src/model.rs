@@ -2,9 +2,9 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 use crate::{
-    BuildsetId, BuildsetState, CertificateId, CleanupState, GitOid, QueueItemId, QueueItemState,
-    RemoteState, RepositoryExecutionState, RepositoryId, SlotId, StepAttemptId, StepId,
-    ValidationGenerationId,
+    BuildsetId, BuildsetState, CertificateId, CleanupState, CommandId, GitOid, QueueItemId,
+    QueueItemState, RemoteState, RepositoryExecutionState, RepositoryId, SlotId, StepAttemptId,
+    StepId, ValidationGenerationId,
 };
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -79,9 +79,21 @@ pub struct QueueItem {
     pub remote_state: RemoteState,
     pub cleanup_state: CleanupState,
     pub dependencies: Vec<QueueItemId>,
+    /// Promotion authority is deliberately separate from admission to the
+    /// speculative queue. Legacy persisted items default to authorized.
+    #[serde(default = "default_promotion_authorized")]
+    pub promotion_authorized: bool,
+    #[serde(default)]
+    pub promotion_authorized_at: Option<OffsetDateTime>,
+    #[serde(default)]
+    pub promotion_authorized_by: Option<CommandId>,
     pub current_generation_id: Option<ValidationGenerationId>,
     pub buildset_id: Option<BuildsetId>,
     pub certificate_id: Option<CertificateId>,
+}
+
+const fn default_promotion_authorized() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -234,11 +246,10 @@ pub struct PassCertificate {
 }
 
 impl PassCertificate {
-    pub fn validates(
+    pub fn validates_frozen_inputs(
         &self,
         item: &QueueItem,
         generation: &ValidationGeneration,
-        observed_master: &GitOid,
         config_digest: &str,
         step_graph_digest: &str,
         engine_epoch: u64,
@@ -250,10 +261,28 @@ impl PassCertificate {
             && self.expected_parent_oid == generation.expected_parent_oid
             && self.configuration_digest == generation.configuration_digest
             && self.step_graph_digest == generation.step_graph_digest
-            && self.expected_parent_oid == *observed_master
+            && self.engine_epoch == generation.engine_epoch
             && self.configuration_digest == config_digest
             && self.step_graph_digest == step_graph_digest
             && self.engine_epoch == engine_epoch
             && self.checkout_verified
+    }
+
+    pub fn validates(
+        &self,
+        item: &QueueItem,
+        generation: &ValidationGeneration,
+        observed_master: &GitOid,
+        config_digest: &str,
+        step_graph_digest: &str,
+        engine_epoch: u64,
+    ) -> bool {
+        self.validates_frozen_inputs(
+            item,
+            generation,
+            config_digest,
+            step_graph_digest,
+            engine_epoch,
+        ) && self.expected_parent_oid == *observed_master
     }
 }

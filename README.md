@@ -39,12 +39,21 @@ name = "ci"
 run = "./ci"
 ```
 
-`master` must not be checked out in a developer-visible worktree while its gate is active. Initialization never changes that checkout silently: `--detach-master` explicitly detaches a clean primary worktree at the identical commit, or you can switch it to a feature branch yourself. Create a clean, single-commit feature worktree, then use `tg approve` or the matching app action.
+`master` must not be checked out in a developer-visible worktree while its gate is active. Initialization never changes that checkout silently: `--detach-master` explicitly detaches a clean primary worktree at the identical commit, or you can switch it to a feature branch yourself.
+
+An agent can submit a clean commit for speculative validation without permission to promote it:
+
+```sh
+tg candidate HEAD --wait
+tg status <candidate-id>
+```
+
+`--wait` returns when validation has produced promotion-grade evidence (or a conclusive failure), while `master` remains unchanged. A user later grants authority to the exact retained candidate with `tg approve <candidate-id>`; `tg cancel <candidate-id>` cancels it. For the original one-phase user workflow, `tg approve HEAD` still submits and authorizes in one command.
 
 ## Safety model
 
 - CI runs in detached worktrees belonging to a disposable execution mirror.
-- Approval retains the immutable source under `refs/tollgate/sources/`.
+- Candidate submission retains the immutable source under `refs/tollgate/sources/`; promotion authority is recorded separately.
 - Promotion retains and re-verifies the tested object, then uses an expected-old-OID `git update-ref` compare-and-swap.
 - SQLite runs WAL + foreign keys + `synchronous=FULL` and uses durable external-operation intents.
 - Output is appended to disk before live delivery; a hidden or slow UI cannot block only the UI path.

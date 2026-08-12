@@ -16,6 +16,14 @@ export async function approve(repositoryId: string, revision = "HEAD", worktreeP
   return invoke("approve", { repositoryId, revision, worktreePath });
 }
 
+export async function submitCandidate(repositoryId: string, revision = "HEAD", worktreePath?: string) {
+  return invoke("submit_candidate", { repositoryId, revision, worktreePath });
+}
+
+export async function authorizeCandidate(repositoryId: string, itemId: string, expectedRevision: number) {
+  return invoke("authorize_candidate", { repositoryId, itemId, expectedRevision });
+}
+
 export async function check(repositoryId: string, revision = "HEAD", worktreePath?: string) {
   return invoke("check", { repositoryId, revision, worktreePath });
 }

@@ -46,6 +46,7 @@ enum TopCommand {
     Init(InitArgs),
     #[command(subcommand)]
     Repo(RepoCommand),
+    Candidate(RevisionArgs),
     Approve(RevisionArgs),
     Queue,
     Status {
@@ -112,9 +113,12 @@ struct InitArgs {
 
 #[derive(Args)]
 struct RevisionArgs {
-    #[arg(default_value = "HEAD")]
+    #[arg(
+        default_value = "HEAD",
+        help = "Git revision; `tg approve` also accepts an existing candidate ID"
+    )]
     revision: String,
-    #[arg(long)]
+    #[arg(long, help = "Wait for validation or promotion to finish")]
     wait: bool,
 }
 
@@ -268,18 +272,37 @@ async fn run(cli: Cli) -> anyhow::Result<u8> {
         }
         TopCommand::Approve(args) => {
             let repository = select_repository(&mut client, cli.repository).await?;
-            let response = client
-                .request(IpcCommand::Approve {
-                    repository_id: repository.state.id,
-                    revision: args.revision,
-                    worktree_path: Some(std::env::current_dir()?.to_string_lossy().into_owned()),
-                    command_id: CommandId::new(),
-                })
-                .await?;
+            let candidate_id = args.revision.parse::<QueueItemId>().ok();
+            let response = if let Some(item_id) = candidate_id {
+                client
+                    .request(IpcCommand::AuthorizeCandidate {
+                        repository_id: repository.state.id,
+                        item_id,
+                        expected_revision: repository.state.queue_revision,
+                        command_id: CommandId::new(),
+                    })
+                    .await?
+            } else {
+                client
+                    .request(IpcCommand::Approve {
+                        repository_id: repository.state.id,
+                        revision: args.revision,
+                        worktree_path: Some(
+                            std::env::current_dir()?.to_string_lossy().into_owned(),
+                        ),
+                        command_id: CommandId::new(),
+                    })
+                    .await?
+            };
             print_value(response.clone(), cli.json, |value| {
                 println!(
-                    "Approved {}\n  source  {}\n  tested  {}\n  queue revision {}",
+                    "Approved {}{}\n  source  {}\n  tested  {}\n  queue revision {}",
                     value["item_id"].as_str().unwrap_or("?"),
+                    if value["evidence_reused"].as_bool() == Some(true) {
+                        " (completed validation reused)"
+                    } else {
+                        ""
+                    },
                     oid_value(&value["source_oid"]),
                     oid_value(&value["tested_oid"]),
                     value["queue_revision"]
@@ -293,6 +316,39 @@ async fn run(cli: Cli) -> anyhow::Result<u8> {
                     response["item_id"]
                         .as_str()
                         .ok_or_else(|| anyhow!("approval response omitted item ID"))?
+                        .parse()?,
+                    cli.json,
+                )
+                .await;
+            }
+        }
+        TopCommand::Candidate(args) => {
+            let repository = select_repository(&mut client, cli.repository).await?;
+            let response = client
+                .request(IpcCommand::Candidate {
+                    repository_id: repository.state.id,
+                    revision: args.revision,
+                    worktree_path: Some(std::env::current_dir()?.to_string_lossy().into_owned()),
+                    command_id: CommandId::new(),
+                })
+                .await?;
+            print_value(response.clone(), cli.json, |value| {
+                println!(
+                    "Candidate {} submitted without promotion authority\n  source  {}\n  tested  {}\n  queue revision {}",
+                    value["item_id"].as_str().unwrap_or("?"),
+                    oid_value(&value["source_oid"]),
+                    oid_value(&value["tested_oid"]),
+                    value["queue_revision"]
+                );
+                Ok(())
+            })?;
+            if args.wait {
+                return wait_for_candidate(
+                    &mut client,
+                    repository.state.id,
+                    response["item_id"]
+                        .as_str()
+                        .ok_or_else(|| anyhow!("candidate response omitted item ID"))?
                         .parse()?,
                     cli.json,
                 )
@@ -345,7 +401,16 @@ async fn run(cli: Cli) -> anyhow::Result<u8> {
         }
         TopCommand::Wait { id } => {
             let repository = select_repository(&mut client, cli.repository).await?;
-            return wait_for_item(&mut client, repository.state.id, id, cli.json).await;
+            let validation_only = repository
+                .queue
+                .iter()
+                .find(|view| view.item.id == id)
+                .is_some_and(|view| !view.item.promotion_authorized);
+            return if validation_only {
+                wait_for_candidate(&mut client, repository.state.id, id, cli.json).await
+            } else {
+                wait_for_item(&mut client, repository.state.id, id, cli.json).await
+            };
         }
         TopCommand::Logs {
             id,
@@ -1108,6 +1173,25 @@ async fn wait_for_item(
     item_id: QueueItemId,
     json: bool,
 ) -> anyhow::Result<u8> {
+    wait_for_item_until(client, repository_id, item_id, json, false).await
+}
+
+async fn wait_for_candidate(
+    client: &mut IpcClient,
+    repository_id: RepositoryId,
+    item_id: QueueItemId,
+    json: bool,
+) -> anyhow::Result<u8> {
+    wait_for_item_until(client, repository_id, item_id, json, true).await
+}
+
+async fn wait_for_item_until(
+    client: &mut IpcClient,
+    repository_id: RepositoryId,
+    item_id: QueueItemId,
+    json: bool,
+    validation_only: bool,
+) -> anyhow::Result<u8> {
     loop {
         let snapshot = match client.snapshot().await {
             Ok(snapshot) => snapshot,
@@ -1134,7 +1218,9 @@ async fn wait_for_item(
                     view.item.metadata.subject
                 );
             }
-            if view.item.state.is_terminal() {
+            if view.item.state.is_terminal()
+                || (validation_only && view.item.state == tollgate_domain::QueueItemState::Ready)
+            {
                 if !json {
                     println!();
                 }
@@ -1184,7 +1270,9 @@ async fn wait_for_item(
                     item.metadata.subject
                 );
             }
-            if item.state.is_terminal() {
+            if item.state.is_terminal()
+                || (validation_only && item.state == tollgate_domain::QueueItemState::Ready)
+            {
                 if !json {
                     println!();
                 }
@@ -1259,9 +1347,14 @@ fn print_queue(repository: &RepositorySnapshot, json: bool) -> anyhow::Result<()
     }
     for (index, view) in repository.queue.iter().enumerate() {
         println!(
-            "{:>2}  {:<11}  {}  {:<10}  {}",
+            "{:>2}  {:<11}  {:<10}  {}  {:<10}  {}",
             index + 1,
             format!("{:?}", view.item.state).to_lowercase(),
+            if view.item.promotion_authorized {
+                "authorized"
+            } else {
+                "candidate"
+            },
             view.item.source_oid.short(),
             view.item.metadata.branch.as_deref().unwrap_or("detached"),
             view.item.metadata.subject
@@ -1280,11 +1373,22 @@ fn print_queue(repository: &RepositorySnapshot, json: bool) -> anyhow::Result<()
 
 fn print_status(repository: &RepositorySnapshot, id: Option<QueueItemId>) {
     if let Some(id) = id {
-        if let Some(view) = repository.queue.iter().find(|view| view.item.id == id) {
+        if let Some(view) = repository
+            .queue
+            .iter()
+            .chain(&repository.checks)
+            .chain(&repository.history_items)
+            .find(|view| view.item.id == id)
+        {
             println!(
-                "{}\n  state       {:?}\n  source      {}\n  tested      {}\n  generation  {}",
+                "{}\n  state       {:?}\n  authority   {}\n  source      {}\n  tested      {}\n  generation  {}\n  evidence    {}",
                 view.item.metadata.subject,
                 view.item.state,
+                if view.item.promotion_authorized {
+                    "promotion authorized"
+                } else {
+                    "validation only"
+                },
                 view.item.source_oid.short(),
                 view.generation
                     .as_ref()
@@ -1293,10 +1397,15 @@ fn print_status(repository: &RepositorySnapshot, id: Option<QueueItemId>) {
                 view.generation
                     .as_ref()
                     .map(|value| &value.identity_digest[..10])
-                    .unwrap_or("—")
+                    .unwrap_or("—"),
+                if view.certificate.is_some() {
+                    "promotion-grade certificate ready"
+                } else {
+                    "not complete"
+                }
             );
         } else {
-            println!("Queue item {id} is not active.");
+            println!("Queue item {id} was not found in the recent snapshot.");
         }
         return;
     }

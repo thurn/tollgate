@@ -21,8 +21,9 @@ use tollgate_ipc::{
     acquire_user_authority_lock, bind_user_socket, verify_peer_uid,
 };
 use tollgate_service::{
-    AppSnapshot, ApproveResult, DoctorReport, EnvironmentView, QueueReorderResult,
-    RemoteSyncResult, RepositorySnapshot, TollgateService, WorktreeOperationResult,
+    AppSnapshot, ApproveResult, CandidateAuthorizationResult, DoctorReport, EnvironmentView,
+    QueueReorderResult, RemoteSyncResult, RepositorySnapshot, TollgateService,
+    WorktreeOperationResult,
 };
 
 type Service = Arc<TollgateService>;
@@ -82,6 +83,38 @@ async fn approve(
 ) -> Result<ApproveResult, String> {
     let result = service
         .approve_from(repository_id, revision, worktree_path, CommandId::new())
+        .await
+        .map_err(|error| error.to_string())?;
+    let _ = app.emit("tollgate://snapshot-changed", ());
+    Ok(result)
+}
+
+#[tauri::command]
+async fn submit_candidate(
+    app: tauri::AppHandle,
+    service: tauri::State<'_, Service>,
+    repository_id: RepositoryId,
+    revision: String,
+    worktree_path: Option<String>,
+) -> Result<ApproveResult, String> {
+    let result = service
+        .submit_candidate_from(repository_id, revision, worktree_path, CommandId::new())
+        .await
+        .map_err(|error| error.to_string())?;
+    let _ = app.emit("tollgate://snapshot-changed", ());
+    Ok(result)
+}
+
+#[tauri::command]
+async fn authorize_candidate(
+    app: tauri::AppHandle,
+    service: tauri::State<'_, Service>,
+    repository_id: RepositoryId,
+    item_id: QueueItemId,
+    expected_revision: u64,
+) -> Result<CandidateAuthorizationResult, String> {
+    let result = service
+        .authorize_candidate(repository_id, item_id, expected_revision, CommandId::new())
         .await
         .map_err(|error| error.to_string())?;
     let _ = app.emit("tollgate://snapshot-changed", ());
@@ -689,6 +722,8 @@ pub fn run() {
             snapshot,
             initialize_repository,
             approve,
+            submit_candidate,
+            authorize_candidate,
             check,
             retry_item,
             cancel_item,
@@ -1009,6 +1044,30 @@ async fn execute_ipc_command(service: &Service, command: IpcCommand) -> IpcRespo
             } => serde_json::to_value(
                 service
                     .approve_from(repository_id, revision, worktree_path, command_id)
+                    .await
+                    .map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string()),
+            IpcCommand::Candidate {
+                repository_id,
+                revision,
+                worktree_path,
+                command_id,
+            } => serde_json::to_value(
+                service
+                    .submit_candidate_from(repository_id, revision, worktree_path, command_id)
+                    .await
+                    .map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string()),
+            IpcCommand::AuthorizeCandidate {
+                repository_id,
+                item_id,
+                expected_revision,
+                command_id,
+            } => serde_json::to_value(
+                service
+                    .authorize_candidate(repository_id, item_id, expected_revision, command_id)
                     .await
                     .map_err(|error| error.to_string())?,
             )
