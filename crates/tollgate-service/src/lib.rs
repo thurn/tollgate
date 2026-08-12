@@ -5575,9 +5575,12 @@ impl TollgateService {
         for slot in &slots {
             let healthy = !std::fs::symlink_metadata(&slot.path)
                 .is_ok_and(|metadata| metadata.file_type().is_symlink())
-                && GitRepository::discover(&slot.path)
-                    .await
-                    .is_ok_and(|repository| repository.common_dir == runtime.git.common_dir);
+                && match GitRepository::discover(&slot.path).await {
+                    Ok(repository) => {
+                        paths_identical(&repository.common_dir, &runtime.mirror).await
+                    }
+                    Err(_) => false,
+                };
             if !healthy {
                 unhealthy_slots.push(slot.id.to_string());
             }
@@ -10662,6 +10665,60 @@ mod tests {
             &initialized.configuration.steps[0].command,
             tollgate_config::EffectiveCommand::Shell { script } if script == "false"
         ));
+    }
+
+    #[tokio::test]
+    async fn doctor_accepts_a_slot_owned_by_the_execution_mirror() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", "master"]);
+        std::fs::write(repository.join("base.txt"), "base\n").unwrap();
+        git(&repository, &["add", "base.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+        let service = TollgateService::open(temporary.path().join("support"))
+            .await
+            .unwrap();
+        let initialized = service
+            .initialize_repository_with_options(&repository, Some("true".into()), false)
+            .await
+            .unwrap();
+        let runtime = service.runtime(initialized.state.id).await.unwrap();
+        runtime
+            .git
+            .initialize_mirror(&runtime.mirror)
+            .await
+            .unwrap();
+        let slot_id = SlotId::new();
+        let slot_path = runtime.slots_root.join(slot_id.to_string());
+        runtime
+            .git
+            .provision_slot(&runtime.mirror, &slot_path, &initialized.state.master_oid)
+            .await
+            .unwrap();
+        let slot_repository = GitRepository::discover(&slot_path).await.unwrap();
+        assert!(paths_identical(&slot_repository.common_dir, &runtime.mirror).await);
+        assert!(!paths_identical(&slot_repository.common_dir, &runtime.git.common_dir).await);
+        runtime.data.lock().slots.insert(
+            slot_id,
+            SlotView {
+                id: slot_id,
+                path: slot_path,
+                state: "idle".into(),
+                checkout_oid: Some(initialized.state.master_oid),
+                health: "healthy".into(),
+                last_used: None,
+            },
+        );
+
+        let report = service.doctor(initialized.state.id).await.unwrap();
+        let slots = report
+            .checks
+            .iter()
+            .find(|check| check.name == "Persistent slots")
+            .unwrap();
+        assert!(matches!(slots.status, DiagnosticStatus::Healthy));
+        assert_eq!(slots.detail, "1 registered slot(s) passed ownership checks");
     }
 
     #[tokio::test]
