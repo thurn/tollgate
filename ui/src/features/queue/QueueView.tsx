@@ -22,7 +22,7 @@ export function QueueView({ repository, selectedItemId, onSelect, onApprove }: {
       </div>
     </section>
     {queue.length > 0 && <section className="promotion-path" aria-label="Promotion path">
-      <span className="promotion-path__master"><GitMerge size={14} /><strong>master</strong><code>{shortId(repository.state.master_oid.bytes, 7)}</code></span>
+      <span className="promotion-path__master"><GitMerge size={14} /><strong>release</strong><code>{shortId(repository.state.master_oid.bytes, 7)}</code></span>
       <ChevronRight size={14} />
       <div className="promotion-path__segments">{queue.map((entry, index) => <motion.span layout key={entry.item.id} className={cn(entry.item.state === "ready" && "is-ready", entry.item.state === "running" && "is-running")}><i />#{index + 1}</motion.span>)}</div>
       <div className="promotion-path__window"><Sparkles size={13} />active window <strong>{repository.state.active_window}</strong></div>
@@ -39,5 +39,5 @@ export function QueueView({ repository, selectedItemId, onSelect, onApprove }: {
 function EmptyQueue({ repository, onApprove }: { repository: RepositorySnapshot; onApprove: () => void }) {
   const active = repository.state.execution_state === "active";
   const reason = repository.state.block_reasons[0];
-  return <motion.div className="empty-queue" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }}><div className="empty-queue__visual"><span /><span /><span /><GitMerge size={27} /></div><h2>{active ? "The gate is clear" : repository.state.execution_state === "paused" ? "The gate is paused" : "The gate needs attention"}</h2><p>{active ? <>Approve a clean, single-commit worktree to validate its exact prospective commit on <code>master</code>.</> : reason?.message ?? `Repository state: ${repository.state.execution_state}.`}</p><Button variant="primary" onClick={onApprove} disabled={!active}>Approve a change</Button><small>{active ? <>Or run <code>tg approve</code> from a feature worktree</> : reason?.recovery_action ?? "Resolve the repository state before approving work."}</small></motion.div>;
+  return <motion.div className="empty-queue" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }}><div className="empty-queue__visual"><span /><span /><span /><GitMerge size={27} /></div><h2>{active ? "The gate is clear" : repository.state.execution_state === "paused" ? "The gate is paused" : "The gate needs attention"}</h2><p>{active ? <>Approve a clean, single-commit worktree to validate its exact prospective commit on <code>release</code>.</> : reason?.message ?? `Repository state: ${repository.state.execution_state}.`}</p><Button variant="primary" onClick={onApprove} disabled={!active}>Approve a change</Button><small>{active ? <>Or run <code>tg approve</code> from a feature worktree</> : reason?.recovery_action ?? "Resolve the repository state before approving work."}</small></motion.div>;
 }

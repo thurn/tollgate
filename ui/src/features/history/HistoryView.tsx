@@ -8,7 +8,7 @@ import { isTauri, relativeTime } from "../../lib/utils";
 import { getHistoryItems } from "../../lib/api";
 
 function eventAppearance(event: DomainEvent) {
-  if (event.kind.includes("promotion")) return { icon: GitMerge, tone: "success" as const, title: "Change promoted to master" };
+  if (event.kind.includes("promotion")) return { icon: GitMerge, tone: "success" as const, title: "Change promoted to release" };
   if (event.kind.includes("certificate") || event.kind.includes("passed")) return { icon: ShieldCheck, tone: "success" as const, title: "Pass certificate issued" };
   if (event.kind.includes("failed")) return { icon: X, tone: "danger" as const, title: "Validation failed" };
   if (event.kind.includes("started")) return { icon: TerminalSquare, tone: "info" as const, title: "Validation step started" };

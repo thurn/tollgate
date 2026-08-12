@@ -1,6 +1,6 @@
 # Tollgate
 
-Tollgate is a local dependent gate for macOS. It validates the exact prospective Git commits that would land on `master`, then promotes only a commit carrying a valid pass certificate.
+Tollgate is a local dependent gate for macOS. It validates the exact prospective Git commits that would land on remote `master`, then promotes only a commit carrying a valid pass certificate through a Tollgate-owned local `release` branch.
 
 This repository contains the Rust domain, Git adapter, SQLite store, runner, scheduler, service and IPC protocol; the `tg` CLI and ephemeral worker; and a Tauri v2 + React command center.
 
@@ -26,7 +26,7 @@ The browser development view (`npm --prefix ui run dev`) uses a representative t
 Launch the app and choose **Add repository**, or run:
 
 ```sh
-tg init --run 'cargo test --all-targets' --detach-master
+tg init --run './ci'
 ```
 
 Tollgate writes its trusted policy to `<git-common-dir>/tollgate/config.toml`. The smallest valid file is:
@@ -39,7 +39,9 @@ name = "ci"
 run = "./ci"
 ```
 
-`master` must not be checked out in a developer-visible worktree while its gate is active. Initialization never changes that checkout silently: `--detach-master` explicitly detaches a clean primary worktree at the identical commit, or you can switch it to a feature branch yourself.
+Initialization leaves the current checkout unchanged. Local `master` remains a normal user-owned branch that may track and push directly to `origin/master`; Tollgate creates and exclusively manages an un-checked-out local `release` branch at the same initial commit. Certified pushes map local `release` to the configured remote branch, normally `master`.
+
+A direct push from local `master` is deliberately outside Tollgate certification. Its exact remote lease prevents Tollgate from overwriting that movement; run `tg pull` to adopt the new remote tip into `release` before the next certified promotion.
 
 An agent can submit a clean commit for speculative validation without permission to promote it:
 
@@ -48,7 +50,7 @@ tg candidate HEAD --wait
 tg status <candidate-id>
 ```
 
-`--wait` returns when validation has produced promotion-grade evidence (or a conclusive failure), while `master` remains unchanged. A user later grants authority to the exact retained candidate with `tg approve <candidate-id>`; `tg cancel <candidate-id>` cancels it. For the original one-phase user workflow, `tg approve HEAD` still submits and authorizes in one command.
+`--wait` returns when validation has produced promotion-grade evidence (or a conclusive failure), while `release` remains unchanged. A user later grants authority to the exact retained candidate with `tg approve <candidate-id>`; `tg cancel <candidate-id>` cancels it. For the original one-phase user workflow, `tg approve HEAD` still submits and authorizes in one command.
 
 ## Safety model
 

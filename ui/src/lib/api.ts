@@ -8,8 +8,8 @@ export async function getSnapshot(): Promise<AppSnapshot> {
   return invoke<AppSnapshot>("snapshot");
 }
 
-export async function initializeRepository(path: string, run?: string, detachMaster = false) {
-  return invoke("initialize_repository", { path, run, detachMaster });
+export async function initializeRepository(path: string, run?: string) {
+  return invoke("initialize_repository", { path, run, detachMaster: false });
 }
 
 export async function approve(repositoryId: string, revision = "HEAD", worktreePath?: string) {

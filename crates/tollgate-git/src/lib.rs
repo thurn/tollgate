@@ -12,6 +12,10 @@ use tokio::{fs, process::Command};
 use tollgate_domain::{GitOid, ObjectFormat, QueueItemId};
 
 const EMPTY_HOOKS_DIRECTORY: &str = "/dev/null";
+pub const INTEGRATION_BRANCH: &str = "release";
+pub const INTEGRATION_REF: &str = "refs/heads/release";
+pub const USER_BRANCH: &str = "master";
+pub const USER_BRANCH_REF: &str = "refs/heads/master";
 
 #[derive(Debug, Error)]
 pub enum GitError {
@@ -21,8 +25,8 @@ pub enum GitError {
     InvalidOutput(String),
     #[error("repository is dirty: {0}")]
     DirtyWorktree(String),
-    #[error("master is checked out in {0}")]
-    MasterCheckedOut(String),
+    #[error("Tollgate integration branch `release` is checked out in {0}")]
+    IntegrationCheckedOut(String),
     #[error("unsupported Git object format `{0}`")]
     UnsupportedObjectFormat(String),
     #[error("source commit must have exactly one parent")]
@@ -121,8 +125,8 @@ impl GitRepository {
         })
     }
 
-    pub async fn master_oid(&self) -> Result<GitOid, GitError> {
-        self.resolve_oid("refs/heads/master").await
+    pub async fn integration_oid(&self) -> Result<GitOid, GitError> {
+        self.resolve_oid(INTEGRATION_REF).await
     }
 
     pub async fn tree_oid(&self, commit: &GitOid) -> Result<GitOid, GitError> {
@@ -194,15 +198,17 @@ impl GitRepository {
         })
     }
 
-    pub async fn ensure_master_not_checked_out(&self) -> Result<(), GitError> {
+    pub async fn ensure_integration_not_checked_out(&self) -> Result<(), GitError> {
         let bytes = self.git(["worktree", "list", "--porcelain", "-z"]).await?;
         let fields = bytes.split(|byte| *byte == 0).collect::<Vec<_>>();
         let mut current_path = None;
         for field in fields {
             if let Some(path) = field.strip_prefix(b"worktree ") {
                 current_path = Some(String::from_utf8_lossy(path).into_owned());
-            } else if field == b"branch refs/heads/master" {
-                return Err(GitError::MasterCheckedOut(current_path.unwrap_or_default()));
+            } else if field == b"branch refs/heads/release" {
+                return Err(GitError::IntegrationCheckedOut(
+                    current_path.unwrap_or_default(),
+                ));
             }
         }
         Ok(())
@@ -250,12 +256,12 @@ impl GitRepository {
         reject_integrated: bool,
     ) -> Result<ApprovalProbe, GitError> {
         self.ensure_clean().await?;
-        self.ensure_master_not_checked_out().await?;
+        self.ensure_integration_not_checked_out().await?;
         let source_oid = self.resolve_oid(revision).await?;
-        let master = self.master_oid().await?;
-        if reject_integrated && self.is_ancestor(&source_oid, &master).await? {
+        let integration = self.integration_oid().await?;
+        if reject_integrated && self.is_ancestor(&source_oid, &integration).await? {
             return Err(GitError::InvalidOutput(
-                "source is already an ancestor of master".into(),
+                "source is already an ancestor of release".into(),
             ));
         }
         let parents = text(
@@ -454,7 +460,7 @@ impl GitRepository {
         expected_source: &GitOid,
     ) -> Result<bool, GitError> {
         let worktree = std::fs::canonicalize(worktree)?;
-        if worktree == self.worktree_root || branch == "master" {
+        if worktree == self.worktree_root || matches!(branch, USER_BRANCH | INTEGRATION_BRANCH) {
             return Ok(false);
         }
         let discovered = Self::discover(&worktree).await?;
@@ -494,19 +500,46 @@ impl GitRepository {
         Ok((!branch.is_empty()).then_some(branch))
     }
 
-    pub async fn detach_current_master_if_clean(&self) -> Result<bool, GitError> {
-        if self.current_branch().await?.as_deref() != Some("master") {
-            return Ok(false);
+    pub async fn initialize_integration_ref_from_master(&self) -> Result<GitOid, GitError> {
+        self.ensure_integration_not_checked_out().await?;
+        let master = self.resolve_oid(USER_BRANCH_REF).await?;
+        match self.optional_ref_oid(INTEGRATION_REF).await? {
+            Some(release) if release != master => Err(GitError::InvalidOutput(format!(
+                "local `release` already exists at {}, but `master` is {}; Tollgate will not overwrite it",
+                release.short(),
+                master.short()
+            ))),
+            Some(release) => Ok(release),
+            None => {
+                self.git(["update-ref", INTEGRATION_REF, &master.to_hex(), ""])
+                    .await?;
+                let release = self.integration_oid().await?;
+                if release != master {
+                    return Err(GitError::InvalidOutput(
+                        "release initialization did not preserve the exact master OID".into(),
+                    ));
+                }
+                Ok(release)
+            }
         }
-        self.ensure_clean().await?;
-        let master = self.master_oid().await?;
-        self.git(["switch", "--detach", &master.to_hex()]).await?;
-        if self.resolve_oid("HEAD").await? != master || self.current_branch().await?.is_some() {
-            return Err(GitError::InvalidOutput(
-                "clean master worktree did not detach at the exact same OID".into(),
-            ));
+    }
+
+    pub async fn migrate_integration_ref_from_master(&self) -> Result<GitOid, GitError> {
+        self.ensure_integration_not_checked_out().await?;
+        let master = self.resolve_oid(USER_BRANCH_REF).await?;
+        if let Some(release) = self.optional_ref_oid(INTEGRATION_REF).await? {
+            if release != master {
+                return Err(GitError::InvalidOutput(format!(
+                    "cannot migrate Tollgate authority: existing `release` {} differs from legacy `master` {}",
+                    release.short(),
+                    master.short()
+                )));
+            }
+            return Ok(release);
         }
-        Ok(true)
+        self.git(["update-ref", INTEGRATION_REF, &master.to_hex(), ""])
+            .await?;
+        self.integration_oid().await
     }
 
     pub async fn create_feature_worktree(
@@ -523,12 +556,12 @@ impl GitRepository {
         let valid = self
             .git_status(["check-ref-format", "--branch", branch])
             .await?;
-        if !valid.success() || branch == "master" {
+        if !valid.success() || matches!(branch, USER_BRANCH | INTEGRATION_BRANCH) {
             return Err(GitError::InvalidOutput(
                 "feature branch name is invalid or reserved".into(),
             ));
         }
-        let master = self.master_oid().await?;
+        let master = self.integration_oid().await?;
         self.git([
             "worktree",
             "add",
@@ -541,7 +574,7 @@ impl GitRepository {
         let created = Self::discover(destination).await?;
         if created.common_dir != self.common_dir || created.resolve_oid("HEAD").await? != master {
             return Err(GitError::InvalidOutput(
-                "created worktree identity did not match the gated master".into(),
+                "created worktree identity did not match the gated release".into(),
             ));
         }
         Ok(master)
@@ -552,14 +585,14 @@ impl GitRepository {
         let branch = self.current_branch().await?.ok_or_else(|| {
             GitError::InvalidOutput("feature update requires a checked-out branch".into())
         })?;
-        if branch == "master" {
+        if matches!(branch.as_str(), USER_BRANCH | INTEGRATION_BRANCH) {
             return Err(GitError::InvalidOutput(
-                "feature update cannot operate on master".into(),
+                "feature update cannot operate on master or release".into(),
             ));
         }
         let old = self.resolve_oid("HEAD").await?;
         let old_parent = self.commit_parent_oid(&old).await?;
-        let master = self.master_oid().await?;
+        let master = self.integration_oid().await?;
         if old_parent == master {
             return Ok((old.clone(), old));
         }
@@ -596,7 +629,7 @@ impl GitRepository {
         let new = self.resolve_oid("HEAD").await?;
         if self.commit_parent_oid(&new).await? != master {
             return Err(GitError::InvalidOutput(
-                "updated feature does not have current master as its exact parent".into(),
+                "updated feature does not have current release as its exact parent".into(),
             ));
         }
         Ok((old, new))
@@ -625,7 +658,7 @@ impl GitRepository {
                 "fetch",
                 "--no-tags",
                 source.as_ref(),
-                "+refs/heads/master:refs/tollgate/master",
+                "+refs/heads/release:refs/tollgate/release",
                 "+refs/tollgate/sources/*:refs/tollgate/sources/*",
             ],
         )
@@ -870,21 +903,23 @@ impl GitRepository {
         Ok(())
     }
 
-    pub async fn compare_and_swap_master(
+    pub async fn compare_and_swap_integration(
         &self,
         expected_old: &GitOid,
         tested_new: &GitOid,
     ) -> Result<(), GitError> {
-        self.ensure_master_not_checked_out().await?;
+        self.ensure_integration_not_checked_out().await?;
         self.git([
             "update-ref",
-            "refs/heads/master",
+            INTEGRATION_REF,
             &tested_new.to_hex(),
             &expected_old.to_hex(),
         ])
         .await?;
-        if self.master_oid().await? != *tested_new {
-            return Err(GitError::InvalidOutput("master CAS result mismatch".into()));
+        if self.integration_oid().await? != *tested_new {
+            return Err(GitError::InvalidOutput(
+                "release CAS result mismatch".into(),
+            ));
         }
         Ok(())
     }
@@ -1296,6 +1331,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn initializes_release_without_moving_the_checked_out_master_branch() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("file.txt"), "base\n").unwrap();
+        git(&repository, &["add", "file.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+
+        let adapter = GitRepository::discover(&repository).await.unwrap();
+        let master = adapter.resolve_oid(USER_BRANCH_REF).await.unwrap();
+        let release = adapter
+            .initialize_integration_ref_from_master()
+            .await
+            .unwrap();
+
+        assert_eq!(release, master);
+        assert_eq!(adapter.integration_oid().await.unwrap(), master);
+        assert_eq!(
+            adapter.current_branch().await.unwrap().as_deref(),
+            Some(USER_BRANCH)
+        );
+        adapter.ensure_integration_not_checked_out().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn refuses_to_overwrite_an_existing_divergent_release_branch() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("file.txt"), "base\n").unwrap();
+        git(&repository, &["add", "file.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+        git(&repository, &["branch", INTEGRATION_BRANCH]);
+        std::fs::write(repository.join("file.txt"), "master moved\n").unwrap();
+        git(&repository, &["commit", "-am", "move master"]);
+
+        let adapter = GitRepository::discover(&repository).await.unwrap();
+        let error = adapter
+            .initialize_integration_ref_from_master()
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("will not overwrite"));
+        assert_ne!(
+            adapter.integration_oid().await.unwrap(),
+            adapter.resolve_oid(USER_BRANCH_REF).await.unwrap()
+        );
+    }
+
+    #[tokio::test]
     async fn constructs_a_shared_synthetic_prefix_with_preserved_parent_chain() {
         let temporary = tempfile::tempdir().unwrap();
         let repository = temporary.path().join("repository");
@@ -1318,6 +1405,10 @@ mod tests {
         git(&repository, &["checkout", "--detach", "HEAD"]);
 
         let adapter = GitRepository::discover(&repository).await.unwrap();
+        adapter
+            .initialize_integration_ref_from_master()
+            .await
+            .unwrap();
         let base_oid = GitOid::from_hex(&base).unwrap();
         let a_oid = GitOid::from_hex(&source_a).unwrap();
         let b_oid = GitOid::from_hex(&source_b).unwrap();
@@ -1364,6 +1455,10 @@ mod tests {
         git(&repository, &["checkout", "--detach", "HEAD"]);
 
         let adapter = GitRepository::discover(&repository).await.unwrap();
+        adapter
+            .initialize_integration_ref_from_master()
+            .await
+            .unwrap();
         let mirror = temporary.path().join("mirror.git");
         adapter.initialize_mirror(&mirror).await.unwrap();
         git(

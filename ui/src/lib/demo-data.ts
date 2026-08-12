@@ -57,7 +57,7 @@ export const demoSnapshot: AppSnapshot = {
     {
       state: {
         id: "019fef58-aaaa-7000-8000-e6aff447a5ba", name: "tollgate", path: "/Users/dev/tollgate",
-        integration_ref: "refs/heads/master", master_oid: oid("b2cdf95"), queue_revision: 17, event_sequence: 94,
+        integration_ref: "refs/heads/release", master_oid: oid("b2cdf95"), queue_revision: 17, event_sequence: 94,
         engine_epoch: 1, execution_state: "active", block_reasons: [], active_configuration_digest: "0aa71db513e868d166f3640ef91bf93c",
         active_window: 20, active_window_floor: 3, active_window_ceiling: 20, remote_enabled: false,
       },
@@ -98,7 +98,7 @@ export const demoSnapshot: AppSnapshot = {
     {
       state: {
         id: "019fef58-bbbb-7000-8000-e6aff447a5ba", name: "atlas-web", path: "/Users/dev/atlas-web",
-        integration_ref: "refs/heads/master", master_oid: oid("3af01be"), queue_revision: 5, event_sequence: 22,
+        integration_ref: "refs/heads/release", master_oid: oid("3af01be"), queue_revision: 5, event_sequence: 22,
         engine_epoch: 1, execution_state: "blocked", block_reasons: [{ code: "push-diverged", message: "origin/master moved unexpectedly", recovery_action: "Review local and remote tips, then reconcile." }], active_configuration_digest: "acf214",
         active_window: 10, active_window_floor: 3, active_window_ceiling: 20, remote_enabled: true,
       },

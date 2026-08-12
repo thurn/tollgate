@@ -106,8 +106,8 @@ struct InitArgs {
     run: Option<String>,
     #[arg(long)]
     no_bootstrap: bool,
-    /// Explicitly detach a clean primary worktree that currently owns `master`.
-    #[arg(long)]
+    /// Legacy no-op retained for command-line compatibility.
+    #[arg(long, hide = true)]
     detach_master: bool,
 }
 
@@ -126,7 +126,7 @@ struct RevisionArgs {
 enum RepoCommand {
     Add {
         path: PathBuf,
-        #[arg(long)]
+        #[arg(long, hide = true)]
         detach_master: bool,
     },
     Remove {
@@ -202,7 +202,7 @@ async fn run(cli: Cli) -> anyhow::Result<u8> {
             print_value(response, cli.json, |value| {
                 let repository: RepositorySnapshot = serde_json::from_value(value.clone())?;
                 println!(
-                    "Initialized {}\n  repository  {}\n  master      {}\n  config      {}",
+                    "Initialized {}\n  repository  {}\n  release     {}\n  config      {}",
                     repository.state.name,
                     repository.state.id,
                     repository.state.master_oid.short(),
@@ -617,7 +617,7 @@ async fn run(cli: Cli) -> anyhow::Result<u8> {
                 .await?;
             print_value(value, cli.json, |value| {
                 println!(
-                    "{}\n  adopted master  {}\n  queue revision  {}",
+                    "{}\n  adopted release {}\n  queue revision  {}",
                     value["message"]
                         .as_str()
                         .unwrap_or("Repository reconciled."),
@@ -1337,7 +1337,7 @@ fn print_queue(repository: &RepositorySnapshot, json: bool) -> anyhow::Result<()
         return Ok(());
     }
     println!(
-        "{} · queue revision {} · master {}",
+        "{} · queue revision {} · release {}",
         repository.state.name,
         repository.state.queue_revision,
         repository.state.master_oid.short()
@@ -1410,7 +1410,7 @@ fn print_status(repository: &RepositorySnapshot, id: Option<QueueItemId>) {
         return;
     }
     println!(
-        "{}\n  execution  {:?}\n  master     {}\n  queue      {} items · revision {}\n  runs       {} active · {} waiting\n  config     {}",
+        "{}\n  execution  {:?}\n  release    {}\n  queue      {} items · revision {}\n  runs       {} active · {} waiting\n  config     {}",
         repository.state.name,
         repository.state.execution_state,
         repository.state.master_oid.short(),

@@ -34,7 +34,7 @@ export function CommandPalette({ open, onOpenChange, onRoute, onApprove, onCheck
             {onApprove && <CommandPrimitive.Item onSelect={() => run(onApprove)}><Plus />Approve a change<span>⌘ ↵</span></CommandPrimitive.Item>}
             {onCheck && <CommandPrimitive.Item onSelect={() => run(onCheck)}><FlaskConical />Run independent check</CommandPrimitive.Item>}
             {onPull && <CommandPrimitive.Item onSelect={() => run(onPull)}><RefreshCw />Pull remote fast-forward</CommandPrimitive.Item>}
-            {onPush && <CommandPrimitive.Item onSelect={() => run(onPush)}><UploadCloud />Push certified master</CommandPrimitive.Item>}
+            {onPush && <CommandPrimitive.Item onSelect={() => run(onPush)}><UploadCloud />Push release to master</CommandPrimitive.Item>}
             {onReconcile && <CommandPrimitive.Item onSelect={() => run(onReconcile)}><GitMerge />Reconcile external movement</CommandPrimitive.Item>}
             {onWorktrees && <CommandPrimitive.Item onSelect={() => run(onWorktrees)}><FolderGit2 />Create, update, or remove worktree</CommandPrimitive.Item>}
             {canPause && <CommandPrimitive.Item onSelect={() => run(onPause)}>{paused ? <Play /> : <Pause />}{paused ? "Resume gate" : "Pause gate"}</CommandPrimitive.Item>}

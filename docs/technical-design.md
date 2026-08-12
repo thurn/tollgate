@@ -6,11 +6,11 @@ Status: proposed v1 design | Date: 2026-08-10 | Product: Tollgate desktop applic
 
 Tollgate is a 100% local continuous-integration and Git promotion system for macOS. A Tauri v2 desktop application is the command center and the sole live authority for scheduling, execution, queue mutation, and promotion. The `tg` CLI is a fast and scriptable client of the same Rust command service. There is no daemon. Closing the last window leaves the ordinary Dock application running; explicitly quitting it stops active CI and durable queue processing resumes when the app is next opened.
 
-Tollgate's defining behavior is a single-repository, Zuul-style dependent gate for `master`. Approving clean, single-commit changes A, B, and C creates an ordered queue and concurrently validates the exact prospective prefix commits `master+A`, `master+A+B`, and `master+A+B+C`, subject to local resource capacity. A passing head is promoted with an old-OID compare-and-swap. Already-passing descendants advance without rerunning only when their exact tested parent has just been promoted and every other validity input is unchanged. If an earlier independent change fails, conflicts, is canceled, or becomes stale, it leaves the active queue and every affected descendant is rebuilt and retested without it. True Git dependencies leave the queue together when their prerequisite fails.
+Tollgate's defining behavior is a single-repository, Zuul-style dependent gate through local `release` to remote `master`. Approving clean, single-commit changes A, B, and C creates an ordered queue and concurrently validates the exact prospective prefix commits `release+A`, `release+A+B`, and `release+A+B+C`, subject to local resource capacity. A passing head is promoted with an old-OID compare-and-swap. Already-passing descendants advance without rerunning only when their exact tested parent has just been promoted and every other validity input is unchanged. If an earlier independent change fails, conflicts, is canceled, or becomes stale, it leaves the active queue and every affected descendant is rebuilt and retested without it. True Git dependencies leave the queue together when their prerequisite fails.
 
 The non-negotiable invariant is:
 
-> Every commit that Tollgate writes to `refs/heads/master` is the exact Git object ID for which every applicable voting validation completed successfully under the frozen configuration for that item's validation generation.
+> Every commit that Tollgate writes to local `refs/heads/release` or pushes to the configured remote branch is the exact Git object ID for which every applicable voting validation completed successfully under the frozen configuration for that item's validation generation.
 
 Tollgate maximizes incremental build reuse with persistent detached Git worktree slots, preserved ignored files, APFS clone-on-write seed snapshots, slot affinity, and optional use of already-installed shared caches such as `sccache`. The execution engine remains language-agnostic: a validation step is primarily a name and a shell command. Data-driven initialization templates may propose commands for Rust, Node, Python, Unity, or mixed repositories, but the scheduler has no language-specific test logic.
 
@@ -19,7 +19,7 @@ Tollgate maximizes incremental build reuse with persistent detached Git worktree
 ### 2.1 Product goals
 
 - Replace a personal Buildbot-style CI server with a local desktop application.
-- Prevent unvalidated commits from being promoted by Tollgate to `master`.
+- Prevent unvalidated commits from being promoted by Tollgate to local `release` or remote `master`.
 - Apply Zuul's dependent-gate semantics to local branches and worktrees.
 - Keep the common path small: create a worktree, make one commit, run `tg approve`, and continue working.
 - Make queue state, running capacity, steps, logs, timing, failures, promotion, push state, and history legible in the desktop UI.
@@ -43,7 +43,7 @@ Tollgate maximizes incremental build reuse with persistent detached Git worktree
 
 - A daemon, launch agent, headless CI server, or execution that continues after the app quits.
 - Linux, Windows, or pre-Tahoe macOS support.
-- Multiple integration branches in one repository; v1 owns only `master`.
+- Multiple integration branches in one repository; v1 owns only local `release` and targets one configured remote branch.
 - Cross-repository speculative queues, cross-repository atomic promotion, or dependency cycles.
 - Multiple macOS users concurrently operating the same repository.
 - Containers, virtual machines, or a general security sandbox.
@@ -58,7 +58,7 @@ Tollgate maximizes incremental build reuse with persistent detached Git worktree
 
 | Term | Meaning |
 | --- | --- |
-| Authoritative repository | The user's real Git common directory and refs. Only this repository's `master` is promoted. |
+| Authoritative repository | The user's real Git common directory and refs. Tollgate promotes only local `release`; user-owned local `master` remains outside its authority. |
 | Execution mirror | A disposable bare Git repository under Tollgate's cache root. Synthetic commits and CI worktrees live here, isolating CI Git operations from authoritative refs. |
 | Source commit | The immutable, single-parent commit OID captured by `tg approve`. |
 | Queue item | One approval of one source commit, plus ordering, hard dependencies, attempts, and history. |
@@ -80,13 +80,13 @@ The implementation must make the following invariants explicit in domain types, 
 
 For every completed Tollgate promotion event, all of the following are true:
 
-- `master`'s new OID equals the pass certificate's tested OID.
-- The new commit's first and only parent equals `master`'s OID immediately before promotion.
+- `release`'s new OID equals the pass certificate's tested OID.
+- The new commit's first and only parent equals `release`'s OID immediately before promotion.
 - The certificate belongs to the current queue head and matches that item's currently assigned validation generation.
 - Every applicable voting step in the frozen step graph has a successful terminal result.
 - The tracked checkout and initialized submodules matched the tested commit after validation.
 - The frozen configuration and step-graph digests still match the item's validation generation.
-- The ref update compared the actual old `master` OID with the expected OID and succeeded atomically.
+- The ref update compared the actual old `release` OID with the expected OID and succeeded atomically.
 
 There is no merge, cherry-pick, amend, signing, message edit, or commit creation after validation and before promotion.
 
@@ -138,7 +138,8 @@ Registration is always explicit through `tg init`, `tg repo add`, or Open Reposi
 
 Each registered repository has:
 
-- one integration branch named `master`;
+- one Tollgate-owned local integration branch named `release`, never checked out in a developer worktree;
+- one user-owned local branch named `master`, normally checked out in the primary worktree and tracking remote `master`;
 - one ordered dependent gate;
 - zero or more independent check runs;
 - its own queue revision, validation generations, history, configuration, execution mirror, slots, and seeds;
@@ -146,15 +147,15 @@ Each registered repository has:
 
 The app may supervise several repositories concurrently using one global resource pool. Cross-repository queue semantics do not exist in v1.
 
-`master` must not be checked out in a developer-visible worktree while the repository is active. Initialization detects a clean checked-out `master` and offers to detach that worktree at the same OID. A user who wants to check out `master` must first pause/release the gate. Detached views of the current master tip are allowed.
+Initialization leaves the developer's checkout unchanged and creates local `release` at the exact local `master` OID. Tollgate exclusively owns `release`, which must not be checked out in any worktree while the repository is active. Local `master` remains user-owned, may track `origin/master`, and may be committed to or pushed through ordinary Git. Direct pushes are explicitly uncertified external movement; Tollgate's remote lease detects them and requires adoption into `release` before certified promotion continues.
 
 ### 6.3 Normal workflow
 
-1. The user creates or opens a feature worktree based on an appropriate `master` or queued dependency.
+1. The user creates or opens a feature worktree based on the gated `release` tip or an appropriate queued dependency. The primary checkout may remain on user-owned `master`.
 2. The worktree contains one source commit. Ignored build output is allowed; staged changes, tracked modifications, and non-ignored untracked files are not.
 3. `tg candidate` captures `HEAD`, validates its shape and dependencies, creates `refs/tollgate/sources/<item-id>`, durably enqueues a non-promotable item, and returns its ID. `tg approve HEAD` remains a combined submit-and-authorize convenience.
 4. The app constructs synthetic prefixes, assigns new validation generations to affected items, and schedules eligible buildsets.
-5. `tg approve <candidate-id>` durably grants promotion authority to that exact retained source. A passing authorized head is promoted automatically; an unauthorized ready head remains queued with its certificate and does not modify `master`.
+5. `tg approve <candidate-id>` durably grants promotion authority to that exact retained source. A passing authorized head is promoted automatically; an unauthorized ready head remains queued with its certificate and does not modify local `release`.
 6. After local promotion, or after push succeeds when push is enabled, Tollgate automatically cleans up the source worktree and branch if all safety checks still pass.
 
 Automatic cleanup requires a non-primary linked worktree that is still at the captured source OID and has no tracked, staged, or non-ignored untracked changes. Branch deletion is an old-OID compare-and-swap. Ignored files in an eligible linked worktree are disposable by default. If any check fails, cleanup becomes `needs-attention`; promotion is never rolled back. The hidden source ref retains the commit for audit.
@@ -258,7 +259,7 @@ The v1 schema must represent each of these logical entities. Migrations may spli
 - `repository_state`: repository UUID, schema/engine epoch, integration ref, current observed OIDs, queue revision, pause/block state, and active configuration digest.
 - `queue_items`: UUIDv7/short ID, source OID/ref/worktree snapshot, source metadata, enqueue order, queue-item state, terminal reason, and separate remote and cleanup states.
 - `item_dependencies`: hard Git dependency edges.
-- `source_promotions`: permanent exact mapping from queue item/source OID to promoted synthetic OID, old `master` OID, certificate, and promotion event.
+- `source_promotions`: permanent exact mapping from queue item/source OID to promoted synthetic OID, old `release` OID, certificate, and promotion event.
 - `validation_generations`: item, anchored base OID, ordered prefix/digest through the item, dependency inputs, prefix OIDs, configuration and step-graph digests, engine epoch, and invalidation lineage.
 - `buildsets`: item/validation generation, exact tested OID and parent, environment snapshot fingerprint, slot, status, `retry_of_buildset_id`, and whole-buildset attempt number.
 - `steps` and `step_attempts`: frozen command/resource data, timing, result class, exit/signal/timeout, log ranges, retry number.
@@ -319,9 +320,9 @@ All Tollgate-internal plumbing operations, including mirror fetches, synthetic c
 - the integration branch exists and is not checked out;
 - the selected worktree has no staged changes, tracked modifications, or non-ignored untracked files;
 - the resolved source is one commit object with exactly one parent;
-- the source is not already an ancestor of `master`;
+- the source is not already an ancestor of `release`;
 - the source OID is not already active in the queue;
-- every unmerged source ancestor is either literal `master` history, an active known source item, or a previously promoted source item whose promoted OID is still in `master` history;
+- every unmerged source ancestor is either literal `release` history, an active known source item, or a previously promoted source item whose promoted OID is still in `release` history;
 - effective configuration is valid enough to construct a gate buildset.
 
 Root and merge commits are rejected in v1. Ignored files do not make a developer worktree dirty. Approval captures source subject, full message hash, author/committer metadata, signature verification state, branch/ref OID if present, worktree path/identity, and approval time for display and cleanup; only the OID defines content.
@@ -340,10 +341,10 @@ Re-approving a changed OID from the same source branch follows Zuul's new-patchs
 
 Queue order alone creates a speculative relationship, not a hard dependency. A hard dependency exists when a source commit is actually based on another unmerged source commit.
 
-For source B, Tollgate walks from B's parent through first-parent ancestry until it reaches a literal ancestor of current `master`. Every intervening commit is resolved by exact OID, never by branch name, patch ID, or content similarity:
+For source B, Tollgate walks from B's parent through first-parent ancestry until it reaches a literal ancestor of current `release`. Every intervening commit is resolved by exact OID, never by branch name, patch ID, or content similarity:
 
 - An OID matching an active queue item's source OID creates an active hard-dependency edge.
-- An OID matching a promoted item's source OID is a satisfied dependency only when that item's recorded promoted synthetic OID is a literal ancestor of current `master`.
+- An OID matching a promoted item's source OID is a satisfied dependency only when that item's recorded promoted synthetic OID is a literal ancestor of current `release`.
 - An OID belonging to a failed, canceled, superseded, or otherwise unsuccessful item makes approval fail with the corresponding dependency reason.
 - An unknown OID makes approval fail rather than silently approving additional code.
 
@@ -360,7 +361,7 @@ Hard dependencies impose these rules:
 
 The execution mirror is initialized as a disposable bare repository and is never treated as authoritative. Before constructing affected validation generations, the Git adapter ensures that the mirror contains:
 
-- the exact observed authoritative `master` OID;
+- the exact observed authoritative local `release` OID;
 - every active source OID and its required ancestry;
 - any submodule/config objects needed for checkout according to normal Git behavior;
 - internal mirror refs under `refs/tollgate/` that make active synthetic objects reachable.
@@ -369,7 +370,7 @@ Mirror synchronization uses explicit local fetches/refspecs. Deleting or rebuild
 
 ### 9.5 Synthetic prefix construction
 
-Let `M0` be the observed `master`, and let source commits be A, B, and C in queue order. Tollgate constructs one shared linear prefix chain for the affected queue suffix:
+Let `M0` be the observed local `release`, and let source commits be A, B, and C in queue order. Tollgate constructs one shared linear prefix chain for the affected queue suffix:
 
 - `S_A = transplant(A, M0)`
 - `S_B = transplant(B, S_A)`
@@ -408,7 +409,7 @@ Appending or changing an item after a given item does not change that earlier it
 
 Successful promotion advances the queue revision and removes the promoted head from the active queue, but it does not change a surviving descendant's validation generation when the descendant's expected parent is the exact promoted OID and every other validation input remains unchanged. The descendant keeps its existing buildset and certificate. Candidate authorization likewise reuses a completed certificate only when it still belongs to the current immutable generation. A later reconstruction may use the promoted OID as a new anchor, but it cannot transfer the old certificate to a differently identified validation generation.
 
-Approval, cancellation/dequeue, conclusive failure, conflict, re-approval, retry enqueue, and manual reorder recompute only affected validation generations. An accepted external `master` movement, an applied configuration change, an engine-epoch change, or recovery that cannot prove inputs unchanged invalidates every affected unpromoted generation.
+Approval, cancellation/dequeue, conclusive failure, conflict, re-approval, retry enqueue, and manual reorder recompute only affected validation generations. An accepted external `release` movement or adopted remote-base movement, an applied configuration change, an engine-epoch change, or recovery that cannot prove inputs unchanged invalidates every affected unpromoted generation.
 
 ### 9.7 Zuul-style queue behavior
 
@@ -518,8 +519,8 @@ The repository supervisor may begin promotion only when:
 - its certificate passes every current validity check;
 - a synchronous re-open, parse, canonicalization, and digest of `<git-common-dir>/tollgate/config.toml` equals the certificate's frozen configuration digest; filesystem watching is never sufficient evidence for this check;
 - a synchronous probe confirms that the recorded Git executable path/file identity, versioned Git-semantics profile, object format, and engine epoch still match the validation generation;
-- authoritative `master` still equals the certificate's expected parent;
-- `master` is not checked out in any authoritative worktree;
+- authoritative local `release` still equals the certificate's expected parent;
+- `release` is not checked out in any authoritative worktree;
 - every active certificate log reaches its recorded completion offset and matches its recorded integrity hash; missing or corrupt active evidence blocks promotion rather than silently weakening the certificate;
 - the tested object has been copied from the mirror into `refs/tollgate/tested/<buildset-id>` and re-verified in the authoritative object database;
 - when push is enabled, a fresh fetch proves the configured remote is at the expected remote OID.
@@ -535,13 +536,13 @@ SQLite and Git cannot share one transaction, so promotion uses a durable intent 
 3. Use `git update-ref` with both new and expected old OIDs. If audit/ref cleanup is combined, use `update-ref --stdin` with `start`, `prepare`, and `commit` so all lockable ref changes succeed together.
 4. In a second full-durability SQLite transaction, mark the intent complete, the item promoted, and the next head eligible; emit `promotion.completed` with the actual OID.
 
-All authoritative internal ref changes use the frozen hooks-disabled Git profile. A multi-ref `update-ref` transaction gives all-or-none command success and per-ref atomic replacement, but readers outside the transaction may observe ref updates at different instants. No correctness decision therefore depends on a simultaneous unlocked read of `master` and a hidden ref. The supervisor serializes its own reads, and recovery verifies each ref independently against the intent before finalizing or blocking.
+All authoritative internal ref changes use the frozen hooks-disabled Git profile. A multi-ref `update-ref` transaction gives all-or-none command success and per-ref atomic replacement, but readers outside the transaction may observe ref updates at different instants. No correctness decision therefore depends on a simultaneous unlocked read of `release` and a hidden ref. The supervisor serializes its own reads, and recovery verifies each ref independently against the intent before finalizing or blocking.
 
 Recovery inspects every incomplete intent:
 
-- If `master == tested_new`, re-verify the certificate and finalize the database event idempotently.
-- If `master == expected_old`, no ref change occurred. Retry only if every precondition is still valid; otherwise cancel the intent and regenerate.
-- If `master` is any other OID, do not guess. Enter external-movement reconciliation.
+- If `release == tested_new`, re-verify the certificate and finalize the database event idempotently.
+- If `release == expected_old`, no ref change occurred. Retry only if every precondition is still valid; otherwise cancel the intent and regenerate.
+- If `release` is any other OID, do not guess. Enter external-movement reconciliation.
 
 The implementation must fault-inject a crash before and after every durable boundary and Git operation.
 
@@ -553,16 +554,16 @@ After promoting A, the supervisor reevaluates B rather than blindly consuming a 
 
 Push is off by default. When enabled, each promotion has two durable phases: local CAS, then leased remote push. Before local CAS, Tollgate fetches the remote and requires its branch to equal the recorded expected remote OID. After CAS it pushes the exact tested OID with an explicit expected-value lease. It never uses an unqualified force.
 
-Remote observation and push use exact refs rather than human output or an implicitly updated tracking branch:
+Remote observation and push use exact refs rather than human output or an implicitly updated tracking branch. Local `release` maps to the configured remote branch, normally `master`:
 
-1. Fetch configured remote `refs/heads/master` into a dedicated Tollgate-owned remote-observation ref with an explicit refspec, record the fetched OID or explicit nonexistence, and never fetch directly into local `master`.
+1. Fetch configured remote `refs/heads/master` into a dedicated Tollgate-owned remote-observation ref with an explicit refspec, record the fetched OID or explicit nonexistence, and never fetch directly into local `master` or local `release`.
 2. Require that observation to equal the push intent's expected remote OID before local CAS. Missing, inaccessible, and divergent remote refs are distinct results.
 3. After local CAS, push exactly `<tested-oid>:refs/heads/master` with `--force-with-lease=refs/heads/master:<expected-remote-oid>` and machine-readable status. Expected nonexistence uses Git's explicit empty expected-value lease form and is never conflated with an unknown observation. A configured local `pre-push` hook may reject this user-initiated operation; Tollgate records that as a failed attempt.
 4. After transport success, query the exact remote ref directly using stable Git plumbing equivalent to `ls-remote --refs <remote> refs/heads/master`. Only an observed OID equal to the tested OID changes remote state to `synchronized`.
 
-If exact observation succeeds, record it, change the locally integrated item from `promoted-local-push-pending` to `promoted`, and allow the next promotion. If push or observation fails after local CAS, local `master` remains correctly promoted, the item's remote state becomes `push-blocked`, and the repository promotion barrier remains closed. Running validations may finish; no later item promotes. `tg push` retries only the exact sequence of Tollgate-certified local promotions. Source cleanup waits for the push barrier when push is enabled.
+If exact observation succeeds, record it, change the locally integrated item from `promoted-local-push-pending` to `promoted`, and allow the next promotion. If push or observation fails after local CAS, local `release` remains correctly promoted, the item's remote state becomes `push-blocked`, and the repository promotion barrier remains closed. Running validations may finish; no later item promotes. `tg push` retries only the exact sequence of Tollgate-certified local promotions. Source cleanup waits for the push barrier when push is enabled.
 
-An unfinished push intent freezes remote identity, URL, branch, expected OID/nonexistence, and local promoted chain. An ordinary configuration apply cannot disable pushing, change that remote target, or retarget the intent. The user must first complete the frozen push or use an explicit `tg reconcile` action that previews and records abandonment of the remote promise. Abandonment never rolls back local `master`; it marks the item `promoted`, records remote state as deliberately unsynchronized/disabled history, invalidates affected later generations under the newly applied policy, and only then releases the barrier and cleanup decision. Other configuration changes may be activated while push is blocked, but they cannot release the promotion barrier or mutate the frozen push intent.
+An unfinished push intent freezes remote identity, URL, branch, expected OID/nonexistence, and local promoted chain. An ordinary configuration apply cannot disable pushing, change that remote target, or retarget the intent. The user must first complete the frozen push or use an explicit `tg reconcile` action that previews and records abandonment of the remote promise. Abandonment never rolls back local `release`; it marks the item `promoted`, records remote state as deliberately unsynchronized/disabled history, invalidates affected later generations under the newly applied policy, and only then releases the barrier and cleanup decision. Other configuration changes may be activated while push is blocked, but they cannot release the promotion barrier or mutate the frozen push intent.
 
 Network unavailability does not cancel running CI. It prevents promotion at the remote preflight, or creates `push-blocked` if connectivity disappears after local CAS.
 
@@ -570,34 +571,34 @@ Network unavailability does not cancel running CI. It prevents promotion at the 
 
 Tollgate watches authoritative refs/worktree metadata and, more importantly, revalidates them before every transition where correctness depends on them.
 
-- External fast-forward of `master`: pause dispatch briefly, invalidate affected validation generations, adopt the new tip, remove queued source OIDs that are literal ancestors of the new tip, and rebuild the rest under the active local configuration. Additionally, if the new history contains an active item's exact current synthetic tested OID, verify that OID's stored generation inputs and object bytes, mark that item `externally-integrated` without creating a Tollgate pass or promotion event, and recompute descendants from the adopted base. Patch equivalence alone never qualifies. If the new tip contains a synthetic OID whose ownership or generation cannot be proved, block for reconciliation rather than applying the source patch again.
-- Non-fast-forward, deletion, unrelated replacement, or `master` becoming checked out: block the repository until explicit reconciliation.
+- External fast-forward of local `release`: pause dispatch briefly, invalidate affected validation generations, adopt the new tip, remove queued source OIDs that are literal ancestors of the new tip, and rebuild the rest under the active local configuration. Additionally, if the new history contains an active item's exact current synthetic tested OID, verify that OID's stored generation inputs and object bytes, mark that item `externally-integrated` without creating a Tollgate pass or promotion event, and recompute descendants from the adopted base. Patch equivalence alone never qualifies. If the new tip contains a synthetic OID whose ownership or generation cannot be proved, block for reconciliation rather than applying the source patch again.
+- Non-fast-forward, deletion, unrelated replacement, or local `release` becoming checked out: block the repository until explicit reconciliation. Movement of user-owned local `master` alone is not an integration-ref event.
 - Ref movement during CAS: CAS fails without writing; apply the same classification.
 
 Patch equivalence or patch IDs never prove that an item was externally integrated. Only literal ancestry permits automatic dequeue.
 
 ### 10.6 `tg pull`
 
-`tg pull` is the safe integration-branch pull operation:
+`tg pull` is the safe Tollgate integration-branch pull operation:
 
-1. Fetch the configured remote without checking out `master`.
-2. If remote `master` is a strict fast-forward of local `master`, CAS local `master` to the remote OID, record an external-base event, and rebuild the queue under the active local configuration.
+1. Fetch the configured remote without updating either checked-out local `master` or Tollgate-owned local `release` implicitly.
+2. If remote `master` is a strict fast-forward of local `release`, CAS local `release` to the remote OID, record an external-base event, and rebuild the queue under the active local configuration.
 3. If local is equal or ahead, report no inbound update and show unpushed certified commits.
 4. If the refs diverge, create no merge/rebase; block for `tg reconcile`.
 
 When automatic pushing is enabled, remote `master` is authoritative: periodic fetch and the mandatory pre-promotion fetch adopt an inbound fast-forward immediately, invalidating runs that can no longer promote/push as tested. Fetch errors are visible but do not stop tests. With pushing disabled, automatic fetch only notifies; the user chooses when `tg pull` adopts the remote.
 
-Ordinary `git pull` remains appropriate in a feature worktree because it updates that feature branch, not Tollgate-owned `master`.
+Ordinary `git pull --ff-only` remains appropriate in the primary `master` worktree. It updates the user-owned branch and its files, never Tollgate-owned `release`.
 
 ### 10.7 `tg push` and reconciliation
 
-`tg push` pushes only a contiguous chain of exact Tollgate-promoted local `master` commits. It is not a feature-branch push wrapper. It refuses when local `master` contains an uncertified external commit, when the remote lease is unknown/stale, or when history diverges.
+`tg push` pushes only a contiguous chain of exact Tollgate-promoted local `release` commits to the configured remote branch. It is not a feature-branch push wrapper. It refuses when local `release` contains an uncertified external commit, when the remote lease is unknown/stale, or when history diverges.
 
-`tg reconcile` is an explicit guided operation for rewritten/deleted/diverged refs. It presents local master, last certified master, remote master, active queue base, and pending intents. Accepting a new base never blesses it as Tollgate-validated; it records external adoption, invalidates all active validation generations, and rebuilds. Any Git history repair itself remains an explicit user-directed Git action unless a previewed fast-forward/CAS is sufficient.
+`tg reconcile` is an explicit guided operation for rewritten/deleted/diverged refs. It presents local release, last certified release, remote master, active queue base, and pending intents. Accepting a new base never blesses it as Tollgate-validated; it records external adoption, invalidates all active validation generations, and rebuilds. Any Git history repair itself remains an explicit user-directed Git action unless a previewed fast-forward/CAS is sufficient.
 
 ### 10.8 Gate-aware Git conveniences
 
-- `tg update`: rebase the current clean, unqueued feature branch onto current `master`, then verify it has one unique source commit and report its new OID.
+- `tg update`: rebase the current clean, unqueued feature branch onto current gated `release`, then verify it has one unique source commit and report its new OID.
 - `tg worktree create`: create a feature branch/worktree from the gated tip using configurable placement defaults.
 - `tg worktree remove`: apply queued/landed/dirty safety checks before removal.
 
@@ -829,7 +830,7 @@ An idle donor is one whose buildset is durably terminal, whose worker lifetime c
 
 Automatic seed snapshots occur after:
 
-- a successful bootstrap validation of `master`; and
+- a successful bootstrap validation of `release`; and
 - a successful promoted-head validation when its cache profile materially improves the current seed.
 
 They do not occur after every passing speculative descendant. `tg cache snapshot` may capture an idle eligible slot manually.
@@ -926,7 +927,7 @@ The scheduler selects both buildsets awaiting slots and runnable steps awaiting 
 
 Repository `pause` stops new dispatch and promotion while allowing active commands to finish and record results. `resume` rechecks structural validity before using any completed result. Global pause applies the same rule to all repositories. Cancel/dequeue is separate and destructive to active work.
 
-Blocking states such as remote divergence, invalid trusted config, checked-out `master`, exhausted push failure, state corruption, or ambiguous recovery stop promotion and any work whose inputs cannot be proven. Unrelated repositories continue.
+Blocking states such as remote divergence, invalid trusted config, checked-out `release`, exhausted push failure, state corruption, or ambiguous recovery stop promotion and any work whose inputs cannot be proven. Unrelated repositories continue.
 
 ### 15.4 Background behavior
 
@@ -940,7 +941,7 @@ The initial CLI surface is:
 
 | Command | Contract |
 | --- | --- |
-| `tg init` | Register repository, create the trusted local config, validate Git/shell/APFS/master ownership, configure resources, optionally detach clean `master`, provision a slot, and offer bootstrap CI. |
+| `tg init` | Register repository, create Tollgate-owned local `release` at the exact local `master` OID without changing the checkout, create the trusted local config, validate Git/shell/APFS/ref ownership, configure resources, provision a slot, and offer bootstrap CI. |
 | `tg repo add/remove/list` | Explicit registry management. Remove unregisters by default; it does not erase durable repository state. |
 | `tg approve [<rev>] [--wait]` | Capture clean immutable source, enqueue, return item ID; optionally wait. |
 | `tg queue` | Ordered active queue, queue revision, per-item validation generations, dependencies, states, and prefix OIDs. |
@@ -953,9 +954,9 @@ The initial CLI surface is:
 | `tg check [<rev>] [--wait]` | Independent validation with no promotion. |
 | `tg pause/resume` | Non-destructive repository gate hold. |
 | `tg pull` | Gate-aware fetch and fast-forward adoption. |
-| `tg push` | Push only contiguous certified `master` commits with a lease. |
+| `tg push` | Push only contiguous certified local `release` commits to the configured remote branch with a lease. |
 | `tg reconcile` | Guided external movement/divergence recovery. |
-| `tg update` | Safe one-commit feature rebase onto current gated `master`. |
+| `tg update` | Safe one-commit feature rebase onto current gated `release`. |
 | `tg worktree create/remove` | Gate-aware feature worktree lifecycle. |
 | `tg env reload/show` | Bootstrap and diagnose shell environment. |
 | `tg config validate/explain/regenerate/apply` | Validate, inspect, regenerate, preview, and explicitly activate the single local configuration. |
@@ -1034,17 +1035,17 @@ Accessibility requirements include keyboard access to every operation, non-color
 Initialization is resumable and includes:
 
 1. Resolve/canonicalize the Git common directory and create repository UUID/lock scope.
-2. Probe system Git version/features, object format, worktree state, and `master`.
-3. Require or offer to detach a clean checked-out `master`.
+2. Probe system Git version/features, object format, worktree state, local `master`, and any pre-existing local `release`.
+3. Atomically create local `release` at the exact local `master` OID, or refuse to overwrite a divergent pre-existing branch; leave the current checkout unchanged.
 4. Register the repository explicitly with the app.
 5. Bootstrap the login-shell environment and show tool resolution.
 6. Detect repository templates and write the editable trusted local configuration.
 7. Detect every authoritative/log/artifact/cache volume, APFS clone capability, shared-volume roles, and propose global/repository resource budgets plus per-volume warning/critical/emergency storage thresholds.
 8. Create/synchronize the execution mirror.
 9. Provision the first slot.
-10. With explicit confirmation, run validation on current `master` to verify commands and create the first successful warm seed.
+10. With explicit confirmation, run validation on current `release` to verify commands and create the first successful warm seed.
 
-`--no-bootstrap` skips step 10 and warns that the first approval starts cold. A failing baseline records `baseline-failing`, sends a failure notification, and leaves the gate usable because the next change may fix `master`. It does not automatically publish a failed slot as a seed.
+`--no-bootstrap` skips step 10 and warns that the first approval starts cold. A failing baseline records `baseline-failing`, sends a failure notification, and leaves the gate usable because the next change may fix `release`. It does not automatically publish a failed slot as a seed.
 
 ### 18.2 `tg doctor`
 
@@ -1072,7 +1073,7 @@ The app acquires its single-instance lock, opens/migrates global preferences, th
 
 1. Acquires the repository ownership lock.
 2. Opens SQLite, checks integrity, and reads the last clean-shutdown marker.
-3. Resolves authoritative Git common directory, `master`, worktrees, hidden refs, and object reachability.
+3. Resolves the authoritative Git common directory, Tollgate-owned `release`, user-owned `master`, worktrees, hidden refs, and object reachability.
 4. Reconciles incomplete approval, promotion, push, cleanup, artifact, seed, and pruning intents.
 5. Reconciles mirror/worktree/slot registrations and terminates or quarantines leftover workers.
 6. Marks active buildsets interrupted and creates new attempts or validation generations as required.
@@ -1088,7 +1089,7 @@ Intent reconciliation uses this evidence matrix:
 | Approval | retention ref equals recorded source OID and all recorded source/dependency inputs still verify | ref is absent | block; delete only with the recorded old-OID assertion after explicit intent cancellation |
 | Tested-object retention | tested ref equals recorded tested OID and object parent/tree/content verify | tested ref is absent | block |
 | Result completion | matching live worker terminal frame was received without lifetime-channel loss, logs are complete/durable, process group is reaped, and final checkout verification is recorded | any missing supervision evidence means the buildset is interrupted, never successful | block on contradictory durable evidence |
-| Promotion | authoritative `master` equals recorded tested-new OID and certificate still verifies | `master` equals expected-old and all other owned refs show no committed change | external-movement block |
+| Promotion | authoritative `release` equals recorded tested-new OID and certificate still verifies | `release` equals expected-old and all other owned refs show no committed change | external-movement block |
 | Push | direct remote observation equals recorded tested OID | remote still equals exact expected-old/nonexistence and local promoted chain still verifies | `push-blocked`/divergence |
 | Cleanup | each worktree path, registration, branch ref, and old OID independently matches the completed sub-operation evidence | unchanged owned worktree/ref still matches the pre-cleanup snapshot | `needs-attention`; never recreate or delete by guess |
 | Artifact publication | final path has exclusive ownership marker and manifest/hash/size match | final path absent and only owned staging exists | quarantine conflicting/partial paths |
@@ -1153,7 +1154,7 @@ The pure domain state machine must have exhaustive transition tests and property
 
 - no `promotion.completed` without a current valid certificate;
 - promoted OID always equals certified tested OID;
-- promoted commit parent always equals old master;
+- promoted commit parent always equals old release;
 - queue order always topologically respects hard dependencies;
 - any prefix change invalidates exactly the affected descendant buildsets;
 - appending a tail item never invalidates an earlier item's validation generation;
@@ -1190,7 +1191,7 @@ Use temporary real Git repositories and the supported system Git. Cover:
 - checked-in golden transplant OIDs for the complete Git-semantics profile under SHA-1 and SHA-256;
 - proof that internal plumbing cannot invoke repository hooks and that a user `pre-push` hook rejection becomes only a push failure;
 - source branch amendment/supersession;
-- checked-out `master` rejection;
+- checked-out `release` rejection while checked-out user-owned `master` remains allowed;
 - external local fast-forward, rewind, deletion, and CAS race;
 - external fast-forward containing an exact active synthetic tested OID, including provable adoption and ambiguous-ownership blocking;
 - hidden-ref/object reachability and garbage collection;
@@ -1244,7 +1245,7 @@ v1 is not releasable until:
 - randomized gate-model tests find no divergent final history;
 - no supervised child command survives app crash/quit beyond the bounded termination interval; deliberately daemonizing/session-escaping commands are diagnosed as unsupported;
 - APFS cold/new-slot/warm-slot behavior is measured on Tahoe Apple Silicon;
-- external master/remote movement never produces an automatic merge, rewrite, or unleased push;
+- external release/remote movement never produces an automatic merge, rewrite, or unleased push;
 - a 10 MiB/s log producer cannot block on a hidden or slow UI;
 - every CLI queue mutation has an equivalent UI action and both call the same service handler;
 - destructive filesystem tests prove operations remain inside recorded Tollgate-owned roots;
