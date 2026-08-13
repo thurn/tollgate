@@ -4,15 +4,14 @@ import { listen } from "@tauri-apps/api/event";
 import { getItemDetails, getSnapshot } from "../lib/api";
 import { isTauri } from "../lib/utils";
 
-export type Route = "queue" | "history" | "resources" | "storage" | "configuration" | "doctor";
+export type Route = "queue" | "history";
 
 export function useAppState() {
   const queryClient = useQueryClient();
   const query = useQuery({ queryKey: ["snapshot"], queryFn: getSnapshot, refetchInterval: isTauri() ? 2_000 : false });
   const [repositoryId, setRepositoryId] = useState(() => localStorage.getItem("tollgate.repository"));
-  const [route, setRouteState] = useState<Route>(() => (localStorage.getItem("tollgate.route") as Route | null) ?? "queue");
+  const [route, setRouteState] = useState<Route>(() => localStorage.getItem("tollgate.route") === "history" ? "history" : "queue");
   const [selectedItemId, setSelectedItemId] = useState<string | null>(() => localStorage.getItem("tollgate.item"));
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => localStorage.getItem("tollgate.sidebar") === "collapsed");
 
   useEffect(() => {
     if (!isTauri()) return;
@@ -51,7 +50,5 @@ export function useAppState() {
   function selectRepository(id: string) { setRepositoryId(id); localStorage.setItem("tollgate.repository", id); setSelectedItemId(null); remember({ repositoryId: id, route, selectedItemId: null }); }
   function setRoute(value: Route) { setRouteState(value); localStorage.setItem("tollgate.route", value); remember({ repositoryId, route: value, selectedItemId }); }
   function selectItem(id: string | null) { setSelectedItemId(id); if (id) localStorage.setItem("tollgate.item", id); else localStorage.removeItem("tollgate.item"); remember({ repositoryId, route, selectedItemId: id }); }
-  function toggleSidebar() { setSidebarCollapsed((current) => { localStorage.setItem("tollgate.sidebar", current ? "expanded" : "collapsed"); return !current; }); }
-
-  return { ...query, snapshot: query.data, repository, selectedItem, repositoryId, route, sidebarCollapsed, selectRepository, setRoute, selectItem, toggleSidebar };
+  return { ...query, snapshot: query.data, repository, selectedItem, repositoryId, route, selectRepository, setRoute, selectItem };
 }

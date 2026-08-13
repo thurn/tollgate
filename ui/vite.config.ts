@@ -13,8 +13,6 @@ export default defineConfig({
     rollupOptions: {
       output: {
         manualChunks: {
-          motion: ["framer-motion"],
-          radix: ["@radix-ui/react-dialog", "@radix-ui/react-progress", "@radix-ui/react-separator", "@radix-ui/react-tooltip"],
           query: ["@tanstack/react-query"],
         },
       },
