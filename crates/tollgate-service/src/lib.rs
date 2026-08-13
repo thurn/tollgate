@@ -322,6 +322,8 @@ pub struct ApproveResult {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CandidateAuthorizationResult {
     pub item_id: QueueItemId,
+    #[serde(default)]
+    pub authorized_item_ids: Vec<QueueItemId>,
     pub queue_revision: u64,
     pub source_oid: GitOid,
     pub validation_generation_id: ValidationGenerationId,
@@ -3816,7 +3818,14 @@ impl TollgateService {
             &tokio::fs::read_to_string(runtime.git.common_dir.join("tollgate/config.toml")).await?,
         )?;
         let observed_master = runtime.git.integration_oid().await?;
-        let (mut item, generation, mut state, validation_complete, evidence_reused) = {
+        let (
+            item,
+            mut items_to_authorize,
+            generation,
+            mut state,
+            validation_complete,
+            evidence_reused,
+        ) = {
             let data = runtime.data.lock();
             if data.state.execution_state != RepositoryExecutionState::Active {
                 return Err(ServiceError::RepositoryUnavailable(
@@ -3850,9 +3859,71 @@ impl TollgateService {
                     "promotion authority can only be granted to an active gate candidate".into(),
                 ));
             }
-            if item.promotion_authorized {
+
+            fn append_active_dependencies(
+                item_id: QueueItemId,
+                by_id: &HashMap<QueueItemId, QueueItem>,
+                ordered: &mut Vec<QueueItem>,
+                visiting: &mut HashSet<QueueItemId>,
+            ) -> Result<(), ServiceError> {
+                if !visiting.insert(item_id) {
+                    return Err(ServiceError::Invariant(
+                        "candidate dependency cycle prevents authorization".into(),
+                    ));
+                }
+                let item = by_id
+                    .get(&item_id)
+                    .ok_or(ServiceError::ItemNotFound(item_id))?;
+                for dependency_id in &item.dependencies {
+                    let dependency = by_id
+                        .get(dependency_id)
+                        .ok_or(ServiceError::ItemNotFound(*dependency_id))?;
+                    if dependency.state.is_terminal() {
+                        if matches!(
+                            dependency.state,
+                            QueueItemState::Promoted | QueueItemState::ExternallyIntegrated
+                        ) {
+                            continue;
+                        }
+                        return Err(ServiceError::Invariant(format!(
+                            "candidate dependency {dependency_id} is terminal in state {:?}",
+                            dependency.state
+                        )));
+                    }
+                    if dependency.kind != QueueItemKind::Gate {
+                        return Err(ServiceError::Invariant(format!(
+                            "candidate dependency {dependency_id} is not a gate"
+                        )));
+                    }
+                    append_active_dependencies(*dependency_id, by_id, ordered, visiting)?;
+                }
+                visiting.remove(&item_id);
+                if !ordered.iter().any(|candidate| candidate.id == item_id) {
+                    ordered.push(item.clone());
+                }
+                Ok(())
+            }
+
+            let by_id = data
+                .items
+                .iter()
+                .cloned()
+                .map(|candidate| (candidate.id, candidate))
+                .collect::<HashMap<_, _>>();
+            let mut authorization_closure = Vec::new();
+            append_active_dependencies(
+                item_id,
+                &by_id,
+                &mut authorization_closure,
+                &mut HashSet::new(),
+            )?;
+            let items_to_authorize = authorization_closure
+                .into_iter()
+                .filter(|candidate| !candidate.promotion_authorized)
+                .collect::<Vec<_>>();
+            if items_to_authorize.is_empty() {
                 return Err(ServiceError::Invariant(
-                    "candidate already has promotion authority".into(),
+                    "candidate and its active dependencies already have promotion authority".into(),
                 ));
             }
             let generation = data
@@ -3878,6 +3949,7 @@ impl TollgateService {
             let validation_complete = item.state == QueueItemState::Ready;
             (
                 item,
+                items_to_authorize,
                 generation,
                 data.state.clone(),
                 validation_complete,
@@ -3889,12 +3961,32 @@ impl TollgateService {
                 "candidate source retention ref no longer names the exact submitted commit".into(),
             ));
         }
+        for candidate in &items_to_authorize {
+            if candidate.id == item.id {
+                continue;
+            }
+            if runtime.git.optional_ref_oid(&candidate.source_ref).await?
+                != Some(candidate.source_oid.clone())
+            {
+                return Err(ServiceError::Invariant(format!(
+                    "candidate source retention ref for {} no longer names the exact submitted commit",
+                    candidate.id
+                )));
+            }
+        }
         let authorized_at = OffsetDateTime::now_utc();
-        item.promotion_authorized = true;
-        item.promotion_authorized_at = Some(authorized_at);
-        item.promotion_authorized_by = Some(command_id);
+        for candidate in &mut items_to_authorize {
+            candidate.promotion_authorized = true;
+            candidate.promotion_authorized_at = Some(authorized_at);
+            candidate.promotion_authorized_by = Some(command_id);
+        }
+        let authorized_item_ids = items_to_authorize
+            .iter()
+            .map(|candidate| candidate.id)
+            .collect::<Vec<_>>();
         let result = CandidateAuthorizationResult {
             item_id,
+            authorized_item_ids,
             queue_revision: expected_revision + 1,
             source_oid: item.source_oid.clone(),
             validation_generation_id: generation.id,
@@ -3905,7 +3997,7 @@ impl TollgateService {
         };
         let event = runtime.store.authorize_candidate(
             &state,
-            &item,
+            &items_to_authorize,
             expected_revision,
             command_id,
             &request_digest,
@@ -3916,8 +4008,14 @@ impl TollgateService {
         {
             let mut data = runtime.data.lock();
             data.state = state;
-            if let Some(existing) = data.items.iter_mut().find(|entry| entry.id == item_id) {
-                *existing = item;
+            for authorized in items_to_authorize {
+                if let Some(existing) = data
+                    .items
+                    .iter_mut()
+                    .find(|entry| entry.id == authorized.id)
+                {
+                    *existing = authorized;
+                }
             }
         }
         let _ = runtime.events.send(event);
@@ -12566,6 +12664,157 @@ policy = "clone"
                 .filter(|event| event.kind == "candidate.promotion-authorized")
                 .count(),
             2
+        );
+    }
+
+    #[tokio::test]
+    async fn authorizing_a_candidate_atomically_authorizes_its_active_dependencies() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        let a_worktree = temporary.path().join("candidate-a");
+        let b_worktree = temporary.path().join("candidate-b");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", "master"]);
+        std::fs::write(repository.join("base.txt"), "base\n").unwrap();
+        git(&repository, &["add", "base.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+        let original_master = git(&repository, &["rev-parse", "master"]);
+
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "candidate-a",
+                a_worktree.to_str().unwrap(),
+                "master",
+            ],
+        );
+        std::fs::write(a_worktree.join("a.txt"), "a\n").unwrap();
+        git(&a_worktree, &["add", "a.txt"]);
+        git(&a_worktree, &["commit", "-m", "candidate-a"]);
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "candidate-b",
+                b_worktree.to_str().unwrap(),
+                "candidate-a",
+            ],
+        );
+        std::fs::write(b_worktree.join("b.txt"), "b\n").unwrap();
+        git(&b_worktree, &["add", "b.txt"]);
+        git(&b_worktree, &["commit", "-m", "candidate-b"]);
+        git(&repository, &["switch", "--detach", "master"]);
+
+        let service = TollgateService::open(temporary.path().join("support"))
+            .await
+            .unwrap();
+        let initialized = service
+            .initialize_repository(&repository, Some("test -f a.txt".into()))
+            .await
+            .unwrap();
+        let a = service
+            .submit_candidate_from(
+                initialized.state.id,
+                "HEAD".into(),
+                Some(a_worktree.to_string_lossy().into_owned()),
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        let b = service
+            .submit_candidate_from(
+                initialized.state.id,
+                "HEAD".into(),
+                Some(b_worktree.to_string_lossy().into_owned()),
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let revision = loop {
+            let snapshot = service
+                .repository_snapshot(initialized.state.id)
+                .await
+                .unwrap();
+            if snapshot.queue.iter().all(|view| {
+                view.item.state == QueueItemState::Ready && !view.item.promotion_authorized
+            }) {
+                assert_eq!(
+                    snapshot
+                        .queue
+                        .iter()
+                        .find(|view| view.item.id == b.item_id)
+                        .unwrap()
+                        .item
+                        .dependencies,
+                    vec![a.item_id]
+                );
+                break snapshot.state.queue_revision;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "dependent candidates did not finish validation"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        };
+
+        let authorization_command = CommandId::new();
+        let authorized = service
+            .authorize_candidate(
+                initialized.state.id,
+                b.item_id,
+                revision,
+                authorization_command,
+            )
+            .await
+            .unwrap();
+        assert_eq!(authorized.item_id, b.item_id);
+        assert_eq!(authorized.authorized_item_ids, vec![a.item_id, b.item_id]);
+        assert!(authorized.validation_complete);
+        assert!(authorized.evidence_reused);
+        assert_eq!(
+            git(&repository, &["rev-parse", INTEGRATION_REF]),
+            b.tested_oid.to_hex()
+        );
+        assert_ne!(
+            git(&repository, &["rev-parse", INTEGRATION_REF]),
+            original_master
+        );
+
+        let snapshot = service
+            .repository_snapshot(initialized.state.id)
+            .await
+            .unwrap();
+        assert!(snapshot.queue.is_empty());
+        for item_id in [a.item_id, b.item_id] {
+            let view = snapshot
+                .history_items
+                .iter()
+                .find(|view| view.item.id == item_id)
+                .unwrap();
+            assert_eq!(view.item.state, QueueItemState::Promoted);
+            assert!(view.item.promotion_authorized);
+            assert_eq!(
+                view.item.promotion_authorized_by,
+                Some(authorization_command)
+            );
+            assert_eq!(
+                view.item.promotion_authorized_at,
+                Some(authorized.authorized_at)
+            );
+        }
+        assert_eq!(
+            snapshot
+                .history
+                .iter()
+                .filter(|event| event.kind == "candidate.promotion-authorized")
+                .count(),
+            1
         );
     }
 

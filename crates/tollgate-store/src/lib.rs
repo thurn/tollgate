@@ -550,7 +550,7 @@ impl RepositoryStore {
     pub fn authorize_candidate(
         &self,
         state: &RepositoryState,
-        item: &QueueItem,
+        items: &[QueueItem],
         expected_revision: u64,
         command_id: CommandId,
         request_digest: &str,
@@ -570,14 +570,22 @@ impl RepositoryStore {
         }
         let new_revision = revision + 1;
         let new_sequence = sequence + 1;
-        let changed = transaction.execute(
-            "UPDATE queue_items SET item_json=?2 WHERE item_id=?1 AND active=1",
-            params![item.id.to_string(), encode(item)?],
-        )?;
-        if changed != 1 {
+        if items.is_empty() {
             return Err(StoreError::Integrity(
-                "candidate authorization did not update exactly one active item".into(),
+                "candidate authorization did not include any active items".into(),
             ));
+        }
+        for item in items {
+            let changed = transaction.execute(
+                "UPDATE queue_items SET item_json=?2 WHERE item_id=?1 AND active=1",
+                params![item.id.to_string(), encode(item)?],
+            )?;
+            if changed != 1 {
+                return Err(StoreError::Integrity(format!(
+                    "candidate authorization did not update active item {} exactly once",
+                    item.id
+                )));
+            }
         }
         let mut persisted_state = state.clone();
         persisted_state.queue_revision = new_revision as u64;

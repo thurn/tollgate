@@ -296,12 +296,18 @@ async fn run(cli: Cli) -> anyhow::Result<u8> {
             };
             print_value(response.clone(), cli.json, |value| {
                 println!(
-                    "Approved {}{}\n  source  {}\n  tested  {}\n  queue revision {}",
+                    "Approved {}{}\n  authority  {}\n  source  {}\n  tested  {}\n  queue revision {}",
                     value["item_id"].as_str().unwrap_or("?"),
                     if value["evidence_reused"].as_bool() == Some(true) {
                         " (completed validation reused)"
                     } else {
                         ""
+                    },
+                    match value["authorized_item_ids"].as_array() {
+                        Some(items) if items.len() > 1 => {
+                            format!("{} candidates (including dependencies)", items.len())
+                        }
+                        _ => "1 candidate".into(),
                     },
                     oid_value(&value["source_oid"]),
                     oid_value(&value["tested_oid"]),
