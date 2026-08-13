@@ -31,6 +31,8 @@ pub enum ConfigError {
 #[serde(deny_unknown_fields)]
 pub struct ConfigFile {
     pub version: u16,
+    #[serde(default = "default_true")]
+    pub sync_user_master: bool,
     #[serde(default)]
     pub runner: Option<Vec<String>>,
     #[serde(default)]
@@ -190,6 +192,10 @@ const fn default_true() -> bool {
     true
 }
 
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ArtifactFile {
@@ -208,6 +214,8 @@ const fn default_retention_days() -> u16 {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct EffectiveConfig {
     pub version: u16,
+    #[serde(default = "default_true")]
+    pub sync_user_master: bool,
     pub runner: Vec<String>,
     pub allow_no_job: bool,
     pub allow_concurrent_roots: bool,
@@ -296,6 +304,8 @@ impl EffectiveConfig {
         #[derive(Serialize)]
         struct Canonical<'a> {
             version: u16,
+            #[serde(skip_serializing_if = "is_true")]
+            sync_user_master: bool,
             runner: &'a [String],
             allow_no_job: bool,
             allow_concurrent_roots: bool,
@@ -306,6 +316,7 @@ impl EffectiveConfig {
         }
         Ok(serde_json::to_vec(&Canonical {
             version: self.version,
+            sync_user_master: self.sync_user_master,
             runner: &self.runner,
             allow_no_job: self.allow_no_job,
             allow_concurrent_roots: self.allow_concurrent_roots,
@@ -324,6 +335,8 @@ impl EffectiveConfig {
         #[derive(Deserialize)]
         struct Canonical {
             version: u16,
+            #[serde(default = "default_true")]
+            sync_user_master: bool,
             runner: Vec<String>,
             allow_no_job: bool,
             allow_concurrent_roots: bool,
@@ -335,6 +348,7 @@ impl EffectiveConfig {
         let value: Canonical = serde_json::from_slice(bytes)?;
         Ok(Self {
             version: value.version,
+            sync_user_master: value.sync_user_master,
             runner: value.runner,
             allow_no_job: value.allow_no_job,
             allow_concurrent_roots: value.allow_concurrent_roots,
@@ -460,6 +474,7 @@ impl EffectiveConfig {
         let step_graph_digest = graph_digest(&steps)?;
         let mut config = Self {
             version: 1,
+            sync_user_master: raw.sync_user_master,
             runner,
             allow_no_job: raw.allow_no_job,
             allow_concurrent_roots: raw.allow_concurrent_roots,
@@ -889,9 +904,54 @@ mod tests {
             EffectiveConfig::parse("version = 1\n[[step]]\nname = \"ci\"\nrun = \"./ci\"\n")
                 .unwrap();
         assert_eq!(config.runner, ["/bin/sh", "-c"]);
+        assert!(config.sync_user_master);
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&config.canonical_bytes().unwrap())
+                .unwrap()
+                .get("sync_user_master")
+                .is_none()
+        );
         assert_eq!(config.steps[0].timeout_ns, 60 * 60 * 1_000_000_000);
         assert_eq!(config.steps[0].working_directory, ".");
         assert_eq!(config.digest.len(), 64);
+    }
+
+    #[test]
+    fn user_master_synchronization_is_explicitly_opt_out() {
+        let config = EffectiveConfig::parse(
+            "version = 1\nsync_user_master = false\n[[step]]\nname = \"ci\"\nrun = \"./ci\"\n",
+        )
+        .unwrap();
+
+        assert!(!config.sync_user_master);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&config.canonical_bytes().unwrap())
+                .unwrap()
+                .get("sync_user_master"),
+            Some(&serde_json::Value::Bool(false))
+        );
+    }
+
+    #[test]
+    fn legacy_canonical_configuration_defaults_user_master_sync_on() {
+        let config =
+            EffectiveConfig::parse("version = 1\n[[step]]\nname = \"ci\"\nrun = \"./ci\"\n")
+                .unwrap();
+        let mut canonical: serde_json::Value =
+            serde_json::from_slice(&config.canonical_bytes().unwrap()).unwrap();
+        canonical
+            .as_object_mut()
+            .unwrap()
+            .remove("sync_user_master");
+
+        let restored = EffectiveConfig::restore_canonical(
+            &serde_json::to_vec(&canonical).unwrap(),
+            "legacy-digest".into(),
+            config.step_graph_digest,
+        )
+        .unwrap();
+
+        assert!(restored.sync_user_master);
     }
 
     #[test]

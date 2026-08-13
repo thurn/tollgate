@@ -7,6 +7,7 @@
   "required": ["version"],
   "properties": {
     "version": { "const": 1 },
+    "sync_user_master": { "type": "boolean", "default": true },
     "runner": { "$ref": "#/$defs/argv" },
     "allow_no_job": { "type": "boolean", "default": false },
     "allow_concurrent_roots": { "type": "boolean", "default": false },

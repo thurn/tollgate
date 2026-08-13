@@ -58,7 +58,7 @@ Tollgate maximizes incremental build reuse with persistent detached Git worktree
 
 | Term | Meaning |
 | --- | --- |
-| Authoritative repository | The user's real Git common directory and refs. Tollgate promotes only local `release`; user-owned local `master` remains outside its authority. |
+| Authoritative repository | The user's real Git common directory and refs. Tollgate promotes only local `release`; after certification it may safely fast-forward user-owned local `master` under the configured post-promotion policy. |
 | Execution mirror | A disposable bare Git repository under Tollgate's cache root. Synthetic commits and CI worktrees live here, isolating CI Git operations from authoritative refs. |
 | Source commit | The immutable, single-parent commit OID captured by `tg approve`. |
 | Queue item | One approval of one source commit, plus ordering, hard dependencies, attempts, and history. |
@@ -147,7 +147,7 @@ Each registered repository has:
 
 The app may supervise several repositories concurrently using one global resource pool. Cross-repository queue semantics do not exist in v1.
 
-Initialization leaves the developer's checkout unchanged and creates local `release` at the exact local `master` OID. Tollgate exclusively owns `release`, which must not be checked out in any worktree while the repository is active. Local `master` remains user-owned, may track `origin/master`, and may be committed to or pushed through ordinary Git. Direct pushes are explicitly uncertified external movement; Tollgate's remote lease detects them and requires adoption into `release` before certified promotion continues.
+Initialization leaves the developer's checkout unchanged and creates local `release` at the exact local `master` OID. Tollgate exclusively owns `release`, which must not be checked out in any worktree while the repository is active. Local `master` remains user-owned, may track `origin/master`, and may be committed to or pushed through ordinary Git. After a certified local promotion, or after its exact remote push when pushing is enabled, Tollgate fast-forwards local `master` by default. A checked-out `master` is updated only when its index and worktree are clean; a non-checked-out `master` uses an expected-old ref transaction. Dirty, missing, or divergent state produces a non-blocking needs-attention result. `sync_user_master = false` opts out. Direct pushes are explicitly uncertified external movement; Tollgate's remote lease detects them and requires adoption into `release` before certified promotion continues.
 
 ### 6.3 Normal workflow
 
@@ -156,7 +156,7 @@ Initialization leaves the developer's checkout unchanged and creates local `rele
 3. `tg candidate` captures `HEAD`, validates its shape and dependencies, creates `refs/tollgate/sources/<item-id>`, durably enqueues a non-promotable item, and returns its ID. `tg approve HEAD` remains a combined submit-and-authorize convenience.
 4. The app constructs synthetic prefixes, assigns new validation generations to affected items, and schedules eligible buildsets.
 5. `tg approve <candidate-id>` durably grants promotion authority to that exact retained source. A passing authorized head is promoted automatically; an unauthorized ready head remains queued with its certificate and does not modify local `release`.
-6. After local promotion, or after push succeeds when push is enabled, Tollgate automatically cleans up the source worktree and branch if all safety checks still pass.
+6. After local promotion, or after push succeeds when push is enabled, Tollgate synchronizes user-owned local `master` under the safe default-on policy, then automatically cleans up the source worktree and branch if all safety checks still pass.
 
 Automatic cleanup requires a non-primary linked worktree that is still at the captured source OID and has no tracked, staged, or non-ignored untracked changes. Branch deletion is an old-OID compare-and-swap. Ignored files in an eligible linked worktree are disposable by default. If any check fails, cleanup becomes `needs-attention`; promotion is never rolled back. The hidden source ref retains the commit for audit.
 
@@ -588,7 +588,7 @@ Patch equivalence or patch IDs never prove that an item was externally integrate
 
 When automatic pushing is enabled, remote `master` is authoritative: periodic fetch and the mandatory pre-promotion fetch adopt an inbound fast-forward immediately, invalidating runs that can no longer promote/push as tested. Fetch errors are visible but do not stop tests. With pushing disabled, automatic fetch only notifies; the user chooses when `tg pull` adopts the remote.
 
-Ordinary `git pull --ff-only` remains appropriate in the primary `master` worktree. It updates the user-owned branch and its files, never Tollgate-owned `release`.
+When automatic user-master synchronization is disabled or needs attention, ordinary `git pull --ff-only` remains the fallback in the primary `master` worktree. It updates the user-owned branch and its files, never Tollgate-owned `release`.
 
 ### 10.7 `tg push` and reconciliation
 
@@ -643,6 +643,8 @@ The execution engine understands only generic fields:
 - cleanup/finalizer command where explicitly needed;
 - cache path policy overrides and a user-controlled cache epoch.
 
+Post-promotion policy is independent of validation execution. `sync_user_master` defaults to true and may be set to false to keep local `master` entirely user-managed. Synchronization never changes the tested object, certification decision, authoritative `release` ref, or remote lease result.
+
 There is no language, framework, test suite, package manager, parser, or deployment primitive in the runtime schema. Multiple independent DAG roots may run concurrently within one slot only when explicitly configured; otherwise steps are sequential so they can safely share incremental output.
 
 An effective gate buildset must contain at least one voting step unless the trusted local configuration explicitly permits a no-job item. `tg init` never generates a no-job gate.
@@ -660,7 +662,7 @@ The v1 execution contract is:
 - Environment additions are a string-to-string map and removals are a unique string array. Names must match `[A-Za-z_][A-Za-z0-9_]*`; values must be NUL-free; a name present in both collections is rejected. Captured shell environment is the base, configuration removals apply second, configuration additions third, and Tollgate's documented read-only context variables last; configuration cannot override those context variables.
 - Artifact declarations contain a unique name, one or more safe relative patterns, `required` defaulting to false, and an explicit retention policy. Here `required` describes artifact presence only, not step voting.
 
-Configuration parsing rejects unknown fields. Canonicalization sorts maps and set-like arrays, preserves declaration order where it has execution meaning, expands every default, normalizes paths/durations/sizes, and includes the schema version and runner argv. `tg config explain` emits that complete canonical form. This document's field meanings and the checked-in machine-readable v1 schema are one compatibility contract; changing a meaning requires a schema or engine-epoch change.
+Configuration parsing rejects unknown fields. Canonicalization sorts maps and set-like arrays, preserves declaration order where it has execution meaning, expands validation-affecting defaults, normalizes paths/durations/sizes, and includes the schema version and runner argv. The default-true `sync_user_master` post-promotion preference is omitted from canonical bytes for compatibility with existing v1 configuration snapshots; an explicit false value is retained. `tg config explain` emits the complete effective policy. This document's field meanings and the checked-in machine-readable v1 schema are one compatibility contract; changing a validation-affecting meaning requires a schema or engine-epoch change.
 
 ### 11.3 Path matchers
 
@@ -1021,7 +1023,7 @@ Storage settings show separate budgets/usage for logs, retained artifacts, slots
 
 ### 17.6 Notifications
 
-macOS notifications are failure-only: conclusive validation failure, exhausted infrastructure attempts, setup/bootstrap failure, push failure, or repository block requiring reconciliation. Success, promotion, starts, retries, and ordinary invalidation do not notify. Clicking a notification opens the exact item/step. Per-repository mute and global quiet mode remain available.
+macOS notifications are failure/attention-only: conclusive validation failure, exhausted infrastructure attempts, setup/bootstrap failure, push failure, a user-master synchronization refusal, or repository block requiring reconciliation. Success, promotion, starts, retries, and ordinary invalidation do not notify. Clicking a notification opens the exact item/step. Per-repository mute and global quiet mode remain available.
 
 ### 17.7 Frontend implementation
 

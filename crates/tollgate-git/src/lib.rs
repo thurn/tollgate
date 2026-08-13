@@ -77,6 +77,22 @@ pub struct SyntheticCommit {
     pub tree_oid: GitOid,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "kebab-case")]
+pub enum UserMasterSyncOutcome {
+    UpdatedCheckout {
+        path: PathBuf,
+    },
+    UpdatedRef,
+    AlreadyCurrent {
+        path: Option<PathBuf>,
+    },
+    NeedsAttention {
+        path: Option<PathBuf>,
+        reason: String,
+    },
+}
+
 impl GitRepository {
     pub async fn discover(path: impl AsRef<Path>) -> Result<Self, GitError> {
         let path = path.as_ref();
@@ -212,6 +228,33 @@ impl GitRepository {
             }
         }
         Ok(())
+    }
+
+    async fn worktree_for_branch(&self, branch_ref: &str) -> Result<Option<PathBuf>, GitError> {
+        let bytes = self.git(["worktree", "list", "--porcelain", "-z"]).await?;
+        let mut current_path = None;
+        let mut matches = Vec::new();
+        for field in bytes.split(|byte| *byte == 0) {
+            if field.is_empty() {
+                current_path = None;
+            } else if let Some(path) = field.strip_prefix(b"worktree ") {
+                current_path = Some(PathBuf::from(String::from_utf8_lossy(path).into_owned()));
+            } else if field
+                .strip_prefix(b"branch ")
+                .is_some_and(|branch| branch == branch_ref.as_bytes())
+            {
+                matches.push(current_path.clone().ok_or_else(|| {
+                    GitError::InvalidOutput("worktree branch record omitted its path".into())
+                })?);
+            }
+        }
+        match matches.as_slice() {
+            [] => Ok(None),
+            [path] => Ok(Some(path.clone())),
+            _ => Err(GitError::InvalidOutput(format!(
+                "branch `{branch_ref}` is checked out in multiple worktrees"
+            ))),
+        }
     }
 
     pub async fn ensure_clean(&self) -> Result<(), GitError> {
@@ -924,6 +967,116 @@ impl GitRepository {
         Ok(())
     }
 
+    pub async fn sync_user_master(
+        &self,
+        tested_new: &GitOid,
+        remote_tracking: Option<(&str, &str)>,
+    ) -> Result<UserMasterSyncOutcome, GitError> {
+        if let Some((remote, branch)) = remote_tracking {
+            let tracking_ref = format!("refs/remotes/{remote}/{branch}");
+            if !self
+                .git_status(["check-ref-format", &tracking_ref])
+                .await?
+                .success()
+            {
+                return Ok(UserMasterSyncOutcome::NeedsAttention {
+                    path: None,
+                    reason: format!("remote-tracking ref `{tracking_ref}` is invalid"),
+                });
+            }
+            let current_tracking = self.optional_ref_oid(&tracking_ref).await?;
+            if current_tracking.as_ref() != Some(tested_new) {
+                let expected = current_tracking
+                    .as_ref()
+                    .map(GitOid::to_hex)
+                    .unwrap_or_else(|| "0".repeat(self.profile.object_format.byte_len() * 2));
+                self.git(["update-ref", &tracking_ref, &tested_new.to_hex(), &expected])
+                    .await?;
+            }
+        }
+        let path = self.worktree_for_branch(USER_BRANCH_REF).await?;
+        let Some(current) = self.optional_ref_oid(USER_BRANCH_REF).await? else {
+            return Ok(UserMasterSyncOutcome::NeedsAttention {
+                path,
+                reason: "local `master` does not exist".into(),
+            });
+        };
+
+        if let Some(path) = path.as_ref() {
+            let checkout = Self::discover(path).await?;
+            if checkout.common_dir != self.common_dir {
+                return Err(GitError::InvalidOutput(
+                    "master worktree belongs to a different repository".into(),
+                ));
+            }
+            match checkout.ensure_clean().await {
+                Ok(()) => {}
+                Err(GitError::DirtyWorktree(reason)) => {
+                    return Ok(UserMasterSyncOutcome::NeedsAttention {
+                        path: Some(path.clone()),
+                        reason: format!("master worktree is dirty: {reason}"),
+                    });
+                }
+                Err(error) => return Err(error),
+            }
+            if checkout.current_branch().await?.as_deref() != Some(USER_BRANCH)
+                || checkout.resolve_oid("HEAD").await? != current
+            {
+                return Ok(UserMasterSyncOutcome::NeedsAttention {
+                    path: Some(path.clone()),
+                    reason: "master worktree HEAD does not match the local master ref".into(),
+                });
+            }
+        }
+
+        if current == *tested_new {
+            return Ok(UserMasterSyncOutcome::AlreadyCurrent { path });
+        }
+        if !self.is_ancestor(&current, tested_new).await? {
+            return Ok(UserMasterSyncOutcome::NeedsAttention {
+                path,
+                reason: format!(
+                    "local master {} cannot fast-forward to certified release {}",
+                    current.short(),
+                    tested_new.short()
+                ),
+            });
+        }
+
+        if let Some(path) = path {
+            run_internal(
+                &self.profile.executable,
+                &path,
+                ["merge", "--ff-only", "--no-edit", &tested_new.to_hex()],
+            )
+            .await?;
+            let checkout = Self::discover(&path).await?;
+            if checkout.resolve_oid("HEAD").await? != *tested_new
+                || self.resolve_oid(USER_BRANCH_REF).await? != *tested_new
+            {
+                return Err(GitError::InvalidOutput(
+                    "checked-out master fast-forward result mismatch".into(),
+                ));
+            }
+            checkout.ensure_clean().await?;
+            return Ok(UserMasterSyncOutcome::UpdatedCheckout { path });
+        }
+
+        self.git([
+            "update-ref",
+            USER_BRANCH_REF,
+            &tested_new.to_hex(),
+            &current.to_hex(),
+        ])
+        .await?;
+        if self.resolve_oid(USER_BRANCH_REF).await? != *tested_new {
+            return Err(GitError::InvalidOutput(
+                "user master CAS result mismatch".into(),
+            ));
+        }
+        Ok(UserMasterSyncOutcome::UpdatedRef)
+    }
+
     pub async fn observe_remote_ref(
         &self,
         remote: &str,
@@ -1354,6 +1507,132 @@ mod tests {
             Some(USER_BRANCH)
         );
         adapter.ensure_integration_not_checked_out().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn synchronizes_checked_out_master_and_its_files_by_fast_forward() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("file.txt"), "base\n").unwrap();
+        git(&repository, &["add", "file.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+
+        let feature = temporary.path().join("feature");
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                feature.to_str().unwrap(),
+            ],
+        );
+        std::fs::write(feature.join("file.txt"), "promoted\n").unwrap();
+        git(&feature, &["commit", "-am", "promoted"]);
+        let promoted = GitOid::from_hex(&git(&feature, &["rev-parse", "HEAD"])).unwrap();
+
+        let adapter = GitRepository::discover(&feature).await.unwrap();
+        let base = adapter.resolve_oid(USER_BRANCH_REF).await.unwrap();
+        git(
+            &feature,
+            &["update-ref", "refs/remotes/origin/master", &base.to_hex()],
+        );
+        let outcome = adapter
+            .sync_user_master(&promoted, Some(("origin", "master")))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            UserMasterSyncOutcome::UpdatedCheckout {
+                path: std::fs::canonicalize(&repository).unwrap()
+            }
+        );
+        assert_eq!(
+            std::fs::read_to_string(repository.join("file.txt")).unwrap(),
+            "promoted\n"
+        );
+        assert_eq!(
+            adapter.resolve_oid(USER_BRANCH_REF).await.unwrap(),
+            promoted
+        );
+        assert_eq!(
+            adapter
+                .resolve_oid("refs/remotes/origin/master")
+                .await
+                .unwrap(),
+            promoted
+        );
+    }
+
+    #[tokio::test]
+    async fn leaves_a_dirty_checked_out_master_untouched() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("file.txt"), "base\n").unwrap();
+        git(&repository, &["add", "file.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+        let master = git(&repository, &["rev-parse", "HEAD"]);
+
+        let feature = temporary.path().join("feature");
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                feature.to_str().unwrap(),
+            ],
+        );
+        std::fs::write(feature.join("file.txt"), "promoted\n").unwrap();
+        git(&feature, &["commit", "-am", "promoted"]);
+        let promoted = GitOid::from_hex(&git(&feature, &["rev-parse", "HEAD"])).unwrap();
+        std::fs::write(repository.join("file.txt"), "local edit\n").unwrap();
+
+        let adapter = GitRepository::discover(&feature).await.unwrap();
+        let outcome = adapter.sync_user_master(&promoted, None).await.unwrap();
+
+        assert!(matches!(
+            outcome,
+            UserMasterSyncOutcome::NeedsAttention { reason, .. }
+                if reason.contains("dirty")
+        ));
+        assert_eq!(git(&repository, &["rev-parse", USER_BRANCH_REF]), master);
+        assert_eq!(
+            std::fs::read_to_string(repository.join("file.txt")).unwrap(),
+            "local edit\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn synchronizes_an_unchecked_out_master_with_an_exact_ref_cas() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("file.txt"), "base\n").unwrap();
+        git(&repository, &["add", "file.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+        git(&repository, &["checkout", "--detach"]);
+        std::fs::write(repository.join("file.txt"), "promoted\n").unwrap();
+        git(&repository, &["commit", "-am", "promoted"]);
+        let promoted = GitOid::from_hex(&git(&repository, &["rev-parse", "HEAD"])).unwrap();
+
+        let adapter = GitRepository::discover(&repository).await.unwrap();
+        let outcome = adapter.sync_user_master(&promoted, None).await.unwrap();
+
+        assert_eq!(outcome, UserMasterSyncOutcome::UpdatedRef);
+        assert_eq!(
+            adapter.resolve_oid(USER_BRANCH_REF).await.unwrap(),
+            promoted
+        );
+        assert_eq!(git(&repository, &["rev-parse", "HEAD"]), promoted.to_hex());
     }
 
     #[tokio::test]

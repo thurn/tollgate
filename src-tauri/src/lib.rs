@@ -852,11 +852,13 @@ async fn monitor_failure_notifications(
                     .payload
                     .get("terminal_reason")
                     .and_then(serde_json::Value::as_str);
+                let user_master_sync_attention = event.kind == "user-master.sync-needs-attention";
                 let failure = matches!(
                     state,
                     Some("failed" | "check-failed" | "infrastructure-exhausted")
                 ) || remote == Some("push-blocked")
-                    || reason == Some("baseline-failing");
+                    || reason == Some("baseline-failing")
+                    || user_master_sync_attention;
                 if failure && notifications_enabled {
                     let subject = event
                         .payload
@@ -865,7 +867,13 @@ async fn monitor_failure_notifications(
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or("A Tollgate validation needs attention");
                     let body = reason.unwrap_or_else(|| {
-                        if remote == Some("push-blocked") {
+                        if user_master_sync_attention {
+                            event
+                                .payload
+                                .get("reason")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("Certified promotion succeeded, but local master still needs a manual fast-forward")
+                        } else if remote == Some("push-blocked") {
                             "Remote push failed"
                         } else if state == Some("infrastructure-exhausted") {
                             "Infrastructure retries were exhausted"

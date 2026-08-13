@@ -22,7 +22,9 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tollgate_config::{CachePolicy, EffectiveConfig, EffectiveStep};
 use tollgate_domain::*;
-use tollgate_git::{GitError, GitRepository, INTEGRATION_REF, USER_BRANCH_REF};
+use tollgate_git::{
+    GitError, GitRepository, INTEGRATION_REF, USER_BRANCH_REF, UserMasterSyncOutcome,
+};
 use tollgate_runner::apfs::{CloneManifest, force_clone_file, force_clone_tree, verify_clone_tree};
 use tollgate_runner::{
     BuildsetExecution, EnvironmentSnapshot, RenderedLogFrame, StepResultClass,
@@ -947,6 +949,7 @@ impl TollgateService {
             "update",
             "slot-reset",
             "cleanup",
+            "user-master-sync",
             "reconcile",
         ])? {
             match kind.as_str() {
@@ -968,6 +971,39 @@ impl TollgateService {
                 "cleanup" => {
                     self.reconcile_source_cleanup(runtime, command_id, &evidence)
                         .await?;
+                    continue;
+                }
+                "user-master-sync" => {
+                    let request_digest = evidence
+                        .get("request_digest")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| {
+                            ServiceError::Invariant(
+                                "user master sync intent omitted request digest".into(),
+                            )
+                        })?;
+                    let item_id = evidence
+                        .get("item_id")
+                        .cloned()
+                        .map(serde_json::from_value)
+                        .transpose()?
+                        .flatten();
+                    let tested_oid: GitOid = serde_json::from_value(
+                        evidence.get("tested_oid").cloned().ok_or_else(|| {
+                            ServiceError::Invariant(
+                                "user master sync intent omitted tested OID".into(),
+                            )
+                        })?,
+                    )?;
+                    self.complete_user_master_sync(
+                        runtime,
+                        command_id,
+                        request_digest,
+                        item_id,
+                        &tested_oid,
+                        Actor::Recovery,
+                    )
+                    .await?;
                     continue;
                 }
                 "config-apply" => {
@@ -2795,6 +2831,15 @@ impl TollgateService {
                         })
                     });
                     if matches_push {
+                        if runtime.data.lock().config.sync_user_master {
+                            self.sync_user_master_after_promotion(
+                                runtime,
+                                Some(item.id),
+                                &new_oid,
+                                Actor::Recovery,
+                            )
+                            .await?;
+                        }
                         item.state = item
                             .state
                             .transition(ItemEvent::PushCompleted)
@@ -3013,22 +3058,30 @@ impl TollgateService {
             {
                 return self.block_for_ambiguous_promotion(runtime, &observed_master, command_id);
             }
-            let (mut item, mut state) = {
+            let mut item = {
                 let data = runtime.data.lock();
-                let item = data
-                    .items
+                data.items
                     .iter()
                     .find(|item| item.id == certificate.queue_item_id)
                     .cloned()
-                    .ok_or(ServiceError::ItemNotFound(certificate.queue_item_id))?;
-                (item, data.state.clone())
+                    .ok_or(ServiceError::ItemNotFound(certificate.queue_item_id))?
             };
             if item.state != QueueItemState::Promoting
                 || item.certificate_id != Some(certificate.id)
             {
                 return self.block_for_ambiguous_promotion(runtime, &observed_master, command_id);
             }
-            let remote_enabled = runtime.data.lock().config.remote.enabled;
+            let config = runtime.data.lock().config.clone();
+            let remote_enabled = config.remote.enabled;
+            if config.sync_user_master && !remote_enabled {
+                self.sync_user_master_after_promotion(
+                    runtime,
+                    Some(item.id),
+                    &certificate.tested_oid,
+                    Actor::Recovery,
+                )
+                .await?;
+            }
             item.state = item
                 .state
                 .transition(if remote_enabled {
@@ -3038,6 +3091,7 @@ impl TollgateService {
                 })
                 .map_err(|error| ServiceError::Invariant(error.to_string()))?;
             item.cleanup_state = CleanupState::Pending;
+            let mut state = runtime.data.lock().state.clone();
             state.master_oid = observed_master;
             state.queue_revision += 1;
             state.event_sequence += 1;
@@ -4654,6 +4708,15 @@ impl TollgateService {
             .filter(|item| item.state == QueueItemState::PromotedLocalPushPending)
             .cloned()
             .collect::<Vec<_>>();
+        if config.sync_user_master && !pending.is_empty() {
+            self.sync_user_master_after_promotion(
+                &runtime,
+                pending.last().map(|item| item.id),
+                &state.master_oid,
+                Actor::Cli,
+            )
+            .await?;
+        }
         for mut item in pending {
             item.state = item
                 .state
@@ -8853,6 +8916,15 @@ impl TollgateService {
                 .git
                 .compare_and_swap_integration(&observed_master, &certificate.tested_oid)
                 .await?;
+            if config.sync_user_master && !config.remote.enabled {
+                self.sync_user_master_after_promotion(
+                    &runtime,
+                    Some(item.id),
+                    &certificate.tested_oid,
+                    Actor::App,
+                )
+                .await?;
+            }
             item.state = item
                 .state
                 .transition(if config.remote.enabled {
@@ -8907,6 +8979,15 @@ impl TollgateService {
                             IntentState::ExternalApplied,
                             &serde_json::json!({"remote": certificate.tested_oid}),
                         )?;
+                        if config.sync_user_master {
+                            self.sync_user_master_after_promotion(
+                                &runtime,
+                                Some(item.id),
+                                &certificate.tested_oid,
+                                Actor::App,
+                            )
+                            .await?;
+                        }
                         item.state = item
                             .state
                             .transition(ItemEvent::PushCompleted)
@@ -9003,6 +9084,95 @@ impl TollgateService {
                 self.replace_item(runtime, item)
             }
         }
+    }
+
+    async fn sync_user_master_after_promotion(
+        &self,
+        runtime: &Arc<RepositoryRuntime>,
+        item_id: Option<QueueItemId>,
+        tested_oid: &GitOid,
+        actor: Actor,
+    ) -> Result<UserMasterSyncOutcome, ServiceError> {
+        let command_id = CommandId::new();
+        let request_digest = command_digest(&serde_json::json!({
+            "repository_id": runtime.data.lock().state.id,
+            "item_id": item_id,
+            "tested_oid": tested_oid,
+        }))?;
+        runtime.store.prepare_operation(
+            runtime.data.lock().state.id,
+            "user-master-sync",
+            command_id,
+            &serde_json::json!({
+                "request_digest": request_digest,
+                "item_id": item_id,
+                "tested_oid": tested_oid,
+            }),
+        )?;
+        self.complete_user_master_sync(
+            runtime,
+            command_id,
+            &request_digest,
+            item_id,
+            tested_oid,
+            actor,
+        )
+        .await
+    }
+
+    async fn complete_user_master_sync(
+        &self,
+        runtime: &Arc<RepositoryRuntime>,
+        command_id: CommandId,
+        request_digest: &str,
+        item_id: Option<QueueItemId>,
+        tested_oid: &GitOid,
+        actor: Actor,
+    ) -> Result<UserMasterSyncOutcome, ServiceError> {
+        let config = runtime.data.lock().config.clone();
+        let remote_tracking = config
+            .remote
+            .enabled
+            .then_some((config.remote.name.as_str(), config.remote.branch.as_str()));
+        let outcome = runtime
+            .git
+            .sync_user_master(tested_oid, remote_tracking)
+            .await
+            .unwrap_or_else(|error| UserMasterSyncOutcome::NeedsAttention {
+                path: None,
+                reason: error.to_string(),
+            });
+        let needs_attention = matches!(&outcome, UserMasterSyncOutcome::NeedsAttention { .. });
+        if needs_attention {
+            eprintln!(
+                "Tollgate promoted the certified commit but could not synchronize local master: {:?}",
+                outcome
+            );
+        }
+        let mut state = runtime.data.lock().state.clone();
+        let event = runtime.store.complete_operation(
+            &state,
+            "user-master-sync",
+            command_id,
+            "user-master-sync",
+            request_digest,
+            &outcome,
+            if needs_attention {
+                "user-master.sync-needs-attention"
+            } else {
+                "user-master.synchronized"
+            },
+            &serde_json::json!({
+                "item_id": item_id,
+                "tested_oid": tested_oid,
+                "outcome": outcome,
+            }),
+            actor,
+        )?;
+        state.event_sequence = event.sequence;
+        runtime.data.lock().state = state;
+        let _ = runtime.events.send(event);
+        Ok(outcome)
     }
 
     pub async fn cancel(
@@ -10928,6 +11098,7 @@ impl IdleSleepAssertion {
 mod tests {
     use super::*;
     use std::process::Command as StdCommand;
+    use tollgate_git::USER_BRANCH;
 
     fn git(directory: &Path, args: &[&str]) -> String {
         let output = StdCommand::new("git")
@@ -11388,6 +11559,16 @@ policy = "clone"
         let parent = git(&repository, &["show", "-s", "--format=%P", INTEGRATION_REF]);
         assert_eq!(promoted, result.tested_oid.to_hex());
         assert_eq!(parent, old_master);
+        assert_eq!(git(&repository, &["rev-parse", USER_BRANCH_REF]), promoted);
+        assert!(
+            service
+                .repository_snapshot(initialized.state.id)
+                .await
+                .unwrap()
+                .history
+                .iter()
+                .any(|event| event.kind == "user-master.synchronized")
+        );
         assert_eq!(
             promoted, source,
             "a direct-parent source with the same tree is reused byte-for-byte"
@@ -11483,6 +11664,81 @@ policy = "clone"
             .unwrap();
         assert_eq!(after_purge.seeds.len(), 1);
         assert_eq!(after_purge.seeds[0].state, "pruned");
+    }
+
+    #[tokio::test]
+    async fn promotion_leaves_user_master_unchanged_when_synchronization_is_disabled() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        let feature_worktree = temporary.path().join("feature");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("base.txt"), "base\n").unwrap();
+        git(&repository, &["add", "base.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+        let old_master = git(&repository, &["rev-parse", USER_BRANCH_REF]);
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                feature_worktree.to_str().unwrap(),
+                USER_BRANCH,
+            ],
+        );
+        std::fs::write(feature_worktree.join("feature.txt"), "feature\n").unwrap();
+        git(&feature_worktree, &["add", "feature.txt"]);
+        git(&feature_worktree, &["commit", "-m", "feature"]);
+        let source = git(&feature_worktree, &["rev-parse", "HEAD"]);
+        git(&repository, &["switch", "--detach", USER_BRANCH]);
+
+        let service = TollgateService::open(temporary.path().join("support"))
+            .await
+            .unwrap();
+        let initialized = service
+            .initialize_repository(&repository, Some("test -f feature.txt".into()))
+            .await
+            .unwrap();
+        std::fs::write(
+            repository.join(".git/tollgate/config.toml"),
+            "version = 1\nsync_user_master = false\n\n[[step]]\nname = \"ci\"\nrun = \"test -f feature.txt\"\n",
+        )
+        .unwrap();
+        service
+            .apply_configuration(initialized.state.id, CommandId::new())
+            .await
+            .unwrap();
+        service
+            .approve(initialized.state.id, "feature".into(), CommandId::new())
+            .await
+            .unwrap();
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let snapshot = service
+                .repository_snapshot(initialized.state.id)
+                .await
+                .unwrap();
+            if snapshot.queue.is_empty() {
+                assert!(
+                    !snapshot
+                        .history
+                        .iter()
+                        .any(|event| event.kind.starts_with("user-master.sync"))
+                );
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        assert_eq!(git(&repository, &["rev-parse", INTEGRATION_REF]), source);
+        assert_eq!(
+            git(&repository, &["rev-parse", USER_BRANCH_REF]),
+            old_master
+        );
     }
 
     #[tokio::test]
