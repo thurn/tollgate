@@ -72,7 +72,7 @@ enum TopCommand {
         #[arg(long)]
         cold: bool,
     },
-    Promote {
+    Reorder {
         ids: Vec<QueueItemId>,
     },
     Check(RevisionArgs),
@@ -313,6 +313,15 @@ async fn run(cli: Cli) -> anyhow::Result<u8> {
                     oid_value(&value["tested_oid"]),
                     value["queue_revision"]
                 );
+                if let Some(items) = value["restarted_item_ids"].as_array()
+                    && !items.is_empty()
+                {
+                    println!(
+                        "  priority  moved ahead of unapproved work; {} affected validation{} restarted",
+                        items.len(),
+                        if items.len() == 1 { "" } else { "s" }
+                    );
+                }
                 Ok(())
             })?;
             if args.wait {
@@ -533,7 +542,7 @@ async fn run(cli: Cli) -> anyhow::Result<u8> {
                 Ok(())
             })?;
         }
-        TopCommand::Promote { ids } => {
+        TopCommand::Reorder { ids } => {
             let repository = select_repository(&mut client, cli.repository).await?;
             let value = client
                 .request(IpcCommand::Reorder {
@@ -1467,5 +1476,21 @@ fn classify_exit(error: &anyhow::Error) -> u8 {
         4
     } else {
         5
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reorder_command_has_no_promote_alias() {
+        let id = "019ffe40-a60d-7722-a369-2635222d1203";
+        let parsed = Cli::try_parse_from(["tg", "reorder", id]).unwrap();
+        let TopCommand::Reorder { ids } = parsed.command else {
+            panic!("reorder did not parse as the queue reorder command");
+        };
+        assert_eq!(ids, vec![id.parse().unwrap()]);
+        assert!(Cli::try_parse_from(["tg", "promote", id]).is_err());
     }
 }

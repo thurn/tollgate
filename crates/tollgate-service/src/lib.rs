@@ -324,6 +324,8 @@ pub struct CandidateAuthorizationResult {
     pub item_id: QueueItemId,
     #[serde(default)]
     pub authorized_item_ids: Vec<QueueItemId>,
+    #[serde(default)]
+    pub restarted_item_ids: Vec<QueueItemId>,
     pub queue_revision: u64,
     pub source_oid: GitOid,
     pub validation_generation_id: ValidationGenerationId,
@@ -3820,11 +3822,13 @@ impl TollgateService {
         let observed_master = runtime.git.integration_oid().await?;
         let (
             item,
-            mut items_to_authorize,
-            generation,
+            mut current,
+            items_to_authorize,
+            original_generation,
             mut state,
-            validation_complete,
-            evidence_reused,
+            config,
+            original_validation_complete,
+            original_evidence_reused,
         ) = {
             let data = runtime.data.lock();
             if data.state.execution_state != RepositoryExecutionState::Active {
@@ -3949,9 +3953,18 @@ impl TollgateService {
             let validation_complete = item.state == QueueItemState::Ready;
             (
                 item,
+                data.items
+                    .iter()
+                    .filter(|candidate| {
+                        candidate.kind == QueueItemKind::Gate
+                            && is_rebuildable_gate_state(candidate.state)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>(),
                 items_to_authorize,
                 generation,
                 data.state.clone(),
+                data.config.clone(),
                 validation_complete,
                 evidence_reused,
             )
@@ -3975,29 +3988,164 @@ impl TollgateService {
             }
         }
         let authorized_at = OffsetDateTime::now_utc();
-        for candidate in &mut items_to_authorize {
-            candidate.promotion_authorized = true;
-            candidate.promotion_authorized_at = Some(authorized_at);
-            candidate.promotion_authorized_by = Some(command_id);
-        }
         let authorized_item_ids = items_to_authorize
             .iter()
             .map(|candidate| candidate.id)
             .collect::<Vec<_>>();
+        let authorized_ids = authorized_item_ids.iter().copied().collect::<HashSet<_>>();
+        for candidate in &mut current {
+            if authorized_ids.contains(&candidate.id) {
+                candidate.promotion_authorized = true;
+                candidate.promotion_authorized_at = Some(authorized_at);
+                candidate.promotion_authorized_by = Some(command_id);
+            }
+        }
+
+        let by_id = current
+            .iter()
+            .cloned()
+            .map(|candidate| (candidate.id, candidate))
+            .collect::<HashMap<_, _>>();
+        let mut ordered_ids = Vec::with_capacity(current.len());
+        let mut visiting = HashSet::new();
+        fn append_with_active_dependencies(
+            id: QueueItemId,
+            by_id: &HashMap<QueueItemId, QueueItem>,
+            ordered: &mut Vec<QueueItemId>,
+            visiting: &mut HashSet<QueueItemId>,
+        ) -> Result<(), ServiceError> {
+            if ordered.contains(&id) {
+                return Ok(());
+            }
+            if !visiting.insert(id) {
+                return Err(ServiceError::Invariant(
+                    "candidate dependency cycle prevents authorization priority".into(),
+                ));
+            }
+            let candidate = by_id.get(&id).ok_or(ServiceError::ItemNotFound(id))?;
+            for dependency in &candidate.dependencies {
+                if by_id.contains_key(dependency) {
+                    append_with_active_dependencies(*dependency, by_id, ordered, visiting)?;
+                }
+            }
+            visiting.remove(&id);
+            ordered.push(id);
+            Ok(())
+        }
+        for candidate in current
+            .iter()
+            .filter(|candidate| candidate.promotion_authorized)
+        {
+            append_with_active_dependencies(candidate.id, &by_id, &mut ordered_ids, &mut visiting)?;
+        }
+        for candidate in &current {
+            append_with_active_dependencies(candidate.id, &by_id, &mut ordered_ids, &mut visiting)?;
+        }
+        let first_changed = current
+            .iter()
+            .map(|candidate| candidate.id)
+            .zip(&ordered_ids)
+            .position(|(before, after)| before != *after)
+            .unwrap_or(current.len());
+        let mut ordered = ordered_ids
+            .iter()
+            .map(|id| {
+                by_id
+                    .get(id)
+                    .cloned()
+                    .ok_or(ServiceError::ItemNotFound(*id))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut generations = Vec::new();
+        if first_changed < ordered.len() {
+            runtime.git.initialize_mirror(&runtime.mirror).await?;
+            let sources = ordered
+                .iter()
+                .map(|candidate| candidate.source_oid.clone())
+                .collect::<Vec<_>>();
+            let synthetic = runtime
+                .git
+                .construct_prefix(
+                    &runtime.mirror,
+                    &runtime.builder,
+                    &state.master_oid,
+                    &sources,
+                )
+                .await?;
+            let base_sequence = current
+                .iter()
+                .map(|candidate| candidate.enqueue_sequence)
+                .min()
+                .unwrap_or(1);
+            for (index, candidate) in ordered.iter_mut().enumerate() {
+                candidate.enqueue_sequence = base_sequence + index as u64;
+                if index < first_changed {
+                    continue;
+                }
+                if let Some(token) = runtime.cancellations.lock().get(&candidate.id) {
+                    token.cancel();
+                }
+                candidate.state = candidate
+                    .state
+                    .transition(ItemEvent::InputsChanged)
+                    .map_err(|error| ServiceError::Invariant(error.to_string()))?;
+                let commit = &synthetic[index];
+                let generation = ValidationGeneration::derive(
+                    ValidationGenerationId::new(),
+                    candidate.id,
+                    state.master_oid.clone(),
+                    ordered_ids[..=index].to_vec(),
+                    sources[..=index].to_vec(),
+                    synthetic[..=index]
+                        .iter()
+                        .map(|commit| commit.oid.clone())
+                        .collect(),
+                    commit.parent_oid.clone(),
+                    commit.oid.clone(),
+                    config.digest.clone(),
+                    config.step_graph_digest.clone(),
+                    state.engine_epoch,
+                );
+                candidate.current_generation_id = Some(generation.id);
+                candidate.buildset_id = None;
+                candidate.certificate_id = None;
+                candidate.state = candidate
+                    .state
+                    .transition(ItemEvent::GenerationPrepared)
+                    .map_err(|error| ServiceError::Invariant(error.to_string()))?;
+                generations.push(generation);
+            }
+        }
+        let restarted_item_ids = ordered[first_changed..]
+            .iter()
+            .map(|candidate| candidate.id)
+            .collect::<Vec<_>>();
+        let prioritized_item = ordered
+            .iter()
+            .find(|candidate| candidate.id == item_id)
+            .ok_or(ServiceError::ItemNotFound(item_id))?;
+        let generation = generations
+            .iter()
+            .find(|generation| generation.item_id == item_id)
+            .unwrap_or(&original_generation);
+        let validation_complete = restarted_item_ids.is_empty() && original_validation_complete;
+        let evidence_reused = restarted_item_ids.is_empty() && original_evidence_reused;
         let result = CandidateAuthorizationResult {
             item_id,
             authorized_item_ids,
+            restarted_item_ids,
             queue_revision: expected_revision + 1,
-            source_oid: item.source_oid.clone(),
+            source_oid: prioritized_item.source_oid.clone(),
             validation_generation_id: generation.id,
-            tested_oid: generation.tested_oid,
+            tested_oid: generation.tested_oid.clone(),
             validation_complete,
             evidence_reused,
             authorized_at,
         };
         let event = runtime.store.authorize_candidate(
             &state,
-            &items_to_authorize,
+            &ordered,
+            &generations,
             expected_revision,
             command_id,
             &request_digest,
@@ -4008,18 +4156,19 @@ impl TollgateService {
         {
             let mut data = runtime.data.lock();
             data.state = state;
-            for authorized in items_to_authorize {
-                if let Some(existing) = data
-                    .items
-                    .iter_mut()
-                    .find(|entry| entry.id == authorized.id)
+            for candidate in ordered {
+                if let Some(existing) = data.items.iter_mut().find(|entry| entry.id == candidate.id)
                 {
-                    *existing = authorized;
+                    *existing = candidate;
                 }
             }
+            data.items
+                .sort_by_key(|candidate| candidate.enqueue_sequence);
+            data.extend_generations(generations);
         }
         let _ = runtime.events.send(event);
         drop(mutation);
+        self.spawn_eligible(repository_id, &runtime);
         self.promote_ready(repository_id).await?;
         Ok(result)
     }
@@ -12493,6 +12642,168 @@ policy = "clone"
             git(&repository, &["rev-parse", INTEGRATION_REF]),
             b.tested_oid.to_hex()
         );
+    }
+
+    #[tokio::test]
+    async fn authorizing_a_later_independent_candidate_prioritizes_it_for_promotion() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        let a_worktree = temporary.path().join("candidate-a");
+        let b_worktree = temporary.path().join("candidate-b");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", "master"]);
+        std::fs::write(repository.join("base.txt"), "base\n").unwrap();
+        git(&repository, &["add", "base.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+        for (branch, path, file) in [
+            ("candidate-a", &a_worktree, "a.txt"),
+            ("candidate-b", &b_worktree, "b.txt"),
+        ] {
+            git(
+                &repository,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    branch,
+                    path.to_str().unwrap(),
+                    "master",
+                ],
+            );
+            std::fs::write(path.join(file), format!("{branch}\n")).unwrap();
+            git(path, &["add", file]);
+            git(path, &["commit", "-m", branch]);
+        }
+        git(&repository, &["switch", "--detach", "master"]);
+
+        let service = TollgateService::open(temporary.path().join("support"))
+            .await
+            .unwrap();
+        let initialized = service
+            .initialize_repository(&repository, Some("true".into()))
+            .await
+            .unwrap();
+        let a = service
+            .submit_candidate_from(
+                initialized.state.id,
+                "HEAD".into(),
+                Some(a_worktree.to_string_lossy().into_owned()),
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        let b = service
+            .submit_candidate_from(
+                initialized.state.id,
+                "HEAD".into(),
+                Some(b_worktree.to_string_lossy().into_owned()),
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let (revision, old_b_generation, old_b_certificate) = loop {
+            let snapshot = service
+                .repository_snapshot(initialized.state.id)
+                .await
+                .unwrap();
+            if snapshot.queue.iter().all(|view| {
+                view.item.state == QueueItemState::Ready && !view.item.promotion_authorized
+            }) {
+                let b_view = snapshot
+                    .queue
+                    .iter()
+                    .find(|view| view.item.id == b.item_id)
+                    .unwrap();
+                break (
+                    snapshot.state.queue_revision,
+                    b_view.generation.as_ref().unwrap().id,
+                    b_view.certificate.as_ref().unwrap().id,
+                );
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "independent candidates did not finish speculative validation"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        };
+
+        let authorized = service
+            .authorize_candidate(initialized.state.id, b.item_id, revision, CommandId::new())
+            .await
+            .unwrap();
+        assert_eq!(authorized.authorized_item_ids, vec![b.item_id]);
+        assert_eq!(authorized.restarted_item_ids, vec![b.item_id, a.item_id]);
+        assert!(!authorized.validation_complete);
+        assert!(!authorized.evidence_reused);
+        assert_ne!(authorized.validation_generation_id, old_b_generation);
+
+        loop {
+            let snapshot = service
+                .repository_snapshot(initialized.state.id)
+                .await
+                .unwrap();
+            let b_promoted = snapshot.history_items.iter().any(|view| {
+                view.item.id == b.item_id && view.item.state == QueueItemState::Promoted
+            });
+            if b_promoted {
+                let a_view = snapshot
+                    .queue
+                    .iter()
+                    .find(|view| view.item.id == a.item_id)
+                    .unwrap();
+                assert!(!a_view.item.promotion_authorized);
+                assert_eq!(snapshot.queue.len(), 1);
+                assert_eq!(snapshot.state.master_oid, authorized.tested_oid);
+                assert_eq!(
+                    a_view.generation.as_ref().unwrap().expected_parent_oid,
+                    authorized.tested_oid
+                );
+                let runtime = service.runtime(initialized.state.id).await.unwrap();
+                assert_eq!(
+                    runtime
+                        .data
+                        .lock()
+                        .generations
+                        .iter()
+                        .find(|generation| generation.id == old_b_generation)
+                        .unwrap()
+                        .invalidated_by,
+                    Some(authorized.validation_generation_id)
+                );
+                assert!(runtime.data.lock().certificates.iter().any(|certificate| {
+                    certificate.id == old_b_certificate && certificate.queue_item_id == b.item_id
+                }));
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "authorized later candidate did not bypass the unapproved head: queue={:?}, history={:?}, blocks={:?}, dispatching={:?}",
+                snapshot
+                    .queue
+                    .iter()
+                    .map(|view| (
+                        view.item.id,
+                        view.item.state,
+                        view.item.promotion_authorized
+                    ))
+                    .collect::<Vec<_>>(),
+                snapshot
+                    .history_items
+                    .iter()
+                    .map(|view| (view.item.id, view.item.state))
+                    .collect::<Vec<_>>(),
+                snapshot.state.block_reasons,
+                service
+                    .runtime(initialized.state.id)
+                    .await
+                    .unwrap()
+                    .dispatching
+                    .lock()
+                    .clone()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
     }
 
     #[tokio::test]

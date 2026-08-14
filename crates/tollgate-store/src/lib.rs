@@ -551,6 +551,7 @@ impl RepositoryStore {
         &self,
         state: &RepositoryState,
         items: &[QueueItem],
+        generations: &[ValidationGeneration],
         expected_revision: u64,
         command_id: CommandId,
         request_digest: &str,
@@ -575,10 +576,23 @@ impl RepositoryStore {
                 "candidate authorization did not include any active items".into(),
             ));
         }
+        for generation in generations {
+            invalidate_current_generation(&transaction, generation)?;
+            transaction.execute(
+                "INSERT INTO validation_generations (generation_id, item_id, identity_digest, tested_format, tested_oid, expected_parent_format, expected_parent_oid, configuration_digest, step_graph_digest, engine_epoch, generation_json, current) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1)",
+                params![generation.id.to_string(), generation.item_id.to_string(), generation.identity_digest, format!("{:?}", generation.tested_oid.format).to_lowercase(), generation.tested_oid.as_bytes(), format!("{:?}", generation.expected_parent_oid.format).to_lowercase(), generation.expected_parent_oid.as_bytes(), generation.configuration_digest, generation.step_graph_digest, generation.engine_epoch as i64, encode(generation)?],
+            )?;
+        }
+        for (index, item) in items.iter().enumerate() {
+            transaction.execute(
+                "UPDATE queue_items SET enqueue_sequence=?2 WHERE item_id=?1",
+                params![item.id.to_string(), -(index as i64) - 1],
+            )?;
+        }
         for item in items {
             let changed = transaction.execute(
-                "UPDATE queue_items SET item_json=?2 WHERE item_id=?1 AND active=1",
-                params![item.id.to_string(), encode(item)?],
+                "UPDATE queue_items SET state=?2, remote_state=?3, cleanup_state=?4, current_generation_id=?5, item_json=?6, active=?7, enqueue_sequence=?8 WHERE item_id=?1 AND active=1",
+                params![item.id.to_string(), enum_json(&item.state)?, enum_json(&item.remote_state)?, enum_json(&item.cleanup_state)?, item.current_generation_id.map(|id| id.to_string()), encode(item)?, (!item.state.is_terminal()) as i64, item.enqueue_sequence as i64],
             )?;
             if changed != 1 {
                 return Err(StoreError::Integrity(format!(

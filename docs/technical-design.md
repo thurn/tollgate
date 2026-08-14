@@ -155,7 +155,7 @@ Initialization leaves the developer's checkout unchanged and creates local `rele
 2. The worktree contains one source commit. Ignored build output is allowed; staged changes, tracked modifications, and non-ignored untracked files are not.
 3. `tg candidate` captures `HEAD`, validates its shape and dependencies, creates `refs/tollgate/sources/<item-id>`, durably enqueues a non-promotable item, and returns its ID. `tg approve HEAD` remains a combined submit-and-authorize convenience.
 4. The app constructs synthetic prefixes, assigns new validation generations to affected items, and schedules eligible buildsets.
-5. `tg approve <candidate-id>` durably grants promotion authority to that exact retained source and every active hard dependency in its retained ancestry as one queue-revision transaction. A passing authorized head is promoted automatically; an unauthorized ready head remains queued with its certificate and does not modify local `release`.
+5. `tg approve <candidate-id>` durably grants promotion authority to that exact retained source and every active hard dependency in its retained ancestry as one queue-revision transaction. Authorized items retain their relative order and move ahead of unrelated unauthorized items, while hard dependencies remain ahead of their dependents. If this priority change alters a speculative prefix, Tollgate invalidates and rebuilds exactly the affected suffix; otherwise it reuses completed evidence. A passing authorized head is promoted automatically, so an unrelated candidate awaiting human authority cannot indefinitely block approved work.
 6. After local promotion, or after push succeeds when push is enabled, Tollgate synchronizes user-owned local `master` under the safe default-on policy, then automatically cleans up the source worktree and branch if all safety checks still pass.
 
 Automatic cleanup requires a non-primary linked worktree that is still at the captured source OID and has no tracked, staged, or non-ignored untracked changes. Branch deletion is an old-OID compare-and-swap. Ignored files in an eligible linked worktree are disposable by default. If any check fails, cleanup becomes `needs-attention`; promotion is never rolled back. The hidden source ref retains the commit for audit.
@@ -409,19 +409,20 @@ Appending or changing an item after a given item does not change that earlier it
 
 Successful promotion advances the queue revision and removes the promoted head from the active queue, but it does not change a surviving descendant's validation generation when the descendant's expected parent is the exact promoted OID and every other validation input remains unchanged. The descendant keeps its existing buildset and certificate. Candidate authorization likewise reuses a completed certificate only when it still belongs to the current immutable generation. A later reconstruction may use the promoted OID as a new anchor, but it cannot transfer the old certificate to a differently identified validation generation.
 
-Approval, cancellation/dequeue, conclusive failure, conflict, re-approval, retry enqueue, and manual reorder recompute only affected validation generations. An accepted external `release` movement or adopted remote-base movement, an applied configuration change, an engine-epoch change, or recovery that cannot prove inputs unchanged invalidates every affected unpromoted generation.
+Authorization priority, cancellation/dequeue, conclusive failure, conflict, re-approval, retry enqueue, and manual reorder recompute only affected validation generations. An accepted external `release` movement or adopted remote-base movement, an applied configuration change, an engine-epoch change, or recovery that cannot prove inputs unchanged invalidates every affected unpromoted generation.
 
 ### 9.7 Zuul-style queue behavior
 
 The gate follows Zuul's dependent-pipeline behavior:
 
-- Items are ordered by durable enqueue sequence, subject to hard dependencies.
+- New candidates are initially ordered by durable enqueue sequence, subject to hard dependencies.
+- Granting authority to a retained candidate is scheduling priority: authorized items remain stable relative to one another and the newly authorized closure moves ahead of unrelated unauthorized items. The authorization transaction preserves dependency order and restarts every item whose speculative prefix changes.
 - Each eligible item is tested with every active item ahead of it.
 - A conclusive failure or merge conflict removes that item from the active queue.
 - Affected independent descendants discard their results and restart without the failed item.
 - Hard dependents are removed rather than rebuilt without their prerequisite.
 - Passing heads promote in order. A descendant that already passed advances immediately only when its exact tested parent is the just-promoted OID and its assigned validation generation remains unchanged.
-- Manual reorder (`tg promote`) moves selected independent items toward the front while respecting hard dependencies, and restarts every item whose prefix changed.
+- Manual reorder (`tg reorder`) moves selected independent items toward the front while respecting hard dependencies, and restarts every item whose prefix changed.
 - Manual retry of a failed item creates a new tail item for the same immutable source OID. Moving it forward is a separate explicit reorder.
 - Duplicate active source OIDs are rejected.
 
@@ -953,7 +954,7 @@ The initial CLI surface is:
 | `tg logs <id> [--step ...] [--follow]` | Offset-resumable log output. |
 | `tg cancel <id>` | Preview and dequeue queue item or cancel independent check. |
 | `tg retry <failed-id> [--cold]` | Fresh tail enqueue of the same source OID. |
-| `tg promote <id>...` | Preview and reorder within hard-dependency constraints. |
+| `tg reorder <id>...` | Preview and reorder within hard-dependency constraints. |
 | `tg check [<rev>] [--wait]` | Independent validation with no promotion. |
 | `tg pause/resume` | Non-destructive repository gate hold. |
 | `tg pull` | Gate-aware fetch and fast-forward adoption. |
@@ -1011,7 +1012,7 @@ A resource panel shows global run capacity, CPU/memory reservations versus obser
 
 ### 17.4 Operations
 
-Every normal queue/CI operation available in the CLI is available in the UI: approve from a selected clean worktree, cancel/dequeue, retry/cold retry, promote/reorder, pause/resume, pull, push retry, reconcile, check, worktree cleanup, slot reset, seed/cache purge, retained artifact/log management, and environment reload.
+Every normal queue/CI operation available in the CLI is available in the UI: approve from a selected clean worktree, cancel/dequeue, retry/cold retry, reorder, pause/resume, pull, push retry, reconcile, check, worktree cleanup, slot reset, seed/cache purge, retained artifact/log management, and environment reload.
 
 Operations that invalidate descendants, kill a process, delete a worktree/branch, discard caches, adopt an external base, or reorder the queue present a concrete impact preview. UI commands carry observed queue revision and are rejected/repreviewed if state changed before confirmation.
 
