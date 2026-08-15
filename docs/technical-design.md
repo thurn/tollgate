@@ -757,7 +757,7 @@ Commands are non-interactive by default:
 - stdout and stderr captured as separate streams with per-stream byte offsets, plus a broker-assigned global observation sequence;
 - configured `run` string through the frozen runner argv, or direct explicit `argv`, with the exact semantics in Section 11.2;
 - slot root/default configured directory as cwd;
-- one process group per step;
+- one root process group per step, with same-session subordinate process groups retained under supervision while they remain descendants of the root command;
 - Background CPU priority and macOS background I/O policy by default;
 - configurable graceful termination signal and grace period, default 10 seconds, followed by process-group `SIGKILL` and a default 5-second reap/verification bound;
 - monotonic runnable-time accounting with a default 60-minute timeout;
@@ -774,7 +774,7 @@ Worker supervision uses an inherited lifetime channel rather than trusting a bar
 5. If the app dies or closes its endpoint without an orderly shutdown command, the worker observes EOF, terminates the process group with the frozen escalation policy, writes only an exclusive-create interruption marker beneath the owned slot, and exits. PID/start-time or macOS process events may supplement diagnostics but are not the lifetime authority, avoiding PID-reuse ambiguity.
 6. If the worker dies first, the app detects channel closure, terminates the recorded process group independently, marks the attempt interrupted, and quarantines the slot if it cannot prove the group empty. On restart, any database `running` state is interrupted even when a worker marker claims a clean exit.
 
-Commands that deliberately daemonize, create a new session, or otherwise escape the supervised process tree are unsupported in v1. Configuration diagnostics warn about known launchers with this behavior; cancellation guarantees apply to supervised descendants.
+Commands may create subordinate process groups within the root command's Unix session; the worker continues tracking their process identities, includes their resident memory in the step limit, and reaps any group that outlives the root command. Commands that deliberately daemonize, create a new session, join an unrelated process group, or otherwise escape the supervised process tree are unsupported in v1. A real containment rejection is retained as structured step diagnostic evidence rather than being represented only by the termination signal. Configuration diagnostics warn about known launchers with escaping behavior; cancellation guarantees apply to supervised descendants.
 
 ### 12.4 Result classification and retries
 

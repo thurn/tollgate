@@ -412,6 +412,18 @@ fn externally_terminated(
     }
 }
 
+fn containment_diagnostics(message: Option<String>) -> Vec<StepDiagnostic> {
+    message
+        .into_iter()
+        .map(|message| StepDiagnostic {
+            code: "tollgate.containment-escape".into(),
+            message,
+            paths: Vec::new(),
+            repair: None,
+        })
+        .collect()
+}
+
 pub async fn run_step(
     step: &EffectiveStep,
     mut context: ExecutionContext,
@@ -430,7 +442,7 @@ pub async fn run_step(
     );
     let mut result = run_step_inner(step, context, cancellation).await?;
     match read_step_diagnostics(&diagnostics_path).await {
-        Ok(diagnostics) => result.diagnostics = diagnostics,
+        Ok(diagnostics) => result.diagnostics.extend(diagnostics),
         Err(error) => {
             result.class = StepResultClass::ExitFailure;
             result.diagnostics.push(StepDiagnostic {
@@ -603,6 +615,8 @@ enum WorkerOutput {
         process_group_reaped: bool,
         rss_exceeded: bool,
         containment_escaped: bool,
+        #[serde(default)]
+        containment_diagnostic: Option<String>,
     },
 }
 
@@ -764,6 +778,7 @@ async fn run_step_via_worker(
         process_group_reaped,
         rss_exceeded,
         containment_escaped,
+        containment_diagnostic,
         ..
     } = terminal
     else {
@@ -788,6 +803,7 @@ async fn run_step_via_worker(
     } else {
         StepResultClass::ExitFailure
     };
+    let diagnostics = containment_diagnostics(containment_diagnostic);
     Ok(StepResult {
         attempt_id,
         class,
@@ -795,7 +811,7 @@ async fn run_step_via_worker(
         signal,
         elapsed_ms: started.elapsed().as_millis() as u64,
         log: log.seal().await?,
-        diagnostics: Vec::new(),
+        diagnostics,
     })
 }
 
@@ -1572,6 +1588,19 @@ printf '%s\n' '{"code":"BAD CODE","message":"unsafe","paths":["../escape"]}' > "
         assert!(externally_terminated(command, None, Some(15)));
         assert!(!externally_terminated(command, Some(1), None));
         assert!(!externally_terminated(command, Some(139), None));
+    }
+
+    #[test]
+    fn containment_failure_has_structured_diagnostic_evidence() {
+        let diagnostics = containment_diagnostics(Some(
+            "Tollgate rejected an unsupported session escape by descendant PID 42.".into(),
+        ));
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, "tollgate.containment-escape");
+        assert!(diagnostics[0].message.contains("PID 42"));
+        assert!(diagnostics[0].paths.is_empty());
+        assert!(diagnostics[0].repair.is_none());
     }
 
     #[tokio::test]
