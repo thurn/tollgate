@@ -103,6 +103,13 @@ pub struct AppSnapshot {
     pub environment: EnvironmentView,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ItemWaitStatus {
+    pub item: QueueItem,
+    pub repository_execution_state: RepositoryExecutionState,
+    pub block_reasons: Vec<BlockReason>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UnavailableRepository {
     pub id: RepositoryId,
@@ -4153,6 +4160,26 @@ impl TollgateService {
             .find(|item| item.id == item_id)
             .cloned()
             .ok_or(ServiceError::ItemNotFound(item_id))
+    }
+
+    pub async fn item_wait_status(
+        &self,
+        repository_id: RepositoryId,
+        item_id: QueueItemId,
+    ) -> Result<ItemWaitStatus, ServiceError> {
+        let runtime = self.runtime(repository_id).await?;
+        let data = runtime.data.lock();
+        let item = data
+            .items
+            .iter()
+            .find(|item| item.id == item_id)
+            .cloned()
+            .ok_or(ServiceError::ItemNotFound(item_id))?;
+        Ok(ItemWaitStatus {
+            item,
+            repository_execution_state: data.state.execution_state,
+            block_reasons: data.state.block_reasons.clone(),
+        })
     }
 
     pub async fn item_details(

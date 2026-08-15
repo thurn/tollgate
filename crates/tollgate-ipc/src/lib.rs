@@ -216,6 +216,10 @@ pub enum IpcCommand {
         repository_id: RepositoryId,
         item_id: QueueItemId,
     },
+    ItemWaitStatus {
+        repository_id: RepositoryId,
+        item_id: QueueItemId,
+    },
     Initialize {
         path: String,
         run: Option<String>,

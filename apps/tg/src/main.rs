@@ -12,7 +12,9 @@ use tollgate_ipc::{
     Frame, FrameCodec, FrameKind, Handshake, HandshakeAck, IpcCommand, IpcResponse,
     MAX_CONTROL_PAYLOAD, MAX_LOG_PAYLOAD, PROTOCOL_VERSION, StructuredError, verify_peer_uid,
 };
-use tollgate_service::{AppSnapshot, DiagnoseResult, QueueItemView, RepositorySnapshot};
+use tollgate_service::{
+    AppSnapshot, DiagnoseResult, ItemWaitStatus, QueueItemView, RepositorySnapshot,
+};
 use uuid::Uuid;
 
 #[derive(Parser)]
@@ -352,7 +354,7 @@ async fn run(cli: Cli) -> anyhow::Result<u8> {
                     })
                     .await?
             };
-            print_value(response.clone(), cli.json, |value| {
+            print_wait_value(response.clone(), cli.json, args.wait, |value| {
                 println!(
                     "Approved {}{}\n  authority  {}\n  source  {}\n  tested  {}\n  queue revision {}",
                     value["item_id"].as_str().unwrap_or("?"),
@@ -414,7 +416,7 @@ async fn run(cli: Cli) -> anyhow::Result<u8> {
                     command_id: CommandId::new(),
                 })
                 .await?;
-            print_value(response.clone(), cli.json, |value| {
+            print_wait_value(response.clone(), cli.json, args.wait, |value| {
                 println!(
                     "Candidate {} submitted without promotion authority\n  source  {}\n  tested  {}\n  queue revision {}",
                     value["item_id"].as_str().unwrap_or("?"),
@@ -457,7 +459,7 @@ async fn run(cli: Cli) -> anyhow::Result<u8> {
                     command_id: CommandId::new(),
                 })
                 .await?;
-            print_value(response.clone(), cli.json, |value| {
+            print_wait_value(response.clone(), cli.json, args.wait, |value| {
                 println!(
                     "Independent check started {}\n  source  {}\n  tested  {}",
                     value["item_id"].as_str().unwrap_or("?"),
@@ -1435,7 +1437,7 @@ async fn push_master(
         "tail_item_id": tail_id,
         "queue_revision": repository.state.queue_revision,
     });
-    print_value(result, json, |value| {
+    print_wait_value(result, json, wait, |value| {
         let count = value["items"].as_array().map_or(0, Vec::len);
         println!(
             "Scheduled {count} master commit{} for certified push\n  release  {}\n  master   {}\n  tail     {}",
@@ -1640,95 +1642,60 @@ async fn wait_for_item_until(
     json: bool,
     validation_only: bool,
 ) -> anyhow::Result<u8> {
+    let mut previous_status = None;
     loop {
-        let snapshot = match client.snapshot().await {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
+        let command = || IpcCommand::ItemWaitStatus {
+            repository_id,
+            item_id,
+        };
+        let value = match client.request(command()).await {
+            Ok(value) => value,
+            Err(first_error) => {
                 if !json {
-                    eprintln!("\nConnection interrupted ({error}); waiting for Tollgate…");
+                    eprintln!("\nConnection interrupted ({first_error}); waiting for Tollgate…");
                 }
                 reconnect_wait_client(client).await?;
-                continue;
+                client.request(command()).await.with_context(|| {
+                    format!("item wait status failed after reconnect: {first_error}")
+                })?
             }
         };
-        if let Some(view) = snapshot
-            .repositories
-            .iter()
-            .flat_map(|repository| repository.queue.iter().chain(&repository.checks))
-            .find(|view| view.item.id == item_id)
+        let status: ItemWaitStatus = serde_json::from_value(value)?;
+        if wait_status_changed(&mut previous_status, &status) {
+            if json {
+                println!("{}", serde_json::to_string(&status)?);
+            } else {
+                eprint!(
+                    "\r{}  {:<30}",
+                    status.item.state_as_display(),
+                    status.item.metadata.subject
+                );
+            }
+        }
+        if status.item.state.is_terminal()
+            || (validation_only && status.item.state == tollgate_domain::QueueItemState::Ready)
         {
-            if json {
-                println!("{}", serde_json::to_string(view)?);
-            } else {
-                eprint!(
-                    "\r{}  {:<30}",
-                    view.item.state_as_display(),
-                    view.item.metadata.subject
-                );
+            if !json {
+                println!();
             }
-            if view.item.state.is_terminal()
-                || (validation_only && view.item.state == tollgate_domain::QueueItemState::Ready)
-            {
-                if !json {
-                    println!();
-                }
-                return Ok(exit_for_item(&view.item));
+            return Ok(exit_for_item(&status.item));
+        }
+        if status.repository_execution_state == tollgate_domain::RepositoryExecutionState::Blocked {
+            if !json {
+                println!("\nRepository blocked before this item could complete.");
             }
-            if let Some(repository) = snapshot
-                .repositories
-                .iter()
-                .find(|repository| repository.state.id == repository_id)
-                && repository.state.execution_state
-                    == tollgate_domain::RepositoryExecutionState::Blocked
-            {
-                if !json {
-                    println!("\nRepository blocked before this item could complete.");
-                }
-                return Ok(4);
-            }
-        } else {
-            let value = match client
-                .request(IpcCommand::ItemStatus {
-                    repository_id,
-                    item_id,
-                })
-                .await
-            {
-                Ok(value) => value,
-                Err(first_error) => {
-                    reconnect_wait_client(client).await?;
-                    client
-                        .request(IpcCommand::ItemStatus {
-                            repository_id,
-                            item_id,
-                        })
-                        .await
-                        .with_context(|| {
-                            format!("item status failed after reconnect: {first_error}")
-                        })?
-                }
-            };
-            let item: tollgate_domain::QueueItem = serde_json::from_value(value)?;
-            if json {
-                println!("{}", serde_json::to_string(&item)?);
-            } else {
-                eprint!(
-                    "\r{}  {:<30}",
-                    item.state_as_display(),
-                    item.metadata.subject
-                );
-            }
-            if item.state.is_terminal()
-                || (validation_only && item.state == tollgate_domain::QueueItemState::Ready)
-            {
-                if !json {
-                    println!();
-                }
-                return Ok(exit_for_item(&item));
-            }
+            return Ok(4);
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+}
+
+fn wait_status_changed(previous: &mut Option<ItemWaitStatus>, current: &ItemWaitStatus) -> bool {
+    if previous.as_ref() == Some(current) {
+        return false;
+    }
+    *previous = Some(current.clone());
+    true
 }
 
 async fn reconnect_wait_client(client: &mut IpcClient) -> anyhow::Result<()> {
@@ -1994,6 +1961,21 @@ fn print_value(
         human(&value)
     }
 }
+
+fn print_wait_value(
+    value: serde_json::Value,
+    json: bool,
+    wait: bool,
+    human: impl FnOnce(&serde_json::Value) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    if json && wait {
+        println!("{}", serde_json::to_string(&value)?);
+        Ok(())
+    } else {
+        print_value(value, json, human)
+    }
+}
+
 fn socket_path() -> anyhow::Result<PathBuf> {
     Ok(ProjectDirs::from("dev", "Tollgate", "Tollgate")
         .ok_or_else(|| anyhow!("application support directory unavailable"))?
@@ -2203,5 +2185,28 @@ mod tests {
 
         assert_eq!(value["state"]["name"], "test-repository");
         assert_eq!(value["queue"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn json_wait_status_is_compact_and_emitted_only_when_changed() {
+        let repository = repository_with_candidate("019ffe40-a60d-7722-a369-2635222d1203");
+        let mut status = ItemWaitStatus {
+            item: repository.queue[0].item.clone(),
+            repository_execution_state: tollgate_domain::RepositoryExecutionState::Active,
+            block_reasons: Vec::new(),
+        };
+        let mut previous = None;
+
+        assert!(wait_status_changed(&mut previous, &status));
+        assert!(!wait_status_changed(&mut previous, &status));
+
+        status.item.state = tollgate_domain::QueueItemState::Running;
+        assert!(wait_status_changed(&mut previous, &status));
+        let value = serde_json::to_value(&status).unwrap();
+        assert_eq!(value["item"]["state"], "running");
+        assert_eq!(value["repository_execution_state"], "active");
+        assert!(value.get("attempts").is_none());
+        assert!(value.get("configuration").is_none());
+        assert!(value.get("resources").is_none());
     }
 }
