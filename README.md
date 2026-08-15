@@ -50,6 +50,10 @@ tg candidate HEAD --wait
 tg status <candidate-id>
 ```
 
+In JSON mode, `tg status <candidate-id>` returns only that candidate's detailed
+status. Omitting the ID retains the repository-wide snapshot used to inspect the
+current speculative queue and its generation prefixes.
+
 `--wait` returns when validation has produced promotion-grade evidence (or a conclusive failure), while `release` remains unchanged. A user later grants authority to the exact retained candidate with `tg approve <candidate-id>`; that authority atomically covers its active hard dependencies because they are part of the retained source history. Granting authority to a retained candidate moves it ahead of unrelated candidates still awaiting authority. Tollgate preserves an exact completed certificate when the priority change leaves its speculative prefix unchanged, and otherwise rebuilds the affected suffix automatically. `tg cancel <candidate-id>` cancels it. For the original one-phase user workflow, `tg approve HEAD` still submits and authorizes in one command.
 
 If synthesis conflicts with an earlier candidate, the `generation.tested_oid` shown by `tg --json status` is a supported recovery base. Tollgate retains every displayed speculative generation under `refs/tollgate/speculative/`, so the OID is available in every worktree of the registered repository. For a single task commit, use this flow:

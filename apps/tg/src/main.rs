@@ -522,7 +522,7 @@ async fn run(cli: Cli) -> anyhow::Result<u8> {
         TopCommand::Status { id } => {
             let repository = select_repository(&mut client, cli.repository).await?;
             if cli.json {
-                println!("{}", serde_json::to_string_pretty(&repository)?);
+                println!("{}", status_json(&repository, id)?);
             } else {
                 print_status(&repository, id);
             }
@@ -1812,13 +1812,7 @@ fn print_queue(repository: &RepositorySnapshot, json: bool) -> anyhow::Result<()
 
 fn print_status(repository: &RepositorySnapshot, id: Option<QueueItemId>) {
     if let Some(id) = id {
-        if let Some(view) = repository
-            .queue
-            .iter()
-            .chain(&repository.checks)
-            .chain(&repository.history_items)
-            .find(|view| view.item.id == id)
-        {
+        if let Some(view) = status_view(repository, id) {
             println!(
                 "{}\n  state       {:?}\n  authority   {}\n  source      {}\n  tested      {}\n  generation  {}\n  evidence    {}",
                 view.item.metadata.subject,
@@ -1886,6 +1880,24 @@ fn print_status(repository: &RepositorySnapshot, id: Option<QueueItemId>) {
         repository.resources.queued_runs,
         &repository.configuration.digest[..12]
     );
+}
+
+fn status_json(repository: &RepositorySnapshot, id: Option<QueueItemId>) -> anyhow::Result<String> {
+    if let Some(id) = id {
+        let view = status_view(repository, id)
+            .ok_or_else(|| anyhow!("queue item {id} was not found in the recent snapshot"))?;
+        return Ok(serde_json::to_string_pretty(view)?);
+    }
+    Ok(serde_json::to_string_pretty(repository)?)
+}
+
+fn status_view(repository: &RepositorySnapshot, id: QueueItemId) -> Option<&QueueItemView> {
+    repository
+        .queue
+        .iter()
+        .chain(&repository.checks)
+        .chain(&repository.history_items)
+        .find(|view| view.item.id == id)
 }
 
 async fn wait_for_terminal_checks(
@@ -2015,6 +2027,105 @@ fn classify_exit(error: &anyhow::Error) -> u8 {
 mod tests {
     use super::*;
 
+    fn repository_with_candidate(candidate_id: &str) -> RepositorySnapshot {
+        let repository_id = "019ffe40-a60d-7722-a369-2635222d1204";
+        let oid = serde_json::json!({
+            "format": "sha1",
+            "bytes": "1111111111111111111111111111111111111111"
+        });
+        let candidate = serde_json::json!({
+            "item": {
+                "id": candidate_id,
+                "repository_id": repository_id,
+                "kind": "gate",
+                "enqueue_sequence": 1,
+                "source_oid": oid,
+                "source_ref": "refs/tollgate/sources/test",
+                "metadata": {
+                    "subject": "Keep status candidate-scoped",
+                    "message_hash": "message-hash",
+                    "author_name": "Test Author",
+                    "author_email": "test@example.com",
+                    "branch": "wt/status-candidate-output",
+                    "worktree_path": "/tmp/status-candidate-output",
+                    "signature_state": "unsigned",
+                    "approved_at": [2026, 227, 0, 0, 0, 0, 0, 0, 0],
+                    "purpose": null
+                },
+                "state": "queued",
+                "terminal_reason": null,
+                "remote_state": "disabled",
+                "cleanup_state": "not-eligible",
+                "dependencies": [],
+                "promotion_authorized": false,
+                "promotion_authorized_at": null,
+                "promotion_authorized_by": null,
+                "current_generation_id": null,
+                "buildset_id": null,
+                "certificate_id": null
+            },
+            "generation": null,
+            "buildset": null,
+            "attempts": [],
+            "attempt_generations": [],
+            "certificate": null,
+            "certificates": [],
+            "included_items": [],
+            "elapsed_ms": null,
+            "failure_attribution": null
+        });
+        serde_json::from_value(serde_json::json!({
+            "state": {
+                "id": repository_id,
+                "name": "test-repository",
+                "path": "/tmp/test-repository",
+                "integration_ref": "refs/heads/release",
+                "master_oid": oid,
+                "queue_revision": 1,
+                "event_sequence": 1,
+                "engine_epoch": 1,
+                "execution_state": "active",
+                "block_reasons": [],
+                "active_configuration_digest": "configuration-digest",
+                "active_window": 1,
+                "active_window_floor": 1,
+                "active_window_ceiling": 1,
+                "remote_enabled": false
+            },
+            "observed_master_oid": oid,
+            "queue": [candidate],
+            "checks": [],
+            "master_push": null,
+            "history_items": [],
+            "history": [],
+            "configuration": {
+                "digest": "configuration-digest",
+                "step_graph_digest": "step-graph-digest",
+                "steps": [],
+                "remote_enabled": false,
+                "runner": []
+            },
+            "resources": {
+                "max_buildsets": 1,
+                "repository_concurrency": 1,
+                "cpu_tokens": 1,
+                "memory_bytes": 1,
+                "active_runs": 0,
+                "queued_runs": 0,
+                "cpu_reserved": 0,
+                "memory_reserved": 0,
+                "named_semaphores": {},
+                "authoritative_volume_available": 1,
+                "recovery_reserve": 1,
+                "volumes": []
+            },
+            "slots": [],
+            "seeds": [],
+            "artifacts": []
+        }))
+        .unwrap()
+    }
+
     #[test]
     fn reorder_command_has_no_promote_alias() {
         let id = "019ffe40-a60d-7722-a369-2635222d1203";
@@ -2057,5 +2168,31 @@ mod tests {
         assert_eq!(args.id, id.parse().unwrap());
         assert!(!args.no_replay);
         assert!(args.verify_repair);
+    }
+
+    #[test]
+    fn json_status_with_id_returns_only_the_candidate() {
+        let id = "019ffe40-a60d-7722-a369-2635222d1203";
+        let repository = repository_with_candidate(id);
+
+        let output = status_json(&repository, Some(id.parse().unwrap())).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        assert_eq!(value["item"]["id"], id);
+        assert_eq!(value["item"]["promotion_authorized"], false);
+        assert!(value.get("queue").is_none());
+        assert!(value.get("configuration").is_none());
+        assert!(value.get("resources").is_none());
+    }
+
+    #[test]
+    fn json_status_without_id_retains_the_repository_snapshot() {
+        let repository = repository_with_candidate("019ffe40-a60d-7722-a369-2635222d1203");
+
+        let output = status_json(&repository, None).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        assert_eq!(value["state"]["name"], "test-repository");
+        assert_eq!(value["queue"].as_array().unwrap().len(), 1);
     }
 }
