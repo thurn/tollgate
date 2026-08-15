@@ -248,6 +248,15 @@ pub enum IpcCommand {
         worktree_path: Option<String>,
         command_id: CommandId,
     },
+    Diagnose {
+        repository_id: RepositoryId,
+        item_id: QueueItemId,
+        #[serde(default)]
+        replay: bool,
+        #[serde(default)]
+        verify_repair: bool,
+        command_id: CommandId,
+    },
     Cancel {
         repository_id: RepositoryId,
         item_id: QueueItemId,

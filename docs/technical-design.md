@@ -719,6 +719,29 @@ A slot owns the entire buildset:
 
 The runner exports generic read-only context such as `CI=1`, queue/check mode, repository ID, item ID, source OID, tested OID, expected parent, validation-generation ID, slot path, and attempt count. These variables are execution context, not commit metadata.
 
+Each step also receives a read-only `TOLLGATE_DIAGNOSTICS_FILE` path outside the
+checkout. A step may write bounded JSONL records containing a stable diagnostic
+code, human message, repository-relative paths, and an optional explicit `argv`
+repair. Tollgate rejects malformed, oversized, symlinked, path-traversing, or
+otherwise invalid diagnostic output and never derives repair commands from log
+text. Diagnostics are sealed into the step attempt and buildset result.
+
+For a failed voting step, comparable retained evidence requires the same tested
+OID role, configuration digest, step-graph digest, engine epoch, and environment
+fingerprint. A base success plus candidate failure is `candidate-introduced`;
+the same failure on both is `inherited-from-base`; contradictory outcomes for
+the exact candidate are `flaky-or-non-hermetic`; incomplete or mixed evidence is
+`origin-unknown`. A diagnostic matrix may establish a new internally consistent
+environment group after restart by running the exact base once and candidate
+twice in cold slots.
+
+Repair verification is explicit and never mutates retained source. Tollgate
+first reproduces the diagnosed failure in a disposable checkout, executes one
+unambiguous structured repair under the captured step environment, reruns all
+applicable voting steps, and retains a binary patch only when they pass. The
+patch is review material for a new immutable candidate, not certification of a
+modified tree.
+
 ### 12.3 Process behavior
 
 Commands are non-interactive by default:
@@ -957,6 +980,7 @@ The initial CLI surface is:
 | `tg retry <failed-id> [--cold]` | Fresh tail enqueue of the same source OID. |
 | `tg reorder <id>...` | Preview and reorder within hard-dependency constraints. |
 | `tg check [<rev>] [--wait]` | Independent validation with no promotion. |
+| `tg diagnose <id> [--no-replay] [--verify-repair]` | Attribute a voting failure from comparable evidence; by default run a cold base/candidate/candidate matrix, and optionally verify one structured repair into an immutable patch artifact. |
 | `tg pause/resume` | Non-destructive repository gate hold. |
 | `tg pull` | Gate-aware fetch and fast-forward adoption. |
 | `tg push` | Push only contiguous certified local `release` commits to the configured remote branch with a lease. |

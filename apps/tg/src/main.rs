@@ -12,7 +12,7 @@ use tollgate_ipc::{
     Frame, FrameCodec, FrameKind, Handshake, HandshakeAck, IpcCommand, IpcResponse,
     MAX_CONTROL_PAYLOAD, MAX_LOG_PAYLOAD, PROTOCOL_VERSION, verify_peer_uid,
 };
-use tollgate_service::{AppSnapshot, RepositorySnapshot};
+use tollgate_service::{AppSnapshot, DiagnoseResult, RepositorySnapshot};
 use uuid::Uuid;
 
 #[derive(Parser)]
@@ -78,6 +78,7 @@ enum TopCommand {
         ids: Vec<QueueItemId>,
     },
     Check(RevisionArgs),
+    Diagnose(DiagnoseArgs),
     Pause,
     Resume,
     Pull,
@@ -122,6 +123,18 @@ struct RevisionArgs {
     revision: String,
     #[arg(long, help = "Wait for validation or promotion to finish")]
     wait: bool,
+}
+
+#[derive(Args)]
+struct DiagnoseArgs {
+    id: QueueItemId,
+    #[arg(long, help = "Use retained evidence without scheduling clean replays")]
+    no_replay: bool,
+    #[arg(
+        long,
+        help = "Execute a structured repair in a disposable clone and retain a verified patch"
+    )]
+    verify_repair: bool,
 }
 
 #[derive(Args)]
@@ -411,6 +424,51 @@ async fn run(cli: Cli) -> anyhow::Result<u8> {
                     cli.json,
                 )
                 .await;
+            }
+        }
+        TopCommand::Diagnose(args) => {
+            let repository = select_repository(&mut client, cli.repository).await?;
+            let mut diagnosis: DiagnoseResult = serde_json::from_value(
+                client
+                    .request(IpcCommand::Diagnose {
+                        repository_id: repository.state.id,
+                        item_id: args.id,
+                        replay: !args.no_replay,
+                        verify_repair: args.verify_repair,
+                        command_id: CommandId::new(),
+                    })
+                    .await?,
+            )?;
+            if !diagnosis.replay_item_ids.is_empty() {
+                let repair_artifact = diagnosis.repair_artifact.clone();
+                if !cli.json {
+                    println!(
+                        "Running clean diagnostic matrix for base and candidate (candidate twice)…"
+                    );
+                }
+                wait_for_terminal_checks(
+                    &mut client,
+                    repository.state.id,
+                    &diagnosis.replay_item_ids,
+                )
+                .await?;
+                diagnosis = serde_json::from_value(
+                    client
+                        .request(IpcCommand::Diagnose {
+                            repository_id: repository.state.id,
+                            item_id: args.id,
+                            replay: false,
+                            verify_repair: false,
+                            command_id: CommandId::new(),
+                        })
+                        .await?,
+                )?;
+                diagnosis.repair_artifact = repair_artifact;
+            }
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&diagnosis)?);
+            } else {
+                print_diagnosis(&diagnosis);
             }
         }
         TopCommand::Queue => {
@@ -1568,6 +1626,33 @@ fn print_status(repository: &RepositorySnapshot, id: Option<QueueItemId>) {
                     "not complete"
                 }
             );
+            if let Some(attribution) = &view.failure_attribution {
+                println!(
+                    "  failure     {:?}\n  base        {}\n  environment {}",
+                    attribution.origin,
+                    attribution.base_oid.short(),
+                    &attribution.environment_fingerprint[..12]
+                );
+                for step in &attribution.steps {
+                    println!(
+                        "    {}: {:?} (candidate {}, base {})",
+                        step.name,
+                        step.origin,
+                        step.candidate_result,
+                        step.baseline_result
+                            .as_deref()
+                            .unwrap_or("no comparable run")
+                    );
+                    for diagnostic in &step.diagnostics {
+                        println!("      [{}] {}", diagnostic.code, diagnostic.message);
+                        if let Some(tollgate_domain::RepairCommand::Argv { argv }) =
+                            &diagnostic.repair
+                        {
+                            println!("      suggested repair: {}", argv.join(" "));
+                        }
+                    }
+                }
+            }
         } else {
             println!("Queue item {id} was not found in the recent snapshot.");
         }
@@ -1584,6 +1669,79 @@ fn print_status(repository: &RepositorySnapshot, id: Option<QueueItemId>) {
         repository.resources.queued_runs,
         &repository.configuration.digest[..12]
     );
+}
+
+async fn wait_for_terminal_checks(
+    client: &mut IpcClient,
+    repository_id: RepositoryId,
+    item_ids: &[QueueItemId],
+) -> anyhow::Result<()> {
+    loop {
+        let mut complete = true;
+        for item_id in item_ids {
+            let command = || IpcCommand::ItemStatus {
+                repository_id,
+                item_id: *item_id,
+            };
+            let value = match client.request(command()).await {
+                Ok(value) => value,
+                Err(first_error) => {
+                    reconnect_wait_client(client).await?;
+                    client.request(command()).await.with_context(|| {
+                        format!("diagnostic replay status failed after reconnect: {first_error}")
+                    })?
+                }
+            };
+            let item: tollgate_domain::QueueItem = serde_json::from_value(value)?;
+            complete &= item.state.is_terminal();
+        }
+        if complete {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+fn print_diagnosis(diagnosis: &DiagnoseResult) {
+    let Some(attribution) = &diagnosis.attribution else {
+        println!("No voting-step failure evidence is available for this item.");
+        return;
+    };
+    println!(
+        "Failure origin: {:?}\n  candidate   {}\n  base        {}\n  config      {}\n  environment {}",
+        attribution.origin,
+        attribution.candidate_tested_oid.short(),
+        attribution.base_oid.short(),
+        &attribution.configuration_digest[..12],
+        &attribution.environment_fingerprint[..12],
+    );
+    for step in &attribution.steps {
+        println!(
+            "  {}: {:?} (candidate {}, base {})",
+            step.name,
+            step.origin,
+            step.candidate_result,
+            step.baseline_result
+                .as_deref()
+                .unwrap_or("no comparable run")
+        );
+        for diagnostic in &step.diagnostics {
+            println!("    [{}] {}", diagnostic.code, diagnostic.message);
+            if !diagnostic.paths.is_empty() {
+                println!("    paths: {}", diagnostic.paths.join(", "));
+            }
+            if let Some(tollgate_domain::RepairCommand::Argv { argv }) = &diagnostic.repair {
+                println!("    suggested repair: {}", argv.join(" "));
+            }
+        }
+    }
+    if let Some(artifact) = &diagnosis.repair_artifact {
+        println!(
+            "Verified repair patch:\n  path  {}\n  hash  {}\n  bytes {}",
+            artifact.path, artifact.blake3, artifact.byte_length
+        );
+        println!("The candidate source was not modified; submit the patch as a new candidate.");
+    }
 }
 
 fn print_value(
@@ -1650,5 +1808,17 @@ mod tests {
             panic!("push-master did not parse as the master submission command");
         };
         assert!(args.wait);
+    }
+
+    #[test]
+    fn diagnose_replays_by_default_and_accepts_explicit_repair_verification() {
+        let id = "019ffe40-a60d-7722-a369-2635222d1203";
+        let parsed = Cli::try_parse_from(["tg", "diagnose", id, "--verify-repair"]).unwrap();
+        let TopCommand::Diagnose(args) = parsed.command else {
+            panic!("diagnose did not parse");
+        };
+        assert_eq!(args.id, id.parse().unwrap());
+        assert!(!args.no_replay);
+        assert!(args.verify_repair);
     }
 }

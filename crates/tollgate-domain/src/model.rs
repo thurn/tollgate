@@ -190,6 +190,24 @@ pub struct BuildsetStepResult {
     pub log_hash: String,
     pub stdout_end: u64,
     pub stderr_end: u64,
+    #[serde(default)]
+    pub diagnostics: Vec<StepDiagnostic>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StepDiagnostic {
+    pub code: String,
+    pub message: String,
+    #[serde(default)]
+    pub paths: Vec<String>,
+    #[serde(default)]
+    pub repair: Option<RepairCommand>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RepairCommand {
+    Argv { argv: Vec<String> },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

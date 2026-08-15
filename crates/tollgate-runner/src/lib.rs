@@ -2,6 +2,9 @@
 
 pub mod apfs;
 
+#[cfg(target_os = "macos")]
+use std::os::unix::fs::OpenOptionsExt;
+
 use std::{
     collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
@@ -24,7 +27,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 use tollgate_config::{EffectiveCommand, EffectiveConfig, EffectiveStep};
-use tollgate_domain::{GitOid, StepAttemptId, StepId};
+use tollgate_domain::{GitOid, RepairCommand, StepAttemptId, StepDiagnostic, StepId};
 use tollgate_scheduler::{GlobalScheduler, StepResources};
 use uuid::Uuid;
 
@@ -384,6 +387,8 @@ pub struct StepResult {
     pub signal: Option<i32>,
     pub elapsed_ms: u64,
     pub log: SealedLog,
+    #[serde(default)]
+    pub diagnostics: Vec<StepDiagnostic>,
 }
 
 fn externally_terminated(
@@ -409,6 +414,38 @@ fn externally_terminated(
 
 pub async fn run_step(
     step: &EffectiveStep,
+    mut context: ExecutionContext,
+    cancellation: CancellationToken,
+) -> Result<StepResult, RunnerError> {
+    let diagnostics_path =
+        PathBuf::from(format!("{}.diagnostics.jsonl", context.log_path.display()));
+    match tokio::fs::remove_file(&diagnostics_path).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    context.read_only_context.insert(
+        "TOLLGATE_DIAGNOSTICS_FILE".into(),
+        diagnostics_path.to_string_lossy().into_owned(),
+    );
+    let mut result = run_step_inner(step, context, cancellation).await?;
+    match read_step_diagnostics(&diagnostics_path).await {
+        Ok(diagnostics) => result.diagnostics = diagnostics,
+        Err(error) => {
+            result.class = StepResultClass::ExitFailure;
+            result.diagnostics.push(StepDiagnostic {
+                code: "tollgate.diagnostics-invalid".into(),
+                message: error,
+                paths: Vec::new(),
+                repair: None,
+            });
+        }
+    }
+    Ok(result)
+}
+
+async fn run_step_inner(
+    step: &EffectiveStep,
     context: ExecutionContext,
     cancellation: CancellationToken,
 ) -> Result<StepResult, RunnerError> {
@@ -427,6 +464,96 @@ pub async fn run_step(
     Err(RunnerError::Interrupted(
         "tollgate-worker sidecar is unavailable".into(),
     ))
+}
+
+async fn read_step_diagnostics(path: &Path) -> Result<Vec<StepDiagnostic>, String> {
+    const MAX_BYTES: u64 = 1024 * 1024;
+    const MAX_DIAGNOSTICS: usize = 128;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(target_os = "macos")]
+    options.custom_flags(nix::libc::O_NOFOLLOW);
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("could not open diagnostic output safely: {error}")),
+    };
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("could not inspect diagnostic output: {error}"))?;
+    if !metadata.is_file() {
+        return Err("diagnostic output must be a regular file".into());
+    }
+    if metadata.len() > MAX_BYTES {
+        return Err(format!("diagnostic output exceeds {MAX_BYTES} bytes"));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    File::from_std(file)
+        .take(MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|error| format!("could not read diagnostic output: {error}"))?;
+    if bytes.len() as u64 > MAX_BYTES {
+        return Err(format!("diagnostic output exceeds {MAX_BYTES} bytes"));
+    }
+    let contents = String::from_utf8(bytes)
+        .map_err(|error| format!("diagnostic output is not UTF-8: {error}"))?;
+    let mut diagnostics = Vec::new();
+    for (index, line) in contents.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if diagnostics.len() == MAX_DIAGNOSTICS {
+            return Err(format!(
+                "diagnostic output exceeds {MAX_DIAGNOSTICS} records"
+            ));
+        }
+        let diagnostic: StepDiagnostic = serde_json::from_str(line)
+            .map_err(|error| format!("diagnostic record {} is malformed: {error}", index + 1))?;
+        validate_step_diagnostic(&diagnostic)
+            .map_err(|error| format!("diagnostic record {} is invalid: {error}", index + 1))?;
+        diagnostics.push(diagnostic);
+    }
+    Ok(diagnostics)
+}
+
+fn validate_step_diagnostic(diagnostic: &StepDiagnostic) -> Result<(), String> {
+    if diagnostic.code.is_empty()
+        || diagnostic.code.len() > 128
+        || !diagnostic.code.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'-' | b'_')
+        })
+    {
+        return Err("code must be 1-128 lowercase ASCII letters, digits, '.', '-' or '_'".into());
+    }
+    if diagnostic.message.is_empty() || diagnostic.message.len() > 4096 {
+        return Err("message must be 1-4096 bytes".into());
+    }
+    if diagnostic.paths.len() > 128 {
+        return Err("paths exceeds 128 entries".into());
+    }
+    for path in &diagnostic.paths {
+        let path = Path::new(path);
+        if path.as_os_str().is_empty()
+            || path.is_absolute()
+            || path.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                )
+            })
+        {
+            return Err("paths must be non-empty repository-relative paths without '..'".into());
+        }
+    }
+    if let Some(RepairCommand::Argv { argv }) = &diagnostic.repair
+        && (argv.is_empty() || argv.len() > 64 || argv.iter().any(|argument| argument.len() > 4096))
+    {
+        return Err("repair argv must contain 1-64 bounded arguments".into());
+    }
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -668,6 +795,7 @@ async fn run_step_via_worker(
         signal,
         elapsed_ms: started.elapsed().as_millis() as u64,
         log: log.seal().await?,
+        diagnostics: Vec::new(),
     })
 }
 
@@ -774,6 +902,7 @@ async fn run_step_direct(
                 signal: None,
                 elapsed_ms: started.elapsed().as_millis() as u64,
                 log: log.seal().await?,
+                diagnostics: Vec::new(),
             });
         }
     };
@@ -846,6 +975,7 @@ async fn run_step_direct(
         signal,
         elapsed_ms: started.elapsed().as_millis() as u64,
         log,
+        diagnostics: Vec::new(),
     })
 }
 
@@ -1323,6 +1453,69 @@ mod tests {
         assert_eq!(result.log.stdout_end, 3);
         assert_eq!(result.log.stderr_end, 3);
         assert_ne!(result.log.hash, "");
+    }
+
+    #[tokio::test]
+    async fn captures_bounded_structured_diagnostics_without_scraping_logs() {
+        let temporary = tempfile::tempdir().unwrap();
+        let config = EffectiveConfig::parse(
+            r#"version=1
+[[step]]
+name="ci"
+run='''
+printf '%s\n' '{"code":"generated-output-drift","message":"Generated report is stale","paths":["reports/current.csv"],"repair":{"kind":"argv","argv":["tool","generate"]}}' > "$TOLLGATE_DIAGNOSTICS_FILE"
+exit 1
+'''
+"#,
+        )
+        .unwrap();
+        let context = ExecutionContext {
+            cwd: temporary.path().into(),
+            environment: std::env::vars().collect(),
+            read_only_context: BTreeMap::new(),
+            runner: config.runner.clone(),
+            log_path: temporary.path().join("diagnostic.tlog"),
+        };
+        let result = run_step(&config.steps[0], context, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(result.class, StepResultClass::ExitFailure);
+        assert_eq!(result.diagnostics.len(), 1);
+        assert_eq!(result.diagnostics[0].code, "generated-output-drift");
+        assert_eq!(result.diagnostics[0].paths, vec!["reports/current.csv"]);
+        assert_eq!(
+            result.diagnostics[0].repair,
+            Some(RepairCommand::Argv {
+                argv: vec!["tool".into(), "generate".into()]
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_diagnostic_contract_fails_a_successful_step() {
+        let temporary = tempfile::tempdir().unwrap();
+        let config = EffectiveConfig::parse(
+            r#"version=1
+[[step]]
+name="ci"
+run='''
+printf '%s\n' '{"code":"BAD CODE","message":"unsafe","paths":["../escape"]}' > "$TOLLGATE_DIAGNOSTICS_FILE"
+'''
+"#,
+        )
+        .unwrap();
+        let context = ExecutionContext {
+            cwd: temporary.path().into(),
+            environment: std::env::vars().collect(),
+            read_only_context: BTreeMap::new(),
+            runner: config.runner.clone(),
+            log_path: temporary.path().join("invalid-diagnostic.tlog"),
+        };
+        let result = run_step(&config.steps[0], context, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(result.class, StepResultClass::ExitFailure);
+        assert_eq!(result.diagnostics[0].code, "tollgate.diagnostics-invalid");
     }
 
     #[tokio::test]

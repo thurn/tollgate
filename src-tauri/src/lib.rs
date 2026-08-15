@@ -1092,6 +1092,19 @@ async fn execute_ipc_command(service: &Service, command: IpcCommand) -> IpcRespo
                     .map_err(|error| error.to_string())?,
             )
             .map_err(|error| error.to_string()),
+            IpcCommand::Diagnose {
+                repository_id,
+                item_id,
+                replay,
+                verify_repair,
+                command_id,
+            } => serde_json::to_value(
+                service
+                    .diagnose_failure(repository_id, item_id, replay, verify_repair, command_id)
+                    .await
+                    .map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string()),
             IpcCommand::Cancel {
                 repository_id,
                 item_id,

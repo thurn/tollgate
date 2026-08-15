@@ -9,10 +9,8 @@ async-trait.workspace = true
 blake3.workspace = true
 hex.workspace = true
 serde.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tollgate-domain = { path = "../tollgate-domain" }
 uuid.workspace = true
-
-[dev-dependencies]
-tempfile.workspace = true

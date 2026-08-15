@@ -65,6 +65,33 @@ promoted and synchronized to the configured remote. Remote pushing must be
 enabled for the repository. Bare `tg push` retains its narrower recovery
 meaning: retrying a push of commits that Tollgate has already certified.
 
+## Diagnosing CI failures
+
+`tg status <candidate-id>` attributes each failed voting step when comparable
+evidence already exists. Tollgate reports `candidate-introduced`,
+`inherited-from-base`, `flaky-or-non-hermetic`, or `origin-unknown`; a comparison
+is valid only when the frozen configuration, step graph, engine epoch, and tool
+environment match.
+
+Run `tg diagnose <candidate-id>` for a stronger experiment. Tollgate checks the
+exact anchored base once and the exact tested candidate twice in cold,
+disposable slots, then recomputes attribution from those runs. `--no-replay`
+shows retained evidence without scheduling work.
+
+A step may publish structured diagnostics by writing one JSON object per line
+to the read-only `TOLLGATE_DIAGNOSTICS_FILE` environment variable:
+
+```json
+{"code":"generated-output-drift","message":"Generated reports are stale","paths":["reports/current.csv"],"repair":{"kind":"argv","argv":["tool","generate"]}}
+```
+
+Tollgate bounds and validates this JSONL channel; it does not infer repairs by
+scraping logs. `tg diagnose <candidate-id> --verify-repair` explicitly runs one
+unambiguous structured repair in a fresh clone, reruns every applicable voting
+step, and retains a binary patch only if they pass. The original source and
+candidate remain immutable: the patch must be reviewed and submitted as a new
+candidate.
+
 ## Safety model
 
 - CI runs in detached worktrees belonging to a disposable execution mirror.

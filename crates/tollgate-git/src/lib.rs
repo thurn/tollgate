@@ -2,13 +2,14 @@
 
 use std::{
     ffi::OsStr,
+    io::{Seek, SeekFrom},
     path::{Path, PathBuf},
     process::Stdio,
 };
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::{fs, process::Command};
+use tokio::{fs, io::AsyncReadExt, process::Command};
 use tollgate_domain::{GitOid, ObjectFormat, QueueItemId};
 
 const EMPTY_HOOKS_DIRECTORY: &str = "/dev/null";
@@ -908,6 +909,72 @@ impl GitRepository {
         .await?;
         run_raw(&self.profile.executable, slot, ["clean", "-d", "-f"]).await?;
         Ok(())
+    }
+
+    pub async fn remove_slot(&self, mirror: &Path, slot: &Path) -> Result<(), GitError> {
+        let _ = run_raw(
+            &self.profile.executable,
+            mirror,
+            ["worktree", "unlock", slot.to_string_lossy().as_ref()],
+        )
+        .await;
+        run_raw(
+            &self.profile.executable,
+            mirror,
+            [
+                "worktree",
+                "remove",
+                "--force",
+                slot.to_string_lossy().as_ref(),
+            ],
+        )
+        .await?;
+        run_raw(
+            &self.profile.executable,
+            mirror,
+            ["worktree", "prune", "--expire", "now"],
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn worktree_patch(
+        &self,
+        slot: &Path,
+        maximum_bytes: u64,
+    ) -> Result<Vec<u8>, GitError> {
+        run_raw(
+            &self.profile.executable,
+            slot,
+            ["add", "--intent-to-add", "--all"],
+        )
+        .await?;
+        let mut patch = tempfile::tempfile()?;
+        let mut command = Command::new(&self.profile.executable);
+        command
+            .current_dir(slot)
+            .args(["diff", "--binary", "--full-index", "--no-ext-diff", "HEAD"])
+            .stdout(Stdio::from(patch.try_clone()?))
+            .stderr(Stdio::piped());
+        let output = command.spawn()?.wait_with_output().await?;
+        if !output.status.success() {
+            return Err(GitError::Command {
+                command: "git diff --binary --full-index --no-ext-diff HEAD".into(),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().into(),
+            });
+        }
+        let length = patch.metadata()?.len();
+        if length > maximum_bytes {
+            return Err(GitError::InvalidOutput(format!(
+                "repair patch is {length} bytes, exceeding the {maximum_bytes}-byte limit"
+            )));
+        }
+        patch.seek(SeekFrom::Start(0))?;
+        let mut bytes = Vec::with_capacity(length as usize);
+        tokio::fs::File::from_std(patch)
+            .read_to_end(&mut bytes)
+            .await?;
+        Ok(bytes)
     }
 
     pub async fn quarantine_slot(
