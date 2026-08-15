@@ -6,6 +6,9 @@ import { App } from "./App";
 test("renders the release queue with non-color status text", async () => {
   render(<QueryClientProvider client={new QueryClient()}><App /></QueryClientProvider>);
   expect(await screen.findByRole("heading", { name: "Queue" })).toBeInTheDocument();
+  expect(screen.getByRole("alert")).toHaveTextContent("Master push failed");
+  expect(screen.getByRole("alert")).toHaveTextContent("Step trox failed");
+  expect(screen.getByRole("button", { name: /View failure/ })).toBeInTheDocument();
   expect(screen.getByText("Validation passed")).toBeInTheDocument();
   expect(screen.getAllByText("Running").length).toBeGreaterThan(0);
   expect(screen.queryByText("Approve")).not.toBeInTheDocument();

@@ -130,6 +130,8 @@ pub struct RepositorySnapshot {
     pub observed_master_oid: GitOid,
     pub queue: Vec<QueueItemView>,
     pub checks: Vec<QueueItemView>,
+    #[serde(default)]
+    pub master_push: Option<QueueItemView>,
     pub history_items: Vec<QueueItemView>,
     pub history: Vec<DomainEvent>,
     pub configuration: ConfigurationView,
@@ -752,6 +754,16 @@ fn queue_item_view(data: &RuntimeData, item: &QueueItem) -> QueueItemView {
         elapsed_ms,
         failure_attribution,
     }
+}
+
+fn is_master_push_item(item: &QueueItem) -> bool {
+    item.kind == QueueItemKind::Gate
+        && item.promotion_authorized
+        && item.metadata.branch.as_deref() == Some(USER_BRANCH)
+        && matches!(
+            item.metadata.purpose.as_deref(),
+            Some("push-master") | Some("gate")
+        )
 }
 
 fn reuse_active_enqueue_sequences(current: &[QueueItem], ordered: &mut [QueueItem]) {
@@ -3614,6 +3626,12 @@ impl TollgateService {
             )
             .map(|item| queue_item_view(&data, item))
             .collect();
+        let master_push = data
+            .items
+            .iter()
+            .filter(|item| is_master_push_item(item))
+            .max_by_key(|item| item.enqueue_sequence)
+            .map(|item| queue_item_view(&data, item));
         let history_items = data
             .items
             .iter()
@@ -3642,6 +3660,7 @@ impl TollgateService {
             observed_master_oid,
             queue,
             checks,
+            master_push,
             history_items,
             history,
             configuration: ConfigurationView {
@@ -4073,8 +4092,27 @@ impl TollgateService {
         worktree_path: Option<String>,
         command_id: CommandId,
     ) -> Result<ApproveResult, ServiceError> {
-        self.enqueue_gate_from(repository_id, revision, worktree_path, command_id, true)
+        self.approve_from_with_purpose(repository_id, revision, worktree_path, None, command_id)
             .await
+    }
+
+    pub async fn approve_from_with_purpose(
+        self: &Arc<Self>,
+        repository_id: RepositoryId,
+        revision: String,
+        worktree_path: Option<String>,
+        purpose: Option<String>,
+        command_id: CommandId,
+    ) -> Result<ApproveResult, ServiceError> {
+        self.enqueue_gate_from(
+            repository_id,
+            revision,
+            worktree_path,
+            purpose,
+            command_id,
+            true,
+        )
+        .await
     }
 
     pub async fn submit_candidate(
@@ -4094,8 +4132,15 @@ impl TollgateService {
         worktree_path: Option<String>,
         command_id: CommandId,
     ) -> Result<ApproveResult, ServiceError> {
-        self.enqueue_gate_from(repository_id, revision, worktree_path, command_id, false)
-            .await
+        self.enqueue_gate_from(
+            repository_id,
+            revision,
+            worktree_path,
+            None,
+            command_id,
+            false,
+        )
+        .await
     }
 
     async fn enqueue_gate_from(
@@ -4103,6 +4148,7 @@ impl TollgateService {
         repository_id: RepositoryId,
         revision: String,
         worktree_path: Option<String>,
+        purpose: Option<String>,
         command_id: CommandId,
         promotion_authorized: bool,
     ) -> Result<ApproveResult, ServiceError> {
@@ -4162,6 +4208,7 @@ impl TollgateService {
             "kind": QueueItemKind::Gate,
             "revision": requested_revision,
             "worktree_path": requested_worktree,
+            "purpose": purpose,
             "promotion_authorized": promotion_authorized,
         }))?;
         let command_kind = if promotion_authorized {
@@ -4279,14 +4326,16 @@ impl TollgateService {
                 worktree_path: Some(approval_git.worktree_root.to_string_lossy().into_owned()),
                 signature_state: SignatureState::Unknown,
                 approved_at: OffsetDateTime::now_utc(),
-                purpose: Some(
-                    if promotion_authorized {
-                        "gate"
-                    } else {
-                        "candidate"
-                    }
-                    .into(),
-                ),
+                purpose: purpose.or_else(|| {
+                    Some(
+                        if promotion_authorized {
+                            "gate"
+                        } else {
+                            "candidate"
+                        }
+                        .into(),
+                    )
+                }),
             },
             state: QueueItemState::Constructing,
             terminal_reason: None,
@@ -12609,6 +12658,71 @@ mod tests {
                 .is_none()
         );
         assert_eq!(git(&repository, &["rev-parse", USER_BRANCH_REF]), later);
+    }
+
+    #[tokio::test]
+    async fn latest_failed_master_push_remains_in_repository_snapshot() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("base.txt"), "base\n").unwrap();
+        git(&repository, &["add", "base.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+
+        let service = TollgateService::open(temporary.path().join("support"))
+            .await
+            .unwrap();
+        let initialized = service
+            .initialize_repository(&repository, Some("false".into()))
+            .await
+            .unwrap();
+        std::fs::write(repository.join("master.txt"), "master\n").unwrap();
+        git(&repository, &["add", "master.txt"]);
+        git(&repository, &["commit", "-m", "master push"]);
+        let approved = service
+            .approve_from_with_purpose(
+                initialized.state.id,
+                "HEAD".into(),
+                Some(repository.to_string_lossy().into_owned()),
+                Some("push-master".into()),
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let snapshot = service
+                .repository_snapshot(initialized.state.id)
+                .await
+                .unwrap();
+            let Some(master_push) = snapshot.master_push else {
+                assert!(tokio::time::Instant::now() < deadline);
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                continue;
+            };
+            if master_push.item.state == QueueItemState::Failed {
+                assert_eq!(master_push.item.id, approved.item_id);
+                assert_eq!(
+                    master_push.item.metadata.purpose.as_deref(),
+                    Some("push-master")
+                );
+                assert_eq!(
+                    master_push.item.terminal_reason.as_deref(),
+                    Some("voting-validation-failed")
+                );
+                assert!(
+                    master_push
+                        .failure_attribution
+                        .as_ref()
+                        .is_some_and(|attribution| attribution.steps[0].name == "ci")
+                );
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
     }
 
     #[tokio::test]

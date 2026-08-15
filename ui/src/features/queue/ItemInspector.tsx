@@ -41,7 +41,7 @@ export function ItemInspector({ view, repository, onClose }: {
         <div><dt>Promotion</dt><dd>{view.item.promotion_authorized ? "Authorized" : "Not authorized"}</dd></div>
       </dl>
       {view.item.terminal_reason && <div className="notice"><strong>{view.item.terminal_reason}</strong></div>}
-      <section className="steps"><h3>Steps</h3>{steps.map((step) => { const result = view.buildset?.step_results.find((candidate) => candidate.name === step.name); return <div key={step.name}><span className={`step-state ${result?.result_class === "success" ? "is-success" : result ? "is-active" : ""}`} /><strong>{step.name}</strong><small>{result ? `${result.result_class} · ${formatDuration(result.elapsed_ms)}` : "waiting"}</small></div>; })}</section>
+      <section className="steps"><h3>Steps</h3>{steps.map((step) => { const result = view.buildset?.step_results.find((candidate) => candidate.name === step.name); const failed = result && !["success", "running", "pending", "skipped"].includes(result.result_class); return <div key={step.name}><span className={`step-state ${result?.result_class === "success" ? "is-success" : failed ? "is-failure" : result ? "is-active" : ""}`} /><strong>{step.name}</strong><small>{result ? `${result.result_class} · ${formatDuration(result.elapsed_ms)}` : "waiting"}</small></div>; })}</section>
       <LogPanel view={view} repository={repository} stepNames={steps.map((step) => step.name)} />
     </div>
   </aside>;

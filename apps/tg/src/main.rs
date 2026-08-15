@@ -12,7 +12,7 @@ use tollgate_ipc::{
     Frame, FrameCodec, FrameKind, Handshake, HandshakeAck, IpcCommand, IpcResponse,
     MAX_CONTROL_PAYLOAD, MAX_LOG_PAYLOAD, PROTOCOL_VERSION, verify_peer_uid,
 };
-use tollgate_service::{AppSnapshot, DiagnoseResult, RepositorySnapshot};
+use tollgate_service::{AppSnapshot, DiagnoseResult, QueueItemView, RepositorySnapshot};
 use uuid::Uuid;
 
 #[derive(Parser)]
@@ -141,6 +141,12 @@ struct DiagnoseArgs {
 struct PushMasterArgs {
     #[arg(long, help = "Wait for validation and remote synchronization")]
     wait: bool,
+    #[arg(
+        long,
+        conflicts_with = "wait",
+        help = "Report the latest master push without scheduling work"
+    )]
+    status: bool,
 }
 
 #[derive(Subcommand)]
@@ -311,6 +317,7 @@ async fn run(cli: Cli) -> anyhow::Result<u8> {
                         worktree_path: Some(
                             std::env::current_dir()?.to_string_lossy().into_owned(),
                         ),
+                        purpose: None,
                         command_id: CommandId::new(),
                     })
                     .await?
@@ -392,7 +399,14 @@ async fn run(cli: Cli) -> anyhow::Result<u8> {
             }
         }
         TopCommand::PushMaster(args) => {
-            return push_master(&mut client, cli.repository, cli.json, args.wait).await;
+            return push_master(
+                &mut client,
+                cli.repository,
+                cli.json,
+                args.wait,
+                args.status,
+            )
+            .await;
         }
         TopCommand::Check(args) => {
             let repository = select_repository(&mut client, cli.repository).await?;
@@ -1225,8 +1239,13 @@ async fn push_master(
     selected: Option<RepositoryId>,
     json: bool,
     wait: bool,
+    status: bool,
 ) -> anyhow::Result<u8> {
     let mut repository = select_repository(client, selected).await?;
+    if status {
+        print_push_master_status(&repository, json)?;
+        return Ok(0);
+    }
     if !repository.configuration.remote_enabled {
         return Err(anyhow!(
             "remote push is disabled for this repository; enable [remote] before using `tg push-master`"
@@ -1340,6 +1359,7 @@ async fn push_master(
                         repository_id: repository.state.id,
                         revision: source_oid.to_hex(),
                         worktree_path: Some(master_worktree.to_string_lossy().into_owned()),
+                        purpose: Some("push-master".into()),
                         command_id: CommandId::new(),
                     })
                     .await?;
@@ -1397,6 +1417,128 @@ async fn push_master(
         return wait_for_item(client, repository.state.id, tail_id, json).await;
     }
     Ok(0)
+}
+
+fn print_push_master_status(repository: &RepositorySnapshot, json: bool) -> anyhow::Result<()> {
+    let Some(view) = repository.master_push.as_ref() else {
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "status": "none",
+                    "repository_id": repository.state.id,
+                    "repository_name": repository.state.name,
+                }))?
+            );
+        } else {
+            println!(
+                "No master push has been recorded for {}.",
+                repository.state.name
+            );
+        }
+        return Ok(());
+    };
+
+    let status = master_push_status(view);
+    let failed_steps = master_push_failed_steps(view);
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "status": status,
+                "repository_id": repository.state.id,
+                "repository_name": repository.state.name,
+                "item_id": view.item.id,
+                "state": view.item.state,
+                "remote_state": view.item.remote_state,
+                "source_oid": view.item.source_oid,
+                "tested_oid": view.generation.as_ref().map(|generation| &generation.tested_oid),
+                "subject": view.item.metadata.subject,
+                "terminal_reason": view.item.terminal_reason,
+                "failed_steps": failed_steps,
+            }))?
+        );
+        return Ok(());
+    }
+
+    println!("{}", master_push_status_heading(status));
+    println!("  candidate  {}", view.item.id);
+    println!("  source     {}", view.item.source_oid.short());
+    println!(
+        "  tested     {}",
+        view.generation
+            .as_ref()
+            .map(|generation| generation.tested_oid.short())
+            .unwrap_or_else(|| "—".into())
+    );
+    println!("  state      {:?}", view.item.state);
+    if let Some(reason) = &view.item.terminal_reason {
+        println!("  reason     {reason}");
+    }
+    for step in &failed_steps {
+        println!(
+            "  failed     {} ({})",
+            step["name"].as_str().unwrap_or("unknown"),
+            step["result"].as_str().unwrap_or("failed")
+        );
+    }
+    if status == "failed" {
+        if let Some(step) = failed_steps.first().and_then(|step| step["name"].as_str()) {
+            println!("  inspect    tg logs {} --step {step}", view.item.id);
+        } else {
+            println!("  inspect    tg status {}", view.item.id);
+        }
+    }
+    Ok(())
+}
+
+fn master_push_status(view: &QueueItemView) -> &'static str {
+    use tollgate_domain::{QueueItemState as State, RemoteState};
+    if view.item.remote_state == RemoteState::PushBlocked {
+        return "failed";
+    }
+    match view.item.state {
+        State::Promoted | State::ExternallyIntegrated => "succeeded",
+        State::Failed
+        | State::MergeConflict
+        | State::DependencyFailed
+        | State::InfrastructureExhausted => "failed",
+        State::Canceled | State::Superseded => "canceled",
+        State::Ready => "ready",
+        _ => "running",
+    }
+}
+
+fn master_push_status_heading(status: &str) -> &'static str {
+    match status {
+        "succeeded" => "Master push succeeded",
+        "failed" => "Master push failed",
+        "canceled" => "Master push was canceled",
+        "ready" => "Master push passed validation and is awaiting promotion",
+        _ => "Master push is running",
+    }
+}
+
+fn master_push_failed_steps(view: &QueueItemView) -> Vec<serde_json::Value> {
+    if let Some(attribution) = &view.failure_attribution {
+        return attribution
+            .steps
+            .iter()
+            .map(|step| {
+                serde_json::json!({
+                    "name": step.name,
+                    "result": step.candidate_result,
+                    "origin": step.origin,
+                })
+            })
+            .collect();
+    }
+    view.buildset
+        .iter()
+        .flat_map(|buildset| &buildset.step_results)
+        .filter(|step| !matches!(step.result_class.as_str(), "success" | "skipped"))
+        .map(|step| serde_json::json!({"name": step.name, "result": step.result_class}))
+        .collect()
 }
 
 async fn select_repository(
@@ -1849,6 +1991,18 @@ mod tests {
             panic!("push-master did not parse as the master submission command");
         };
         assert!(args.wait);
+        assert!(!args.status);
+    }
+
+    #[test]
+    fn push_master_status_flag_is_read_only_and_conflicts_with_wait() {
+        let parsed = Cli::try_parse_from(["tg", "push-master", "--status"]).unwrap();
+        let TopCommand::PushMaster(args) = parsed.command else {
+            panic!("push-master did not parse as the master submission command");
+        };
+        assert!(args.status);
+        assert!(!args.wait);
+        assert!(Cli::try_parse_from(["tg", "push-master", "--status", "--wait"]).is_err());
     }
 
     #[test]

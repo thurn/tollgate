@@ -66,9 +66,12 @@ latest speculative tested chain back onto an unchanged, clean local `master`,
 placing the newly certified commits beneath the submitted commits without a
 temporary divergence. New commits or working-tree changes prevent automatic
 projection and are left untouched. Use `tg push-master --wait` when a foreground
-result is useful. Remote pushing must be enabled for the repository. Bare `tg
-push` retains its narrower recovery meaning: retrying a push of commits that
-Tollgate has already certified.
+result is useful. `tg push-master --status` reports the latest master push,
+including its failed validation step and the exact log command to inspect.
+The Queue screen retains the latest failed master push as an action-required
+entry after it leaves the active queue. Remote pushing must be enabled for the
+repository. Bare `tg push` retains its narrower recovery meaning: retrying a
+push of commits that Tollgate has already certified.
 
 ## Diagnosing CI failures
 

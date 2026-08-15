@@ -1,5 +1,5 @@
 import { Clock3, GitMerge } from "lucide-react";
-import type { AppSnapshot } from "../lib/types";
+import { isMasterPushFailure, type AppSnapshot } from "../lib/types";
 import type { Route } from "./useAppState";
 import { cn } from "../lib/utils";
 
@@ -19,15 +19,17 @@ export function Sidebar({ snapshot, selectedRepository, route, onRepository, onR
     <div className="sidebar__drag" data-tauri-drag-region />
     <strong className="brand">Tollgate</strong>
     <div className="repository-list">
-      {snapshot?.repositories.map((repository) => <button
+      {snapshot?.repositories.map((repository) => {
+        const failedMasterPush = isMasterPushFailure(repository.master_push);
+        return <button
         key={repository.state.id}
         className={cn("repository-button", selectedRepository === repository.state.id && "is-active")}
         onClick={() => onRepository(repository.state.id)}
       >
-        <span className={cn("repository-dot", `tone-${repository.state.execution_state === "active" ? "success" : repository.state.execution_state === "blocked" ? "danger" : "warning"}`)} />
+        <span className={cn("repository-dot", `tone-${failedMasterPush || repository.state.execution_state === "blocked" ? "danger" : repository.state.execution_state === "active" ? "success" : "warning"}`)} />
         <span>{repository.state.name}</span>
-        {repository.queue.length > 0 && <small>{repository.queue.length}</small>}
-      </button>)}
+        {failedMasterPush ? <small aria-label="Master push failed">!</small> : repository.queue.length > 0 && <small>{repository.queue.length}</small>}
+      </button>})}
     </div>
     <nav className="sidebar__nav" aria-label="Repository navigation">
       {navigation.map(({ route: value, label, icon: Icon }) => <button key={value} className={cn(route === value && "is-active")} onClick={() => onRoute(value)} aria-current={route === value ? "page" : undefined}><Icon />{label}</button>)}

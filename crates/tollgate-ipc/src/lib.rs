@@ -228,6 +228,8 @@ pub enum IpcCommand {
         repository_id: RepositoryId,
         revision: String,
         worktree_path: Option<String>,
+        #[serde(default)]
+        purpose: Option<String>,
         command_id: CommandId,
     },
     Candidate {

@@ -1048,10 +1048,17 @@ async fn execute_ipc_command(service: &Service, command: IpcCommand) -> IpcRespo
                 repository_id,
                 revision,
                 worktree_path,
+                purpose,
                 command_id,
             } => serde_json::to_value(
                 service
-                    .approve_from(repository_id, revision, worktree_path, command_id)
+                    .approve_from_with_purpose(
+                        repository_id,
+                        revision,
+                        worktree_path,
+                        purpose,
+                        command_id,
+                    )
                     .await
                     .map_err(|error| error.to_string())?,
             )

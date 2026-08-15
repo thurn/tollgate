@@ -43,6 +43,9 @@ export interface Buildset {
 }
 export interface FrozenStep { id: string; name: string; command: { kind: "shell"; runner: string[]; script: string } | { kind: "argv"; argv: string[] }; working_directory: string; needs: string[]; soft_needs: string[]; voting: boolean; final_step: boolean; timeout_ns: number; cpu_tokens: number; memory_bytes: number; rss_limit_bytes?: number; semaphores: string[] }
 export interface BuildsetStepResult { name: string; result_class: string; exit_code?: number; signal?: number; elapsed_ms: number; log_hash: string; stdout_end: number; stderr_end: number }
+export type FailureOrigin = "candidate-introduced" | "inherited-from-base" | "flaky-or-non-hermetic" | "origin-unknown";
+export interface StepFailureAttribution { name: string; origin: FailureOrigin; candidate_result: string; baseline_result?: string; baseline_buildset_id?: string; diagnostics: unknown[] }
+export interface FailureAttribution { origin: FailureOrigin; candidate_buildset_id: string; candidate_tested_oid: GitOid; base_oid: GitOid; configuration_digest: string; step_graph_digest: string; environment_fingerprint: string; steps: StepFailureAttribution[] }
 export interface SuccessfulStepResult { step_id: string; attempt_id: string; log_stdout_end: number; log_stderr_end: number; log_hash: string }
 export interface PassCertificate {
   id: string; buildset_id: string; queue_item_id: string; validation_generation_id: string;
@@ -59,7 +62,7 @@ export interface EffectiveStep {
   environment: Record<string, string>; remove_environment: string[]; artifacts: unknown[];
 }
 export interface DomainEvent { id: string; repository_id: string; sequence: number; actor: string; command_id?: string; kind: string; payload: unknown; created_at: string }
-export interface QueueItemView { item: QueueItem; generation?: ValidationGeneration; buildset?: Buildset; attempts?: Buildset[]; attempt_generations?: ValidationGeneration[]; certificate?: PassCertificate; certificates?: PassCertificate[]; included_items: string[]; elapsed_ms?: number }
+export interface QueueItemView { item: QueueItem; generation?: ValidationGeneration; buildset?: Buildset; attempts?: Buildset[]; attempt_generations?: ValidationGeneration[]; certificate?: PassCertificate; certificates?: PassCertificate[]; included_items: string[]; elapsed_ms?: number; failure_attribution?: FailureAttribution }
 export interface HistoryItemsPage { items: QueueItemView[]; total: number; offset: number }
 export interface ConfigurationView { digest: string; step_graph_digest: string; steps: EffectiveStep[]; remote_enabled: boolean; runner: string[] }
 export interface VolumeView { id: string; roles: string[]; available_bytes: number; warning_threshold: number; critical_threshold: number; emergency_allowance: number; state: "healthy" | "warning" | "critical" }
@@ -69,9 +72,14 @@ export interface SeedView { id: string; path: string; profile: string; generatio
 export interface ArtifactRecord { artifact_id: string; buildset_id: string; source_path: string; retained_path: string; hash: string; size: number; retention_state: "retained" | "pinned"; created_at: string; expires_at: string }
 export interface DiagnosticCheck { name: string; status: "healthy" | "attention"; detail: string; recovery_action?: string }
 export interface DoctorReport { repository_id: string; generated_at: string; checks: DiagnosticCheck[]; healthy: boolean }
-export interface RepositorySnapshot { state: RepositoryState; observed_master_oid: GitOid; queue: QueueItemView[]; checks: QueueItemView[]; history_items: QueueItemView[]; history: DomainEvent[]; configuration: ConfigurationView; resources: ResourceView; slots: SlotView[]; seeds: SeedView[]; artifacts: ArtifactRecord[] }
+export interface RepositorySnapshot { state: RepositoryState; observed_master_oid: GitOid; queue: QueueItemView[]; checks: QueueItemView[]; master_push?: QueueItemView; history_items: QueueItemView[]; history: DomainEvent[]; configuration: ConfigurationView; resources: ResourceView; slots: SlotView[]; seeds: SeedView[]; artifacts: ArtifactRecord[] }
 export interface EnvironmentView { snapshot_id: string; fingerprint: string; path: string; variable_count: number }
 export interface UnavailableRepository { id: string; name: string; path: string; error: string; recovery_action: string }
 export interface AppSnapshot { version: string; generated_at: string; repositories: RepositorySnapshot[]; unavailable_repositories: UnavailableRepository[]; environment: EnvironmentView }
 
 export function oidHex(oid?: GitOid) { return oid?.bytes ?? ""; }
+
+export function isMasterPushFailure(view?: QueueItemView): view is QueueItemView {
+  if (!view) return false;
+  return view.item.remote_state === "push-blocked" || ["failed", "merge-conflict", "dependency-failed", "infrastructure-exhausted"].includes(view.item.state);
+}

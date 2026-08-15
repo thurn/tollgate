@@ -971,7 +971,7 @@ The initial CLI surface is:
 | `tg init` | Register repository, create Tollgate-owned local `release` at the exact local `master` OID without changing the checkout, create the trusted local config, validate Git/shell/APFS/ref ownership, configure resources, provision a slot, and offer bootstrap CI. |
 | `tg repo add/remove/list` | Explicit registry management. Remove unregisters by default; it does not erase durable repository state. |
 | `tg approve [<rev>] [--wait]` | Capture clean immutable source, enqueue, return item ID; optionally wait. |
-| `tg push-master [--wait]` | Rebase a clean stale local `master` range onto certified `release` when needed, authorize each linear commit oldest-first, and return after scheduling by default. While validation runs, project an unchanged clean local tip onto rebuilt speculative history whenever certified `release` advances; `--wait` additionally waits for the tail result. |
+| `tg push-master [--wait\|--status]` | Rebase a clean stale local `master` range onto certified `release` when needed, authorize each linear commit oldest-first, and return after scheduling by default. While validation runs, project an unchanged clean local tip onto rebuilt speculative history whenever certified `release` advances; `--wait` additionally waits for the tail result, while read-only `--status` reports the latest durably identified master push and any failed step. |
 | `tg queue` | Ordered active queue, queue revision, per-item validation generations, dependencies, states, and prefix OIDs. |
 | `tg status [<id>]` | Repository/item/buildset/slot summary. |
 | `tg wait <id>` | Subscribe until terminal/blocked outcome; handle Ctrl-C without canceling CI. |
