@@ -4,10 +4,10 @@ import { oidHex } from "../../lib/types";
 import { cn, formatDuration, shortId } from "../../lib/utils";
 import { StatusGlyph, itemStatus } from "../../components/StatusGlyph";
 
-export function QueueCard({ view, position, selected, onSelect }: { view: QueueItemView; position: number; selected: boolean; onSelect: () => void }) {
+export function QueueCard({ view, position, selected, onSelect }: { view: QueueItemView; position?: number; selected: boolean; onSelect: () => void }) {
   const status = itemStatus(view.item.state);
   return <article className={cn("queue-card", selected && "is-selected")}>
-    <span className="queue-card__position">{position}</span>
+    <span className="queue-card__position">{position ?? ""}</span>
     <StatusGlyph state={view.item.state} />
     <button className="queue-card__main" onClick={onSelect} aria-expanded={selected} aria-controls="item-inspector">
       <strong>{view.item.metadata.subject}</strong>

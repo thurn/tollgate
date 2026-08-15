@@ -9,13 +9,15 @@ function item(index: number, state: QueueItemState, subject: string, branch: str
   const source = oid(["7a41be2", "e09c147", "4d62aa1", "cb38f70"][index - 1] ?? "114acff");
   const tested = oid(["91d3f0e", "f27c1b4", "60be92c", "aa16d92"][index - 1] ?? "abcedef");
   const parent = index === 1 ? oid("b2cdf95") : oid(["91d3f0e", "f27c1b4", "60be92c"][index - 2] ?? "b2cdf95");
+  const passed = ["ready", "promoted", "externally-integrated", "check-passed"].includes(state);
+  const failed = ["failed", "merge-conflict", "dependency-failed", "infrastructure-exhausted", "check-failed"].includes(state);
   return {
     item: {
       id, repository_id: "019fef58-aaaa-7000-8000-e6aff447a5ba", kind: "gate", enqueue_sequence: index,
       source_oid: source, source_ref: `refs/tollgate/sources/${id}`,
       metadata: { subject, message_hash: "e15bc42", author_name: index === 3 ? "Mira Chen" : "You", author_email: "dev@example.com", branch, worktree_path: `/Users/dev/worktrees/${branch}`, signature_state: "verified", approved_at: ago(32 - index * 3), purpose: branch === "master" ? "push-master" : "gate" },
       promotion_authorized: true,
-      state, terminal_reason: state === "failed" ? "voting-validation-failed" : undefined,
+      state, terminal_reason: failed ? "voting-validation-failed" : undefined,
       remote_state: state === "ready" ? "ready" as const : state === "failed" ? "preflight-pending" as const : "disabled" as const,
       cleanup_state: "not-eligible" as const, dependencies: index === 3 ? ["019fef58-7147-7273-9c03-e6aff447a5b2"] : [],
       current_generation_id: `019fef58-9000-7${index}00-8000-e6aff447a5ba`,
@@ -33,11 +35,11 @@ function item(index: number, state: QueueItemState, subject: string, branch: str
       id: `019fef58-8000-7${index}00-8000-e6aff447a5ba`, item_id: id,
       validation_generation_id: `019fef58-9000-7${index}00-8000-e6aff447a5ba`, tested_oid: tested,
       expected_parent_oid: parent, environment_fingerprint: "44acbc2fa5", slot_id: `019fef58-5000-7${index}00-8000-e6aff447a5ba`,
-      state: state === "ready" ? "passed" as const : state === "failed" ? "failed" as const : state === "running" ? "running" as const : "pending" as const,
+      state: passed ? "passed" as const : failed ? "failed" as const : state === "running" ? "running" as const : "pending" as const,
       attempt: 1, created_at: ago(27 - index * 2), started_at: state !== "queued" ? ago(18 - index * 2) : undefined,
-      finished_at: state === "ready" || state === "failed" ? ago(2) : undefined,
-      frozen_steps: state === "failed" ? [{ id: `019fef58-7000-7${index}00-8000-e6aff447a5ba`, name: "trox", command: { kind: "shell", runner: ["/bin/sh", "-c"], script: "npm run trox:check" }, working_directory: ".", needs: [], soft_needs: [], voting: true, final_step: false, timeout_ns: 3_600_000_000_000, cpu_tokens: 1, memory_bytes: 268435456, semaphores: [] }] : undefined,
-      step_results: state === "queued" ? [] : [{ name: state === "failed" ? "trox" : "test", result_class: state === "ready" ? "success" : state === "failed" ? "exit-failure" : "running", elapsed_ms: elapsed, log_hash: "9a1f9d2e", stdout_end: 1842, stderr_end: state === "failed" ? 2529 : 0 }],
+      finished_at: passed || failed ? ago(2) : undefined,
+      frozen_steps: failed ? [{ id: `019fef58-7000-7${index}00-8000-e6aff447a5ba`, name: "trox", command: { kind: "shell", runner: ["/bin/sh", "-c"], script: "npm run trox:check" }, working_directory: ".", needs: [], soft_needs: [], voting: true, final_step: false, timeout_ns: 3_600_000_000_000, cpu_tokens: 1, memory_bytes: 268435456, semaphores: [] }] : undefined,
+      step_results: state === "queued" ? [] : [{ name: failed ? "trox" : "test", result_class: passed ? "success" : failed ? "exit-failure" : "running", elapsed_ms: elapsed, log_hash: "9a1f9d2e", stdout_end: 1842, stderr_end: failed ? 2529 : 0 }],
     },
     certificate: state === "ready" ? {
       id: `019fef58-6000-7${index}00-8000-e6aff447a5ba`, buildset_id: `019fef58-8000-7${index}00-8000-e6aff447a5ba`,
@@ -47,7 +49,7 @@ function item(index: number, state: QueueItemState, subject: string, branch: str
       voting_results: [], warnings: [], checkout_verified: true, completed_event_sequence: 93, created_at: ago(2),
     } : undefined,
     included_items: Array.from({ length: index }, (_, n) => `#${n + 1}`), elapsed_ms: elapsed,
-    failure_attribution: state === "failed" ? {
+    failure_attribution: failed ? {
       origin: "origin-unknown", candidate_buildset_id: `019fef58-8000-7${index}00-8000-e6aff447a5ba`, candidate_tested_oid: tested,
       base_oid: parent, configuration_digest: "0aa71db513e868d166f3640ef91bf93c", step_graph_digest: "c1d06b0345e664abafcb13713532aac8",
       environment_fingerprint: "44acbc2fa5", steps: [{ name: "trox", origin: "origin-unknown", candidate_result: "exit-failure", diagnostics: [] }],
@@ -56,6 +58,16 @@ function item(index: number, state: QueueItemState, subject: string, branch: str
 }
 
 const failedMasterPush = item(5, "failed", "Amplified text revisions", "master", 12_460);
+const promotedRun = item(6, "promoted", "Keep candidate evidence after restart", "feature/evidence-recovery", 512_000);
+const canceledRun = item(7, "canceled", "Retire legacy promotion script", "feature/remove-legacy", 84_000);
+const activeCheck = item(8, "running", "Verify dependency graph changes", "feature/dependency-graph", 91_000);
+activeCheck.item.kind = "independent-check";
+activeCheck.item.metadata.purpose = "check";
+activeCheck.item.promotion_authorized = false;
+const completedCheck = item(9, "check-passed", "Audit runner environment capture", "feature/runner-env", 244_000);
+completedCheck.item.kind = "independent-check";
+completedCheck.item.metadata.purpose = "check";
+completedCheck.item.promotion_authorized = false;
 
 export const demoSnapshot: AppSnapshot = {
   version: "0.1.0",
@@ -77,9 +89,9 @@ export const demoSnapshot: AppSnapshot = {
         item(3, "running", "Add APFS seed manifest validation", "feature/apfs-seeds", 196_000),
         item(4, "queued", "Polish queue dependency visualization", "feature/queue-ui", 0),
       ],
-      checks: [],
+      checks: [activeCheck, completedCheck],
       master_push: failedMasterPush,
-      history_items: [failedMasterPush],
+      history_items: [completedCheck, failedMasterPush, canceledRun, promotedRun],
       history: [
         { id: "event-94", repository_id: "019fef58-aaaa-7000-8000-e6aff447a5ba", sequence: 94, actor: "app", kind: "buildset.step-started", payload: {}, created_at: ago(1) },
         { id: "event-93", repository_id: "019fef58-aaaa-7000-8000-e6aff447a5ba", sequence: 93, actor: "app", kind: "certificate.issued", payload: {}, created_at: ago(2) },

@@ -1,11 +1,11 @@
-import { Clock3, GitMerge } from "lucide-react";
+import { FlaskConical, GitMerge } from "lucide-react";
 import { isMasterPushFailure, type AppSnapshot } from "../lib/types";
 import type { Route } from "./useAppState";
 import { cn } from "../lib/utils";
 
 const navigation: { route: Route; label: string; icon: typeof GitMerge }[] = [
-  { route: "queue", label: "Gate", icon: GitMerge },
-  { route: "history", label: "History", icon: Clock3 },
+  { route: "runs", label: "Gate", icon: GitMerge },
+  { route: "checks", label: "Checks", icon: FlaskConical },
 ];
 
 export function Sidebar({ snapshot, selectedRepository, route, onRepository, onRoute }: {

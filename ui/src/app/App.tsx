@@ -1,9 +1,9 @@
 import { Sidebar } from "./Sidebar";
 import { Topbar } from "./Topbar";
 import { useAppState } from "./useAppState";
-import { QueueView } from "../features/queue/QueueView";
 import { ItemInspector } from "../features/queue/ItemInspector";
-import { HistoryView } from "../features/history/HistoryView";
+import { RunsView } from "../features/runs/RunsView";
+import { ChecksView } from "../features/checks/ChecksView";
 import { EmptyState } from "./EmptyState";
 import { Button } from "../components/ui/Button";
 
@@ -19,8 +19,8 @@ export function App() {
       <Topbar repository={state.repository} route={state.route} onRefresh={() => state.refetch()} refreshing={state.isFetching} />
       {!state.repository || !state.snapshot?.repositories.length ? <EmptyState /> : <div className="workspace__body">
         <main className="main-content">
-          {state.route === "queue" && <QueueView repository={state.repository} selectedItemId={state.selectedItem?.item.id ?? null} onSelect={state.selectItem} />}
-          {state.route === "history" && <HistoryView repository={state.repository} onSelect={state.selectItem} />}
+          {state.route === "runs" && <RunsView repository={state.repository} historyItems={state.historyItems} selectedItemId={state.selectedItem?.item.id ?? null} onSelect={state.selectItem} hasMore={state.hasMoreHistory} loadingMore={state.isLoadingMoreHistory} onLoadMore={state.loadMoreHistory} />}
+          {state.route === "checks" && <ChecksView repository={state.repository} historyItems={state.historyItems} selectedItemId={state.selectedItem?.item.id ?? null} onSelect={state.selectItem} hasMore={state.hasMoreHistory} loadingMore={state.isLoadingMoreHistory} onLoadMore={state.loadMoreHistory} />}
         </main>
         <ItemInspector view={state.selectedItem} repository={state.repository} onClose={() => state.selectItem(null)} />
       </div>}

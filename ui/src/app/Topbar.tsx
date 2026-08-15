@@ -14,7 +14,7 @@ export function Topbar({ repository, route, onRefresh, refreshing }: {
   const status = repository && repositoryStatus(repository.state.execution_state);
   return <header className="topbar" data-tauri-drag-region>
     <div className="topbar__title" data-tauri-drag-region>
-      <strong>{route === "queue" ? "Gate" : "History"}</strong>
+      <strong>{route === "runs" ? "Gate" : "Checks"}</strong>
       {status && <Badge tone={status.tone} dot>{status.label}</Badge>}
     </div>
     {repository && <div className="topbar__actions">
