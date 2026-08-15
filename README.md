@@ -52,6 +52,19 @@ tg status <candidate-id>
 
 `--wait` returns when validation has produced promotion-grade evidence (or a conclusive failure), while `release` remains unchanged. A user later grants authority to the exact retained candidate with `tg approve <candidate-id>`; that authority atomically covers its active hard dependencies because they are part of the retained source history. Granting authority to a retained candidate moves it ahead of unrelated candidates still awaiting authority. Tollgate preserves an exact completed certificate when the priority change leaves its speculative prefix unchanged, and otherwise rebuilds the affected suffix automatically. `tg cancel <candidate-id>` cancels it. For the original one-phase user workflow, `tg approve HEAD` still submits and authorizes in one command.
 
+To submit every clean, linear commit on local `master` after the certified
+`release` tip and automatically push the resulting certified chain, run:
+
+```sh
+tg push-master
+```
+
+The command authorizes the commits oldest-first and returns after scheduling.
+Use `tg push-master --wait` to remain attached until the final commit is
+promoted and synchronized to the configured remote. Remote pushing must be
+enabled for the repository. Bare `tg push` retains its narrower recovery
+meaning: retrying a push of commits that Tollgate has already certified.
+
 ## Safety model
 
 - CI runs in detached worktrees belonging to a disposable execution mirror.

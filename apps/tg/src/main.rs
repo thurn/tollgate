@@ -7,6 +7,7 @@ use futures::{SinkExt, StreamExt};
 use tokio::net::UnixStream;
 use tokio_util::codec::Framed;
 use tollgate_domain::{BuildsetId, CommandId, QueueItemId, RepositoryId};
+use tollgate_git::{GitRepository, USER_BRANCH, USER_BRANCH_REF};
 use tollgate_ipc::{
     Frame, FrameCodec, FrameKind, Handshake, HandshakeAck, IpcCommand, IpcResponse,
     MAX_CONTROL_PAYLOAD, MAX_LOG_PAYLOAD, PROTOCOL_VERSION, verify_peer_uid,
@@ -48,6 +49,7 @@ enum TopCommand {
     Repo(RepoCommand),
     Candidate(RevisionArgs),
     Approve(RevisionArgs),
+    PushMaster(PushMasterArgs),
     Queue,
     Status {
         id: Option<QueueItemId>,
@@ -119,6 +121,12 @@ struct RevisionArgs {
     )]
     revision: String,
     #[arg(long, help = "Wait for validation or promotion to finish")]
+    wait: bool,
+}
+
+#[derive(Args)]
+struct PushMasterArgs {
+    #[arg(long, help = "Wait for every master commit to be promoted and pushed")]
     wait: bool,
 }
 
@@ -369,6 +377,9 @@ async fn run(cli: Cli) -> anyhow::Result<u8> {
                 )
                 .await;
             }
+        }
+        TopCommand::PushMaster(args) => {
+            return push_master(&mut client, cli.repository, cli.json, args.wait).await;
         }
         TopCommand::Check(args) => {
             let repository = select_repository(&mut client, cli.repository).await?;
@@ -1151,6 +1162,144 @@ impl IpcClient {
     }
 }
 
+async fn push_master(
+    client: &mut IpcClient,
+    selected: Option<RepositoryId>,
+    json: bool,
+    wait: bool,
+) -> anyhow::Result<u8> {
+    let mut repository = select_repository(client, selected).await?;
+    if !repository.configuration.remote_enabled {
+        return Err(anyhow!(
+            "remote push is disabled for this repository; enable [remote] before using `tg push-master`"
+        ));
+    }
+
+    let git = GitRepository::discover(&repository.state.path).await?;
+    let master_worktree = git
+        .worktree_for_branch(USER_BRANCH_REF)
+        .await?
+        .ok_or_else(|| {
+            anyhow!(
+                "local master is not checked out; check it out in a worktree before using `tg push-master`"
+            )
+        })?;
+    let master_git = GitRepository::discover(&master_worktree).await?;
+    if master_git.common_dir != git.common_dir
+        || master_git.current_branch().await?.as_deref() != Some(USER_BRANCH)
+    {
+        return Err(anyhow!(
+            "the discovered master worktree does not belong to the selected repository"
+        ));
+    }
+    master_git.ensure_clean().await?;
+    let master_oid = git.resolve_oid(USER_BRANCH_REF).await?;
+    if master_git.resolve_oid("HEAD").await? != master_oid {
+        return Err(anyhow!(
+            "master worktree HEAD does not match the local master ref"
+        ));
+    }
+
+    let source_oids = git.unmerged_user_master_commits().await?;
+    if source_oids.is_empty() {
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "status": "up-to-date",
+                    "release_oid": repository.state.master_oid,
+                    "master_oid": master_oid,
+                    "items": [],
+                }))?
+            );
+        } else {
+            println!("Local master has no commits beyond certified release.");
+        }
+        return Ok(0);
+    }
+
+    let release_oid = repository.state.master_oid.clone();
+    let mut scheduled = Vec::with_capacity(source_oids.len());
+    for source_oid in source_oids {
+        let existing = repository
+            .queue
+            .iter()
+            .find(|view| view.item.source_oid == source_oid)
+            .map(|view| (view.item.id, view.item.promotion_authorized));
+        let (item_id, action) = match existing {
+            Some((item_id, true)) => (item_id, "already-authorized"),
+            Some((item_id, false)) => {
+                let response = client
+                    .request(IpcCommand::AuthorizeCandidate {
+                        repository_id: repository.state.id,
+                        item_id,
+                        expected_revision: repository.state.queue_revision,
+                        command_id: CommandId::new(),
+                    })
+                    .await?;
+                let response_item_id = response["item_id"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("authorization response omitted item ID"))?
+                    .parse::<QueueItemId>()?;
+                (response_item_id, "authorized-candidate")
+            }
+            None => {
+                let response = client
+                    .request(IpcCommand::Approve {
+                        repository_id: repository.state.id,
+                        revision: source_oid.to_hex(),
+                        worktree_path: Some(master_worktree.to_string_lossy().into_owned()),
+                        command_id: CommandId::new(),
+                    })
+                    .await?;
+                let item_id = response["item_id"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("approval response omitted item ID"))?
+                    .parse::<QueueItemId>()?;
+                (item_id, "submitted")
+            }
+        };
+        scheduled.push(serde_json::json!({
+            "item_id": item_id,
+            "source_oid": source_oid,
+            "action": action,
+        }));
+        repository = select_repository(client, Some(repository.state.id)).await?;
+    }
+
+    let tail_id = scheduled
+        .last()
+        .and_then(|item| item["item_id"].as_str())
+        .ok_or_else(|| anyhow!("master submission did not produce a tail item"))?
+        .parse::<QueueItemId>()?;
+    let result = serde_json::json!({
+        "status": "scheduled",
+        "release_oid": release_oid,
+        "master_oid": master_oid,
+        "items": scheduled,
+        "tail_item_id": tail_id,
+        "queue_revision": repository.state.queue_revision,
+    });
+    print_value(result, json, |value| {
+        let count = value["items"].as_array().map_or(0, Vec::len);
+        println!(
+            "Scheduled {count} master commit{} for certified push\n  release  {}\n  master   {}\n  tail     {}",
+            if count == 1 { "" } else { "s" },
+            oid_value(&value["release_oid"]),
+            oid_value(&value["master_oid"]),
+            tail_id,
+        );
+        println!(
+            "Tollgate will push the certified chain to the configured remote after it passes."
+        );
+        Ok(())
+    })?;
+    if wait {
+        return wait_for_item(client, repository.state.id, tail_id, json).await;
+    }
+    Ok(0)
+}
+
 async fn select_repository(
     client: &mut IpcClient,
     selected: Option<RepositoryId>,
@@ -1492,5 +1641,14 @@ mod tests {
         };
         assert_eq!(ids, vec![id.parse().unwrap()]);
         assert!(Cli::try_parse_from(["tg", "promote", id]).is_err());
+    }
+
+    #[test]
+    fn push_master_wait_flag_parses() {
+        let parsed = Cli::try_parse_from(["tg", "push-master", "--wait"]).unwrap();
+        let TopCommand::PushMaster(args) = parsed.command else {
+            panic!("push-master did not parse as the master submission command");
+        };
+        assert!(args.wait);
     }
 }

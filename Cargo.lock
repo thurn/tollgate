@@ -4193,6 +4193,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tollgate-domain",
+ "tollgate-git",
  "tollgate-ipc",
  "tollgate-service",
  "uuid",

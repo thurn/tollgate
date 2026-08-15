@@ -230,7 +230,7 @@ impl GitRepository {
         Ok(())
     }
 
-    async fn worktree_for_branch(&self, branch_ref: &str) -> Result<Option<PathBuf>, GitError> {
+    pub async fn worktree_for_branch(&self, branch_ref: &str) -> Result<Option<PathBuf>, GitError> {
         let bytes = self.git(["worktree", "list", "--porcelain", "-z"]).await?;
         let mut current_path = None;
         let mut matches = Vec::new();
@@ -1222,6 +1222,40 @@ impl GitRepository {
             .map_err(Into::into)
     }
 
+    pub async fn unmerged_user_master_commits(&self) -> Result<Vec<GitOid>, GitError> {
+        let release = self.integration_oid().await?;
+        let master = self.resolve_oid(USER_BRANCH_REF).await?;
+        if release == master {
+            return Ok(Vec::new());
+        }
+        if !self.is_ancestor(&release, &master).await? {
+            return Err(GitError::InvalidOutput(format!(
+                "local master {} is not a descendant of certified release {}; reconcile the branches before pushing master",
+                master.short(),
+                release.short()
+            )));
+        }
+        let commits = self.first_parent_commits_between(&release, &master).await?;
+        let mut expected_parent = release;
+        for commit in &commits {
+            let parent = self.commit_parent_oid(commit).await?;
+            if parent != expected_parent {
+                return Err(GitError::InvalidOutput(format!(
+                    "master commit {} does not directly follow {}; only a linear, merge-free master range can be submitted",
+                    commit.short(),
+                    expected_parent.short()
+                )));
+            }
+            expected_parent = commit.clone();
+        }
+        if expected_parent != master {
+            return Err(GitError::InvalidOutput(
+                "master range did not resolve to the local master tip".into(),
+            ));
+        }
+        Ok(commits)
+    }
+
     pub async fn is_ancestor(
         &self,
         ancestor: &GitOid,
@@ -1507,6 +1541,97 @@ mod tests {
             Some(USER_BRANCH)
         );
         adapter.ensure_integration_not_checked_out().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn lists_unmerged_master_commits_oldest_first() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("file.txt"), "base\n").unwrap();
+        git(&repository, &["add", "file.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+
+        let adapter = GitRepository::discover(&repository).await.unwrap();
+        adapter
+            .initialize_integration_ref_from_master()
+            .await
+            .unwrap();
+        std::fs::write(repository.join("one.txt"), "one\n").unwrap();
+        git(&repository, &["add", "one.txt"]);
+        git(&repository, &["commit", "-m", "one"]);
+        let one = GitOid::from_hex(&git(&repository, &["rev-parse", "HEAD"])).unwrap();
+        std::fs::write(repository.join("two.txt"), "two\n").unwrap();
+        git(&repository, &["add", "two.txt"]);
+        git(&repository, &["commit", "-m", "two"]);
+        let two = GitOid::from_hex(&git(&repository, &["rev-parse", "HEAD"])).unwrap();
+
+        assert_eq!(
+            adapter.unmerged_user_master_commits().await.unwrap(),
+            vec![one, two]
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_a_master_range_containing_a_merge_commit() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("file.txt"), "base\n").unwrap();
+        git(&repository, &["add", "file.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+
+        let adapter = GitRepository::discover(&repository).await.unwrap();
+        adapter
+            .initialize_integration_ref_from_master()
+            .await
+            .unwrap();
+        git(&repository, &["checkout", "-b", "side"]);
+        std::fs::write(repository.join("side.txt"), "side\n").unwrap();
+        git(&repository, &["add", "side.txt"]);
+        git(&repository, &["commit", "-m", "side"]);
+        git(&repository, &["checkout", USER_BRANCH]);
+        std::fs::write(repository.join("master.txt"), "master\n").unwrap();
+        git(&repository, &["add", "master.txt"]);
+        git(&repository, &["commit", "-m", "master"]);
+        git(
+            &repository,
+            &["merge", "--no-ff", "side", "-m", "merge side"],
+        );
+
+        let error = adapter.unmerged_user_master_commits().await.unwrap_err();
+        assert!(matches!(error, GitError::InvalidSourceShape));
+    }
+
+    #[tokio::test]
+    async fn rejects_master_that_diverged_from_release() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("file.txt"), "base\n").unwrap();
+        git(&repository, &["add", "file.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+
+        let adapter = GitRepository::discover(&repository).await.unwrap();
+        adapter
+            .initialize_integration_ref_from_master()
+            .await
+            .unwrap();
+        git(&repository, &["checkout", "--detach", INTEGRATION_BRANCH]);
+        std::fs::write(repository.join("release.txt"), "release\n").unwrap();
+        git(&repository, &["add", "release.txt"]);
+        git(&repository, &["commit", "-m", "move release"]);
+        git(&repository, &["branch", "-f", INTEGRATION_BRANCH, "HEAD"]);
+        git(&repository, &["checkout", USER_BRANCH]);
+        std::fs::write(repository.join("master.txt"), "master\n").unwrap();
+        git(&repository, &["add", "master.txt"]);
+        git(&repository, &["commit", "-m", "move master"]);
+
+        let error = adapter.unmerged_user_master_commits().await.unwrap_err();
+        assert!(error.to_string().contains("is not a descendant"));
     }
 
     #[tokio::test]
