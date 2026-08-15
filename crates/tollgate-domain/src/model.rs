@@ -70,6 +70,10 @@ pub struct QueueItem {
     pub repository_id: RepositoryId,
     #[serde(default)]
     pub kind: QueueItemKind,
+    /// Canonical queue order from admission or the latest explicit manual
+    /// reorder. Automatic authorization priority never rewrites this value.
+    #[serde(default)]
+    pub admission_sequence: Option<u64>,
     pub enqueue_sequence: u64,
     pub source_oid: GitOid,
     pub source_ref: String,

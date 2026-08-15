@@ -380,6 +380,15 @@ async fn run(cli: Cli) -> anyhow::Result<u8> {
                         if items.len() == 1 { "" } else { "s" }
                     );
                 }
+                if let Some(items) = value["restored_item_ids"].as_array()
+                    && !items.is_empty()
+                {
+                    println!(
+                        "  plan      restored admission order; {} exact completed validation{} reused; redundant replacement work canceled",
+                        items.len(),
+                        if items.len() == 1 { "" } else { "s" }
+                    );
+                }
                 Ok(())
             })?;
             if args.wait {

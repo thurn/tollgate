@@ -406,6 +406,8 @@ pub struct CandidateAuthorizationResult {
     pub authorized_item_ids: Vec<QueueItemId>,
     #[serde(default)]
     pub restarted_item_ids: Vec<QueueItemId>,
+    #[serde(default)]
+    pub restored_item_ids: Vec<QueueItemId>,
     pub queue_revision: u64,
     pub source_oid: GitOid,
     pub validation_generation_id: ValidationGenerationId,
@@ -477,6 +479,23 @@ impl RuntimeData {
     fn extend_generations(&mut self, generations: impl IntoIterator<Item = ValidationGeneration>) {
         for generation in generations {
             self.push_generation(generation);
+        }
+    }
+
+    fn activate_generation(&mut self, generation: ValidationGeneration) {
+        if let Some(current) = self.generations.iter_mut().rev().find(|current| {
+            current.item_id == generation.item_id && current.invalidated_by.is_none()
+        }) {
+            current.invalidated_by = Some(generation.id);
+        }
+        if let Some(existing) = self
+            .generations
+            .iter_mut()
+            .find(|existing| existing.id == generation.id)
+        {
+            *existing = generation;
+        } else {
+            self.generations.push(generation);
         }
     }
 }
@@ -809,6 +828,92 @@ fn reuse_active_enqueue_sequences(current: &[QueueItem], ordered: &mut [QueueIte
     for (item, sequence) in ordered.iter_mut().zip(sequences) {
         item.enqueue_sequence = sequence;
     }
+}
+
+fn admission_sequence(item: &QueueItem) -> u64 {
+    item.admission_sequence.unwrap_or(item.enqueue_sequence)
+}
+
+fn restorable_admission_order(current: &[QueueItem]) -> Option<Vec<QueueItemId>> {
+    let mut admission_order = current.iter().collect::<Vec<_>>();
+    admission_order.sort_by_key(|item| (admission_sequence(item), item.id));
+
+    let mut unauthorized_seen = false;
+    for item in &admission_order {
+        if item.promotion_authorized {
+            if unauthorized_seen {
+                return None;
+            }
+        } else {
+            unauthorized_seen = true;
+        }
+    }
+
+    let admission_ids = admission_order
+        .into_iter()
+        .map(|item| item.id)
+        .collect::<Vec<_>>();
+    let current_ids = current.iter().map(|item| item.id).collect::<Vec<_>>();
+    (admission_ids != current_ids).then_some(admission_ids)
+}
+
+fn matching_retained_evidence(
+    item: &QueueItem,
+    desired: &ValidationGeneration,
+    generations: &[ValidationGeneration],
+    buildsets: &[Buildset],
+    certificates: &[PassCertificate],
+    config: &EffectiveConfig,
+    engine_epoch: u64,
+) -> Option<(ValidationGeneration, Buildset, PassCertificate)> {
+    generations
+        .iter()
+        .filter(|generation| {
+            generation.item_id == item.id
+                && generation.identity_digest == desired.identity_digest
+                && generation.anchored_base_oid == desired.anchored_base_oid
+                && generation.ordered_item_ids == desired.ordered_item_ids
+                && generation.ordered_source_oids == desired.ordered_source_oids
+                && generation.prefix_oids == desired.prefix_oids
+                && generation.expected_parent_oid == desired.expected_parent_oid
+                && generation.tested_oid == desired.tested_oid
+                && generation.configuration_digest == desired.configuration_digest
+                && generation.step_graph_digest == desired.step_graph_digest
+                && generation.engine_epoch == desired.engine_epoch
+        })
+        .find_map(|generation| {
+            let certificate = certificates.iter().find(|certificate| {
+                certificate.queue_item_id == item.id
+                    && certificate.validation_generation_id == generation.id
+            })?;
+            let buildset = buildsets.iter().find(|buildset| {
+                buildset.id == certificate.buildset_id
+                    && buildset.item_id == item.id
+                    && buildset.validation_generation_id == generation.id
+                    && matches!(
+                        buildset.state,
+                        BuildsetState::Passed | BuildsetState::PassedWithWarnings
+                    )
+            })?;
+            let mut projected = item.clone();
+            projected.state = QueueItemState::Ready;
+            projected.current_generation_id = Some(generation.id);
+            projected.buildset_id = Some(buildset.id);
+            projected.certificate_id = Some(certificate.id);
+            certificate
+                .validates_frozen_inputs(
+                    &projected,
+                    generation,
+                    &config.digest,
+                    &config.step_graph_digest,
+                    engine_epoch,
+                )
+                .then(|| {
+                    let mut generation = generation.clone();
+                    generation.invalidated_by = None;
+                    (generation, buildset.clone(), certificate.clone())
+                })
+        })
 }
 
 fn current_queue_prefix_oid(data: &RuntimeData) -> GitOid {
@@ -4682,6 +4787,7 @@ impl TollgateService {
             id: item_id,
             repository_id,
             kind: QueueItemKind::Gate,
+            admission_sequence: Some(enqueue_sequence),
             enqueue_sequence,
             source_oid: probe.source_oid.clone(),
             source_ref: format!("refs/tollgate/sources/{item_id}"),
@@ -4910,8 +5016,9 @@ impl TollgateService {
             original_generation,
             mut state,
             config,
-            original_validation_complete,
-            original_evidence_reused,
+            retained_generations,
+            retained_buildsets,
+            retained_certificates,
         ) = {
             let data = runtime.data.lock();
             if data.state.execution_state != RepositoryExecutionState::Active {
@@ -5019,21 +5126,6 @@ impl TollgateService {
                 .find(|generation| Some(generation.id) == item.current_generation_id)
                 .cloned()
                 .ok_or_else(|| ServiceError::Invariant("candidate generation missing".into()))?;
-            let certificate = data
-                .certificates
-                .iter()
-                .find(|certificate| Some(certificate.id) == item.certificate_id);
-            let evidence_reused = certificate.is_some_and(|certificate| {
-                item.state == QueueItemState::Ready
-                    && certificate.validates_frozen_inputs(
-                        &item,
-                        &generation,
-                        &data.config.digest,
-                        &data.config.step_graph_digest,
-                        data.state.engine_epoch,
-                    )
-            });
-            let validation_complete = item.state == QueueItemState::Ready;
             (
                 item,
                 data.items
@@ -5048,8 +5140,9 @@ impl TollgateService {
                 generation,
                 data.state.clone(),
                 data.config.clone(),
-                validation_complete,
-                evidence_reused,
+                data.generations.clone(),
+                data.buildsets.clone(),
+                data.certificates.clone(),
             )
         };
         if runtime.git.optional_ref_oid(&item.source_ref).await? != Some(item.source_oid.clone()) {
@@ -5124,6 +5217,27 @@ impl TollgateService {
         for candidate in &current {
             append_with_active_dependencies(candidate.id, &by_id, &mut ordered_ids, &mut visiting)?;
         }
+        let restored_admission_order = restorable_admission_order(&current);
+        if let Some(admission_order) = &restored_admission_order {
+            let positions = admission_order
+                .iter()
+                .enumerate()
+                .map(|(position, id)| (*id, position))
+                .collect::<HashMap<_, _>>();
+            if current.iter().any(|candidate| {
+                candidate.dependencies.iter().any(|dependency| {
+                    positions
+                        .get(dependency)
+                        .zip(positions.get(&candidate.id))
+                        .is_some_and(|(dependency, candidate)| dependency >= candidate)
+                })
+            }) {
+                return Err(ServiceError::Invariant(
+                    "retained admission order violates an active dependency".into(),
+                ));
+            }
+            ordered_ids.clone_from(admission_order);
+        }
         let first_changed = current
             .iter()
             .map(|candidate| candidate.id)
@@ -5140,6 +5254,9 @@ impl TollgateService {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let mut generations = Vec::new();
+        let mut restored_generations = Vec::new();
+        let mut restored_item_ids = Vec::new();
+        let mut restarted_item_ids = Vec::new();
         if first_changed < ordered.len() {
             runtime.git.initialize_mirror(&runtime.mirror).await?;
             let sources = ordered
@@ -5160,15 +5277,8 @@ impl TollgateService {
                 if index < first_changed {
                     continue;
                 }
-                if let Some(token) = runtime.cancellations.lock().get(&candidate.id) {
-                    token.cancel();
-                }
-                candidate.state = candidate
-                    .state
-                    .transition(ItemEvent::InputsChanged)
-                    .map_err(|error| ServiceError::Invariant(error.to_string()))?;
                 let commit = &synthetic[index];
-                let generation = ValidationGeneration::derive(
+                let desired_generation = ValidationGeneration::derive(
                     ValidationGenerationId::new(),
                     candidate.id,
                     state.master_oid.clone(),
@@ -5184,6 +5294,33 @@ impl TollgateService {
                     config.step_graph_digest.clone(),
                     state.engine_epoch,
                 );
+                if let Some(token) = runtime.cancellations.lock().get(&candidate.id) {
+                    token.cancel();
+                }
+                if restored_admission_order.is_some()
+                    && let Some((generation, buildset, certificate)) = matching_retained_evidence(
+                        candidate,
+                        &desired_generation,
+                        &retained_generations,
+                        &retained_buildsets,
+                        &retained_certificates,
+                        &config,
+                        state.engine_epoch,
+                    )
+                {
+                    candidate.state = QueueItemState::Ready;
+                    candidate.current_generation_id = Some(generation.id);
+                    candidate.buildset_id = Some(buildset.id);
+                    candidate.certificate_id = Some(certificate.id);
+                    restored_item_ids.push(candidate.id);
+                    restored_generations.push(generation);
+                    continue;
+                }
+                candidate.state = candidate
+                    .state
+                    .transition(ItemEvent::InputsChanged)
+                    .map_err(|error| ServiceError::Invariant(error.to_string()))?;
+                let generation = desired_generation;
                 candidate.current_generation_id = Some(generation.id);
                 candidate.buildset_id = None;
                 candidate.certificate_id = None;
@@ -5191,27 +5328,30 @@ impl TollgateService {
                     .state
                     .transition(ItemEvent::GenerationPrepared)
                     .map_err(|error| ServiceError::Invariant(error.to_string()))?;
+                restarted_item_ids.push(candidate.id);
                 generations.push(generation);
             }
         }
-        let restarted_item_ids = ordered[first_changed..]
-            .iter()
-            .map(|candidate| candidate.id)
-            .collect::<Vec<_>>();
         let prioritized_item = ordered
             .iter()
             .find(|candidate| candidate.id == item_id)
             .ok_or(ServiceError::ItemNotFound(item_id))?;
         let generation = generations
             .iter()
-            .find(|generation| generation.item_id == item_id)
+            .chain(&restored_generations)
+            .chain(&retained_generations)
+            .find(|generation| {
+                generation.item_id == item_id
+                    && Some(generation.id) == prioritized_item.current_generation_id
+            })
             .unwrap_or(&original_generation);
-        let validation_complete = restarted_item_ids.is_empty() && original_validation_complete;
-        let evidence_reused = restarted_item_ids.is_empty() && original_evidence_reused;
+        let validation_complete = prioritized_item.state == QueueItemState::Ready;
+        let evidence_reused = validation_complete && prioritized_item.certificate_id.is_some();
         let result = CandidateAuthorizationResult {
             item_id,
             authorized_item_ids,
             restarted_item_ids,
+            restored_item_ids,
             queue_revision: expected_revision + 1,
             source_oid: prioritized_item.source_oid.clone(),
             validation_generation_id: generation.id,
@@ -5225,6 +5365,7 @@ impl TollgateService {
             &state,
             &ordered,
             &generations,
+            &restored_generations,
             expected_revision,
             command_id,
             &request_digest,
@@ -5243,6 +5384,9 @@ impl TollgateService {
             }
             data.items
                 .sort_by_key(|candidate| candidate.enqueue_sequence);
+            for generation in restored_generations {
+                data.activate_generation(generation);
+            }
             data.extend_generations(generations);
         }
         let _ = runtime.events.send(event);
@@ -5376,6 +5520,7 @@ impl TollgateService {
             id: item_id,
             repository_id,
             kind: QueueItemKind::IndependentCheck,
+            admission_sequence: Some(enqueue_sequence),
             enqueue_sequence,
             source_oid: probe.source_oid.clone(),
             source_ref: format!("refs/tollgate/sources/{item_id}"),
@@ -6807,6 +6952,9 @@ impl TollgateService {
             .await?;
         let mut generations = Vec::new();
         reuse_active_enqueue_sequences(&current, &mut ordered);
+        for item in &mut ordered {
+            item.admission_sequence = Some(item.enqueue_sequence);
+        }
         for (index, item) in ordered.iter_mut().enumerate() {
             if index < first_changed {
                 continue;
@@ -14294,6 +14442,22 @@ policy = "clone"
         );
         assert_eq!(reordered.restarted_item_ids.len(), 2);
         assert_eq!(reordered.queue_revision, 3);
+        let reordered_snapshot = service
+            .repository_snapshot(initialized.state.id)
+            .await
+            .unwrap();
+        let reordered_items = reordered_snapshot
+            .queue
+            .iter()
+            .map(|view| &view.item)
+            .collect::<Vec<_>>();
+        assert_eq!(reordered_items[0].id, approved_b.item_id);
+        assert_eq!(reordered_items[1].id, approved_a.item_id);
+        assert!(
+            reordered_items[0].admission_sequence.unwrap()
+                < reordered_items[1].admission_sequence.unwrap(),
+            "an explicit reorder must replace the admission-order baseline"
+        );
         let replay = service
             .reorder_queue(
                 initialized.state.id,
@@ -15290,6 +15454,249 @@ policy = "clone"
             );
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
+    }
+
+    #[tokio::test]
+    async fn distributed_authorizations_restore_admission_order_and_exact_evidence() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        let a_worktree = temporary.path().join("candidate-a");
+        let b_worktree = temporary.path().join("candidate-b");
+        let c_worktree = temporary.path().join("candidate-c");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", "master"]);
+        std::fs::write(repository.join("base.txt"), "base\n").unwrap();
+        git(&repository, &["add", "base.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+        for (branch, path, file) in [
+            ("candidate-a", &a_worktree, "a.txt"),
+            ("candidate-b", &b_worktree, "b.txt"),
+            ("candidate-c", &c_worktree, "c.txt"),
+        ] {
+            git(
+                &repository,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    branch,
+                    path.to_str().unwrap(),
+                    "master",
+                ],
+            );
+            std::fs::write(path.join(file), format!("{branch}\n")).unwrap();
+            git(path, &["add", file]);
+            git(path, &["commit", "-m", branch]);
+        }
+        git(&repository, &["switch", "--detach", "master"]);
+
+        let support = temporary.path().join("support");
+        let service = TollgateService::open(support.clone()).await.unwrap();
+        let initialized = service
+            .initialize_repository(&repository, Some("sleep 1; true".into()))
+            .await
+            .unwrap();
+        let a = service
+            .submit_candidate_from(
+                initialized.state.id,
+                "HEAD".into(),
+                Some(a_worktree.to_string_lossy().into_owned()),
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        let b = service
+            .submit_candidate_from(
+                initialized.state.id,
+                "HEAD".into(),
+                Some(b_worktree.to_string_lossy().into_owned()),
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        let c = service
+            .submit_candidate_from(
+                initialized.state.id,
+                "HEAD".into(),
+                Some(c_worktree.to_string_lossy().into_owned()),
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let (
+            revision,
+            a_generation,
+            a_buildset,
+            a_certificate,
+            b_generation,
+            b_certificate,
+            c_generation,
+            c_certificate,
+        ) = loop {
+            let snapshot = service
+                .repository_snapshot(initialized.state.id)
+                .await
+                .unwrap();
+            if snapshot.queue.iter().all(|view| {
+                view.item.state == QueueItemState::Ready && !view.item.promotion_authorized
+            }) {
+                let a_view = snapshot
+                    .queue
+                    .iter()
+                    .find(|view| view.item.id == a.item_id)
+                    .unwrap();
+                let b_view = snapshot
+                    .queue
+                    .iter()
+                    .find(|view| view.item.id == b.item_id)
+                    .unwrap();
+                let c_view = snapshot
+                    .queue
+                    .iter()
+                    .find(|view| view.item.id == c.item_id)
+                    .unwrap();
+                break (
+                    snapshot.state.queue_revision,
+                    a_view.generation.as_ref().unwrap().id,
+                    a_view.buildset.as_ref().unwrap().id,
+                    a_view.certificate.as_ref().unwrap().id,
+                    b_view.generation.as_ref().unwrap().id,
+                    b_view.certificate.as_ref().unwrap().id,
+                    c_view.generation.as_ref().unwrap().id,
+                    c_view.certificate.as_ref().unwrap().id,
+                );
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "initial speculative validations did not finish"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        };
+
+        let c_authorized = service
+            .authorize_candidate(initialized.state.id, c.item_id, revision, CommandId::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            c_authorized.restarted_item_ids,
+            vec![c.item_id, a.item_id, b.item_id]
+        );
+        assert!(c_authorized.restored_item_ids.is_empty());
+
+        let after_c = service
+            .repository_snapshot(initialized.state.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            after_c
+                .queue
+                .iter()
+                .map(|view| view.item.id)
+                .collect::<Vec<_>>(),
+            vec![c.item_id, a.item_id, b.item_id]
+        );
+        let a_authorized = service
+            .authorize_candidate(
+                initialized.state.id,
+                a.item_id,
+                after_c.state.queue_revision,
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        assert!(a_authorized.restarted_item_ids.is_empty());
+        assert!(a_authorized.restored_item_ids.is_empty());
+        let after_a = service
+            .repository_snapshot(initialized.state.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            after_a
+                .queue
+                .iter()
+                .map(|view| view.item.id)
+                .collect::<Vec<_>>(),
+            vec![c.item_id, a.item_id, b.item_id]
+        );
+        let b_authorized = service
+            .authorize_candidate(
+                initialized.state.id,
+                b.item_id,
+                after_a.state.queue_revision,
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        assert!(b_authorized.restarted_item_ids.is_empty());
+        assert_eq!(
+            b_authorized.restored_item_ids,
+            vec![a.item_id, b.item_id, c.item_id]
+        );
+        assert!(b_authorized.validation_complete);
+        assert!(b_authorized.evidence_reused);
+        assert_eq!(b_authorized.validation_generation_id, b_generation);
+
+        let snapshot = service
+            .repository_snapshot(initialized.state.id)
+            .await
+            .unwrap();
+        assert!(snapshot.queue.is_empty());
+        assert_eq!(snapshot.state.master_oid, c.tested_oid);
+        let a_view = snapshot
+            .history_items
+            .iter()
+            .find(|view| view.item.id == a.item_id)
+            .unwrap();
+        let b_view = snapshot
+            .history_items
+            .iter()
+            .find(|view| view.item.id == b.item_id)
+            .unwrap();
+        let c_view = snapshot
+            .history_items
+            .iter()
+            .find(|view| view.item.id == c.item_id)
+            .unwrap();
+        assert_eq!(a_view.generation.as_ref().unwrap().id, a_generation);
+        assert_eq!(a_view.buildset.as_ref().unwrap().id, a_buildset);
+        assert_eq!(a_view.certificate.as_ref().unwrap().id, a_certificate);
+        assert_eq!(b_view.generation.as_ref().unwrap().id, b_generation);
+        assert_eq!(b_view.certificate.as_ref().unwrap().id, b_certificate);
+        assert_eq!(c_view.generation.as_ref().unwrap().id, c_generation);
+        assert_eq!(c_view.certificate.as_ref().unwrap().id, c_certificate);
+        assert_eq!(
+            service
+                .runtime(initialized.state.id)
+                .await
+                .unwrap()
+                .data
+                .lock()
+                .certificates
+                .len(),
+            3,
+            "bypass work must not mint replacement certificates after exact evidence restoration"
+        );
+        drop(service);
+        let reopened = TollgateService::open(support).await.unwrap();
+        let reopened_a = reopened
+            .item_details(initialized.state.id, a.item_id)
+            .await
+            .unwrap();
+        let reopened_b = reopened
+            .item_details(initialized.state.id, b.item_id)
+            .await
+            .unwrap();
+        let reopened_c = reopened
+            .item_details(initialized.state.id, c.item_id)
+            .await
+            .unwrap();
+        assert_eq!(reopened_a.generation.as_ref().unwrap().id, a_generation);
+        assert_eq!(reopened_a.certificate.as_ref().unwrap().id, a_certificate);
+        assert_eq!(reopened_b.generation.as_ref().unwrap().id, b_generation);
+        assert_eq!(reopened_b.certificate.as_ref().unwrap().id, b_certificate);
+        assert_eq!(reopened_c.generation.as_ref().unwrap().id, c_generation);
+        assert_eq!(reopened_c.certificate.as_ref().unwrap().id, c_certificate);
     }
 
     #[tokio::test]

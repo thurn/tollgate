@@ -556,11 +556,13 @@ impl RepositoryStore {
         Ok(event)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn authorize_candidate(
         &self,
         state: &RepositoryState,
         items: &[QueueItem],
         generations: &[ValidationGeneration],
+        restored_generations: &[ValidationGeneration],
         expected_revision: u64,
         command_id: CommandId,
         request_digest: &str,
@@ -591,6 +593,9 @@ impl RepositoryStore {
                 "INSERT INTO validation_generations (generation_id, item_id, identity_digest, tested_format, tested_oid, expected_parent_format, expected_parent_oid, configuration_digest, step_graph_digest, engine_epoch, generation_json, current) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1)",
                 params![generation.id.to_string(), generation.item_id.to_string(), generation.identity_digest, format!("{:?}", generation.tested_oid.format).to_lowercase(), generation.tested_oid.as_bytes(), format!("{:?}", generation.expected_parent_oid.format).to_lowercase(), generation.expected_parent_oid.as_bytes(), generation.configuration_digest, generation.step_graph_digest, generation.engine_epoch as i64, encode(generation)?],
             )?;
+        }
+        for generation in restored_generations {
+            activate_retained_generation(&transaction, generation)?;
         }
         for (index, item) in items.iter().enumerate() {
             transaction.execute(
@@ -1903,6 +1908,45 @@ fn invalidate_current_generation(
     Ok(())
 }
 
+fn activate_retained_generation(
+    transaction: &rusqlite::Transaction<'_>,
+    restored: &ValidationGeneration,
+) -> Result<(), StoreError> {
+    let current: Option<(String, String)> = transaction
+        .query_row(
+            "SELECT generation_id, generation_json FROM validation_generations WHERE item_id=?1 AND current=1",
+            [restored.item_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if let Some((generation_id, encoded)) = current {
+        if generation_id == restored.id.to_string() {
+            return Ok(());
+        }
+        let mut generation: ValidationGeneration = decode(&encoded)?;
+        generation.invalidated_by = Some(restored.id);
+        transaction.execute(
+            "UPDATE validation_generations SET current=0, generation_json=?2 WHERE generation_id=?1",
+            params![generation_id, encode(&generation)?],
+        )?;
+    }
+    let changed = transaction.execute(
+        "UPDATE validation_generations SET current=1, generation_json=?2 WHERE generation_id=?1 AND item_id=?3",
+        params![
+            restored.id.to_string(),
+            encode(restored)?,
+            restored.item_id.to_string()
+        ],
+    )?;
+    if changed != 1 {
+        return Err(StoreError::Integrity(format!(
+            "retained generation {} for item {} was not available for reactivation",
+            restored.id, restored.item_id
+        )));
+    }
+    Ok(())
+}
+
 fn migrate(connection: &Connection, database_path: Option<&Path>) -> Result<(), StoreError> {
     let mut version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version > SCHEMA_VERSION {
@@ -2314,6 +2358,7 @@ mod tests {
             id: item_id,
             repository_id: state.id,
             kind: QueueItemKind::Gate,
+            admission_sequence: Some(1),
             enqueue_sequence: 1,
             source_oid: source_oid.clone(),
             source_ref: format!("refs/tollgate/sources/{item_id}"),
