@@ -3,7 +3,7 @@
 #[cfg(target_os = "macos")]
 use std::os::unix::fs::OpenOptionsExt;
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs::OpenOptions as StdOpenOptions,
     path::PathBuf,
     process::Stdio,
@@ -202,6 +202,7 @@ async fn main() -> anyhow::Result<()> {
     let mut rss_exceeded = false;
     let mut containment_escaped = false;
     let mut observed_descendants = HashSet::new();
+    let mut root_instance = None;
     let rss_interval = tokio::time::interval(Duration::from_millis(100));
     tokio::pin!(rss_interval);
     let containment_interval = tokio::time::interval(Duration::from_millis(20));
@@ -232,8 +233,19 @@ async fn main() -> anyhow::Result<()> {
             }
             _ = containment_interval.tick() => {
                 if let Some(processes) = process_table().await {
-                    let descendants = descendants_of(child_pid, &processes, &observed_descendants);
-                    observed_descendants.extend(descendants.iter().map(|process| process.pid));
+                    if root_instance.is_none() {
+                        root_instance = processes
+                            .iter()
+                            .find(|process| process.pid == child_pid)
+                            .map(ProcessIdentity::instance);
+                    }
+                    let Some(root_instance) = root_instance.as_ref() else {
+                        continue;
+                    };
+                    let descendants =
+                        descendants_of(root_instance, &processes, &observed_descendants);
+                    observed_descendants
+                        .extend(descendants.iter().map(ProcessIdentity::instance));
                     if let Some(escaped) = descendants.iter().find(|process| process.process_group != child_pid) {
                         containment_escaped = true;
                         terminate_escaped_process(escaped.pid, escaped.process_group);
@@ -295,8 +307,19 @@ async fn main() -> anyhow::Result<()> {
             },
             _ = containment_interval.tick() => {
                 if let Some(processes) = process_table().await {
-                    let descendants = descendants_of(child_pid, &processes, &observed_descendants);
-                    observed_descendants.extend(descendants.iter().map(|process| process.pid));
+                    if root_instance.is_none() {
+                        root_instance = processes
+                            .iter()
+                            .find(|process| process.pid == child_pid)
+                            .map(ProcessIdentity::instance);
+                    }
+                    let Some(root_instance) = root_instance.as_ref() else {
+                        continue;
+                    };
+                    let descendants =
+                        descendants_of(root_instance, &processes, &observed_descendants);
+                    observed_descendants
+                        .extend(descendants.iter().map(ProcessIdentity::instance));
                     for escaped in descendants.iter().filter(|process| process.process_group != child_pid) {
                         containment_escaped = true;
                         terminate_escaped_process(escaped.pid, escaped.process_group);
@@ -370,18 +393,34 @@ async fn terminate_named_pipe_holders(paths: &[PathBuf]) -> bool {
     escaped
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Debug)]
 struct ProcessIdentity {
     pid: u32,
     parent: u32,
     process_group: u32,
+    started_at: String,
+}
+
+impl ProcessIdentity {
+    fn instance(&self) -> ProcessInstance {
+        ProcessInstance {
+            pid: self.pid,
+            started_at: self.started_at.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ProcessInstance {
+    pid: u32,
+    started_at: String,
 }
 
 async fn process_table() -> Option<Vec<ProcessIdentity>> {
     #[cfg(target_os = "macos")]
     {
         let output = Command::new("/bin/ps")
-            .args(["-axo", "pid=,ppid=,pgid="])
+            .args(["-axo", "pid=,ppid=,pgid=,lstart="])
             .stdin(Stdio::null())
             .stderr(Stdio::null())
             .output()
@@ -395,10 +434,18 @@ async fn process_table() -> Option<Vec<ProcessIdentity>> {
                 .lines()
                 .filter_map(|line| {
                     let mut fields = line.split_whitespace();
+                    let pid = fields.next()?.parse().ok()?;
+                    let parent = fields.next()?.parse().ok()?;
+                    let process_group = fields.next()?.parse().ok()?;
+                    let started_at = fields.collect::<Vec<_>>().join(" ");
+                    if started_at.is_empty() {
+                        return None;
+                    }
                     Some(ProcessIdentity {
-                        pid: fields.next()?.parse().ok()?,
-                        parent: fields.next()?.parse().ok()?,
-                        process_group: fields.next()?.parse().ok()?,
+                        pid,
+                        parent,
+                        process_group,
+                        started_at,
                     })
                 })
                 .collect(),
@@ -409,17 +456,24 @@ async fn process_table() -> Option<Vec<ProcessIdentity>> {
 }
 
 fn descendants_of(
-    root: u32,
+    root: &ProcessInstance,
     processes: &[ProcessIdentity],
-    previously_observed: &HashSet<u32>,
+    previously_observed: &HashSet<ProcessInstance>,
 ) -> Vec<ProcessIdentity> {
     let mut identities = previously_observed.clone();
-    identities.insert(root);
+    identities.insert(root.clone());
+    let current_instances = processes
+        .iter()
+        .map(|process| (process.pid, process.instance()))
+        .collect::<HashMap<_, _>>();
     loop {
         let before = identities.len();
         for process in processes {
-            if identities.contains(&process.parent) {
-                identities.insert(process.pid);
+            if current_instances
+                .get(&process.parent)
+                .is_some_and(|parent| identities.contains(parent))
+            {
+                identities.insert(process.instance());
             }
         }
         if identities.len() == before {
@@ -428,8 +482,11 @@ fn descendants_of(
     }
     processes
         .iter()
-        .copied()
-        .filter(|process| process.pid != root && identities.contains(&process.pid))
+        .filter(|process| {
+            let instance = process.instance();
+            &instance != root && identities.contains(&instance)
+        })
+        .cloned()
         .collect()
 }
 
@@ -549,4 +606,49 @@ fn group_is_empty(process_group: u32) -> bool {
         return matches!(killpg(Pid::from_raw(pid), None), Err(Errno::ESRCH));
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn process(pid: u32, parent: u32, process_group: u32, started_at: &str) -> ProcessIdentity {
+        ProcessIdentity {
+            pid,
+            parent,
+            process_group,
+            started_at: started_at.into(),
+        }
+    }
+
+    #[test]
+    fn descendant_tracking_ignores_a_reused_observed_pid() {
+        let root = process(10, 1, 10, "root");
+        let old_child = process(20, 10, 10, "old-child");
+        let observed = HashSet::from([old_child.instance()]);
+        let reused_pid = process(20, 1, 20, "unrelated-new-process");
+
+        assert!(descendants_of(&root.instance(), &[root, reused_pid], &observed).is_empty());
+    }
+
+    #[test]
+    fn descendant_tracking_retains_a_reparented_process_instance() {
+        let root = process(10, 1, 10, "root");
+        let child = process(20, 10, 10, "child");
+        let descendants = descendants_of(
+            &root.instance(),
+            &[root.clone(), child.clone()],
+            &HashSet::new(),
+        );
+        let observed = descendants
+            .iter()
+            .map(ProcessIdentity::instance)
+            .collect::<HashSet<_>>();
+        let escaped = process(20, 1, 20, "child");
+
+        let descendants = descendants_of(&root.instance(), &[escaped], &observed);
+        assert_eq!(descendants.len(), 1);
+        assert_eq!(descendants[0].pid, 20);
+        assert_eq!(descendants[0].process_group, 20);
+    }
 }

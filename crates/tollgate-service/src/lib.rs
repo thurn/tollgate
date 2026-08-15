@@ -600,11 +600,19 @@ fn failure_attribution(
     });
     let (evidence_environment, candidate_replays, baseline_buildsets) =
         if let Some((environment, matrix_buildsets)) = matrix {
-            let candidates = matrix_buildsets
+            let mut candidates = matrix_buildsets
                 .iter()
                 .copied()
                 .filter(|candidate| candidate.tested_oid == generation.tested_oid)
                 .collect::<Vec<_>>();
+            for candidate in comparable_buildsets(&generation.tested_oid, &environment) {
+                if !candidates
+                    .iter()
+                    .any(|existing| existing.id == candidate.id)
+                {
+                    candidates.push(candidate);
+                }
+            }
             let baselines = matrix_buildsets
                 .iter()
                 .copied()
@@ -6363,7 +6371,7 @@ impl TollgateService {
         {
             return Ok(response);
         }
-        let (source, kind, promotion_authorized) = {
+        let (source, kind, promotion_authorized, worktree_path, branch) = {
             let data = runtime.data.lock();
             let item = data
                 .items
@@ -6387,8 +6395,27 @@ impl TollgateService {
                 item.source_oid.to_hex(),
                 item.kind,
                 item.promotion_authorized,
+                item.metadata.worktree_path.clone(),
+                item.metadata.branch.clone(),
             )
         };
+        let source_oid = runtime.git.resolve_oid(&source).await?;
+        if let Some(path) = worktree_path.as_deref() {
+            let registration = runtime
+                .git
+                .registered_worktree(Path::new(path))
+                .await?
+                .ok_or_else(|| {
+                    ServiceError::Invariant(
+                        "retry source path is no longer an exact registered worktree".into(),
+                    )
+                })?;
+            if registration.head != source_oid || registration.branch != branch {
+                return Err(ServiceError::Invariant(
+                    "retry source worktree no longer matches its recorded branch and OID".into(),
+                ));
+            }
+        }
         let child_command_id = if let Some(evidence) =
             runtime.store.operation_evidence(command_id, "retry")?
         {
@@ -6414,22 +6441,24 @@ impl TollgateService {
                     "cold": cold,
                     "source": source,
                     "kind": kind,
+                    "worktree_path": worktree_path.clone(),
+                    "branch": branch.clone(),
                     "child_command_id": child_command_id,
                 }),
             )?;
             child_command_id
         };
-        let source_oid = runtime.git.resolve_oid(&source).await?;
         if cold {
             runtime.cold_sources.lock().insert(source_oid.clone());
         }
         let result = if kind == QueueItemKind::IndependentCheck {
-            self.check_from(repository_id, source, None, child_command_id)
+            self.check_from(repository_id, source, worktree_path, child_command_id)
                 .await
         } else if promotion_authorized {
-            self.approve(repository_id, source, child_command_id).await
+            self.approve_from(repository_id, source, worktree_path, child_command_id)
+                .await
         } else {
-            self.submit_candidate(repository_id, source, child_command_id)
+            self.submit_candidate_from(repository_id, source, worktree_path, child_command_id)
                 .await
         };
         if result.is_err() {
@@ -13054,27 +13083,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retry_uuid_covers_the_source_item_and_cold_policy() {
+    async fn retry_preserves_worktree_provenance_through_promotion_and_cleanup() {
         let temporary = tempfile::tempdir().unwrap();
         let repository = temporary.path().join("repository");
+        let feature = temporary.path().join("feature");
+        let pass_after_retry = temporary.path().join("pass-after-retry");
         std::fs::create_dir(&repository).unwrap();
         git(&repository, &["init", "-b", "master"]);
         std::fs::write(repository.join("base.txt"), "base\n").unwrap();
         git(&repository, &["add", "base.txt"]);
         git(&repository, &["commit", "-m", "base"]);
-        git(&repository, &["switch", "-c", "feature"]);
-        std::fs::write(repository.join("feature.txt"), "feature\n").unwrap();
-        git(&repository, &["add", "feature.txt"]);
-        git(&repository, &["commit", "-m", "feature"]);
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                feature.to_str().unwrap(),
+                "master",
+            ],
+        );
+        std::fs::write(feature.join("feature.txt"), "feature\n").unwrap();
+        git(&feature, &["add", "feature.txt"]);
+        git(&feature, &["commit", "-m", "feature"]);
+        let canonical_feature = std::fs::canonicalize(&feature).unwrap();
+        let command = format!(
+            "if test -f '{}'; then true; else touch '{}'; false; fi",
+            pass_after_retry.display(),
+            pass_after_retry.display()
+        );
         let service = TollgateService::open(temporary.path().join("support"))
             .await
             .unwrap();
         let initialized = service
-            .initialize_repository_with_options(&repository, Some("false".into()), false)
+            .initialize_repository_with_options(&repository, Some(command), false)
             .await
             .unwrap();
         let first = service
-            .approve(initialized.state.id, "feature".into(), CommandId::new())
+            .submit_candidate_from(
+                initialized.state.id,
+                "HEAD".into(),
+                Some(feature.to_string_lossy().into_owned()),
+                CommandId::new(),
+            )
             .await
             .unwrap();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -13106,6 +13158,135 @@ mod tests {
                 .await,
             Err(ServiceError::Store(StoreError::CommandReplayMismatch))
         ));
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let revision = loop {
+            let snapshot = service
+                .repository_snapshot(initialized.state.id)
+                .await
+                .unwrap();
+            let view = snapshot
+                .queue
+                .iter()
+                .find(|view| view.item.id == retried.item_id)
+                .unwrap();
+            assert_eq!(view.item.metadata.branch.as_deref(), Some("feature"));
+            assert_eq!(
+                view.item.metadata.worktree_path.as_deref(),
+                Some(canonical_feature.to_string_lossy().as_ref())
+            );
+            if view.item.state == QueueItemState::Ready {
+                break snapshot.state.queue_revision;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        };
+        service
+            .authorize_candidate(
+                initialized.state.id,
+                retried.item_id,
+                revision,
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        loop {
+            let snapshot = service
+                .repository_snapshot(initialized.state.id)
+                .await
+                .unwrap();
+            if let Some(view) = snapshot
+                .history_items
+                .iter()
+                .find(|view| view.item.id == retried.item_id)
+            {
+                assert_eq!(view.item.state, QueueItemState::Promoted);
+                assert_eq!(view.item.cleanup_state, CleanupState::Completed);
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(!feature.exists());
+        assert!(
+            !StdCommand::new("git")
+                .current_dir(&repository)
+                .args(["show-ref", "--verify", "--quiet", "refs/heads/feature"])
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_rejects_a_worktree_that_moved_from_its_recorded_source() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        let feature = temporary.path().join("feature");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", "master"]);
+        std::fs::write(repository.join("base.txt"), "base\n").unwrap();
+        git(&repository, &["add", "base.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                feature.to_str().unwrap(),
+                "master",
+            ],
+        );
+        std::fs::write(feature.join("feature.txt"), "feature\n").unwrap();
+        git(&feature, &["add", "feature.txt"]);
+        git(&feature, &["commit", "-m", "feature"]);
+
+        let service = TollgateService::open(temporary.path().join("support"))
+            .await
+            .unwrap();
+        let initialized = service
+            .initialize_repository_with_options(&repository, Some("false".into()), false)
+            .await
+            .unwrap();
+        let candidate = service
+            .submit_candidate_from(
+                initialized.state.id,
+                "HEAD".into(),
+                Some(feature.to_string_lossy().into_owned()),
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let item = service
+                .item_status(initialized.state.id, candidate.item_id)
+                .await
+                .unwrap();
+            if item.state == QueueItemState::Failed {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        git(&feature, &["switch", "--detach", "master"]);
+
+        let error = service
+            .retry(
+                initialized.state.id,
+                candidate.item_id,
+                false,
+                CommandId::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("no longer matches its recorded branch and OID")
+        );
     }
 
     #[tokio::test]
@@ -14274,6 +14455,30 @@ policy = "clone"
             loop {
                 let item = service
                     .item_status(initialized.state.id, item_id)
+                    .await
+                    .unwrap();
+                if item.state.is_terminal() {
+                    break;
+                }
+                assert!(tokio::time::Instant::now() < deadline);
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        }
+        let matrix = service
+            .diagnose_failure(
+                initialized.state.id,
+                failed.item_id,
+                true,
+                false,
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(matrix.replay_item_ids.len(), 3);
+        for replay_id in &matrix.replay_item_ids {
+            loop {
+                let item = service
+                    .item_status(initialized.state.id, *replay_id)
                     .await
                     .unwrap();
                 if item.state.is_terminal() {
