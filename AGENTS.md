@@ -23,6 +23,12 @@ run `tg --no-launch doctor` to confirm the restarted service is healthy. If the
 build, installation, restart, or health check fails, keep working on the failure
 or report the concrete blocker instead of declaring success.
 
+Parallel promotions can advance `release` during a self-install. Build from a
+detached worktree at the latest certified release OID, serialize the
+install/restart step, and recheck `release` immediately before replacement. If
+it advanced to a certified descendant, discard the stale build and rebuild from
+the new tip rather than installing an older version.
+
 Do not create new branches unless explicitly requested.
 
 Do not print a summary of changes.
