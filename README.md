@@ -52,6 +52,18 @@ tg status <candidate-id>
 
 `--wait` returns when validation has produced promotion-grade evidence (or a conclusive failure), while `release` remains unchanged. A user later grants authority to the exact retained candidate with `tg approve <candidate-id>`; that authority atomically covers its active hard dependencies because they are part of the retained source history. Granting authority to a retained candidate moves it ahead of unrelated candidates still awaiting authority. Tollgate preserves an exact completed certificate when the priority change leaves its speculative prefix unchanged, and otherwise rebuilds the affected suffix automatically. `tg cancel <candidate-id>` cancels it. For the original one-phase user workflow, `tg approve HEAD` still submits and authorizes in one command.
 
+If synthesis conflicts with an earlier candidate, the `generation.tested_oid` shown by `tg --json status` is a supported recovery base. Tollgate retains every displayed speculative generation under `refs/tollgate/speculative/`, so the OID is available in every worktree of the registered repository. For a single task commit, use this flow:
+
+```sh
+tg --no-launch --json status
+git rebase --onto <current-prefix-oid> HEAD^
+# resolve the reported paths, regenerate derived files, and continue the rebase
+tg --no-launch --json status
+tg --no-launch --json candidate HEAD
+```
+
+An extension after the selected prefix is safe: Tollgate recognizes the still-active prefix, records hard dependencies on the queue items represented by it, and synthesizes the task after the current queue tip. If that prefix was canceled, superseded, or otherwise replaced before submission, JSON mode returns `stale-queue-prefix` with `release_oid`, `queue_revision`, `current_prefix_oid`, and a retry procedure. Refresh status and repeat against the new prefix; expected queue churn is never an internal-invariant error.
+
 To submit every clean, linear commit on local `master` after the certified
 `release` tip and automatically push the resulting certified chain, run:
 
@@ -103,7 +115,7 @@ candidate.
 ## Safety model
 
 - CI runs in detached worktrees belonging to a disposable execution mirror.
-- Candidate submission retains the immutable source under `refs/tollgate/sources/`; promotion authority is recorded separately.
+- Candidate submission retains the immutable source under `refs/tollgate/sources/` and each speculative tested generation under `refs/tollgate/speculative/`; promotion authority is recorded separately.
 - Promotion retains and re-verifies the tested object, then uses an expected-old-OID `git update-ref` compare-and-swap.
 - SQLite runs WAL + foreign keys + `synchronous=FULL` and uses durable external-operation intents.
 - Output is appended to disk before live delivery; a hidden or slow UI cannot block only the UI path.

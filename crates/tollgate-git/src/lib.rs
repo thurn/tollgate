@@ -36,7 +36,7 @@ pub enum GitError {
     #[error("Git could not rebase the requested commit")]
     Unmergeable,
     #[error(
-        "cannot synthesize source {source_oid}: merge conflicts in {conflicting_paths:?} (source base {source_parent_oid}; current queue prefix {prefix_oid}); rebase onto the latest release (or the displayed queue prefix when an earlier candidate is involved), resolve the listed paths, regenerate derived files, and resubmit"
+        "cannot synthesize source {source_oid}: merge conflicts in {conflicting_paths:?} (source base {source_parent_oid}; current queue prefix {prefix_oid}); rebase the single task commit onto the latest release, or onto the displayed current queue prefix when an earlier candidate is involved, resolve the listed paths, regenerate derived files, refresh `tg --no-launch --json status`, and resubmit. Tollgate accepts a still-current speculative prefix as the source parent; if it changed, submission returns structured stale-queue context"
     )]
     SyntheticConflict {
         source_oid: GitOid,
@@ -1035,6 +1035,17 @@ impl GitRepository {
             oid,
         )
         .await
+    }
+
+    pub async fn retain_speculative_object(
+        &self,
+        mirror: &Path,
+        generation_ref: &str,
+        oid: &GitOid,
+    ) -> Result<String, GitError> {
+        let destination = format!("refs/tollgate/speculative/{generation_ref}");
+        self.retain_mirror_object(mirror, &destination, oid).await?;
+        Ok(destination)
     }
 
     async fn retain_mirror_object(
@@ -2637,7 +2648,7 @@ mod tests {
         assert!(message.contains("messages.json"));
         assert!(message.contains(&source_base));
         assert!(message.contains(&prefix.to_hex()));
-        assert!(message.contains("rebase onto the latest release"));
+        assert!(message.contains("rebase the single task commit onto the latest release"));
     }
 
     #[tokio::test]

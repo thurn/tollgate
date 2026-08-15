@@ -61,6 +61,24 @@ pub enum ServiceError {
     ItemNotFound(QueueItemId),
     #[error("queue revision conflict: expected {expected}, actual {actual}")]
     RevisionConflict { expected: u64, actual: u64 },
+    #[error(
+        "candidate source parent {source_parent_oid} belongs to a stale speculative queue prefix; current release {release_oid}, queue revision {queue_revision}, current prefix {current_prefix_oid}. Refresh `tg --no-launch --json status`, rebase the single task commit onto the displayed current prefix (or release when the queue is empty), resolve and regenerate, then resubmit"
+    )]
+    StaleQueuePrefix {
+        source_parent_oid: GitOid,
+        release_oid: GitOid,
+        queue_revision: u64,
+        current_prefix_oid: GitOid,
+    },
+    #[error(
+        "candidate source has unknown unmerged ancestor {ancestor}; current release {release_oid}, queue revision {queue_revision}, current prefix {current_prefix_oid}. Rebase the single task commit onto the displayed current prefix (or release when the queue is empty), then resubmit"
+    )]
+    UnknownSourceAncestor {
+        ancestor: GitOid,
+        release_oid: GitOid,
+        queue_revision: u64,
+        current_prefix_oid: GitOid,
+    },
     #[error("internal service invariant failed: {0}")]
     Invariant(String),
     #[error("I/O error: {0}")]
@@ -791,6 +809,93 @@ fn reuse_active_enqueue_sequences(current: &[QueueItem], ordered: &mut [QueueIte
     for (item, sequence) in ordered.iter_mut().zip(sequences) {
         item.enqueue_sequence = sequence;
     }
+}
+
+fn current_queue_prefix_oid(data: &RuntimeData) -> GitOid {
+    current_queue_prefix_from(&data.state, &data.items, &data.generations)
+}
+
+fn current_queue_prefix_from(
+    state: &RepositoryState,
+    items: &[QueueItem],
+    generations: &[ValidationGeneration],
+) -> GitOid {
+    let active_ids = items
+        .iter()
+        .filter(|item| item.kind == QueueItemKind::Gate && is_rebuildable_gate_state(item.state))
+        .map(|item| item.id)
+        .collect::<HashSet<_>>();
+    items
+        .iter()
+        .filter(|item| item.kind == QueueItemKind::Gate && is_rebuildable_gate_state(item.state))
+        .filter_map(|item| {
+            let generation_id = item.current_generation_id?;
+            let generation = generations
+                .iter()
+                .find(|generation| generation.id == generation_id)?;
+            generation
+                .ordered_item_ids
+                .iter()
+                .all(|item_id| active_ids.contains(item_id))
+                .then_some((item, generation))
+        })
+        .max_by_key(|(item, _)| item.enqueue_sequence)
+        .map(|(_, generation)| generation.tested_oid.clone())
+        .unwrap_or_else(|| state.master_oid.clone())
+}
+
+fn active_prefix_dependencies(data: &RuntimeData, oid: &GitOid) -> Option<Vec<QueueItemId>> {
+    let active_ids = data
+        .items
+        .iter()
+        .filter(|item| item.kind == QueueItemKind::Gate && is_rebuildable_gate_state(item.state))
+        .map(|item| item.id)
+        .collect::<HashSet<_>>();
+    data.items
+        .iter()
+        .filter(|item| item.kind == QueueItemKind::Gate && is_rebuildable_gate_state(item.state))
+        .filter_map(|item| item.current_generation_id)
+        .filter_map(|generation_id| {
+            data.generations
+                .iter()
+                .find(|generation| generation.id == generation_id)
+        })
+        .find_map(|generation| {
+            generation
+                .prefix_oids
+                .iter()
+                .position(|prefix_oid| prefix_oid == oid)
+                .and_then(|position| {
+                    let dependencies = &generation.ordered_item_ids[..=position];
+                    dependencies
+                        .iter()
+                        .all(|item_id| active_ids.contains(item_id))
+                        .then(|| dependencies.to_vec())
+                })
+        })
+}
+
+fn is_historical_prefix(data: &RuntimeData, oid: &GitOid) -> bool {
+    data.generations
+        .iter()
+        .any(|generation| generation.prefix_oids.contains(oid))
+}
+
+async fn retain_speculative_generations(
+    runtime: &RepositoryRuntime,
+    generations: &[ValidationGeneration],
+) -> Result<(), ServiceError> {
+    for generation in generations {
+        runtime
+            .git
+            .retain_speculative_object(
+                &runtime.mirror,
+                &generation.id.to_string(),
+                &generation.tested_oid,
+            )
+            .await?;
+    }
+    Ok(())
 }
 
 impl TollgateService {
@@ -3185,9 +3290,18 @@ impl TollgateService {
             } else {
                 "approve"
             };
+            runtime
+                .git
+                .retain_speculative_object(
+                    &runtime.mirror,
+                    &generation.id.to_string(),
+                    &generation.tested_oid,
+                )
+                .await?;
             let event = runtime.store.complete_approval(
                 &item,
                 &generation,
+                state.queue_revision,
                 Actor::Recovery,
                 command_id,
                 command_kind,
@@ -4461,7 +4575,14 @@ impl TollgateService {
             }
         }
         let item_id = QueueItemId::new();
-        let (state, active_items, existing_ids, existing_oids, enqueue_sequence) = {
+        let (
+            state,
+            active_items,
+            existing_ids,
+            existing_oids,
+            enqueue_sequence,
+            current_prefix_oid,
+        ) = {
             let data = runtime.data.lock();
             if let Some(existing) = data.items.iter().find(|item| {
                 item.kind == QueueItemKind::Gate
@@ -4495,19 +4616,27 @@ impl TollgateService {
                     .max()
                     .unwrap_or(0)
                     + 1,
+                current_queue_prefix_oid(&data),
             )
         };
         let unmerged_ancestors = runtime
             .git
             .unmerged_first_parent_ancestors(&probe.parent_oid, &state.master_oid)
             .await?;
-        let mut dependencies = Vec::new();
+        let mut dependency_ids = HashSet::new();
         for ancestor in &unmerged_ancestors {
             if let Some(item) = active_items
                 .iter()
                 .find(|item| item.source_oid == *ancestor)
             {
-                dependencies.push(item.id);
+                dependency_ids.insert(item.id);
+                continue;
+            }
+            if let Some(prefix_dependencies) = {
+                let data = runtime.data.lock();
+                active_prefix_dependencies(&data, ancestor)
+            } {
+                dependency_ids.extend(prefix_dependencies);
                 continue;
             }
             if let Some(bytes) = runtime.store.promoted_oid_bytes(ancestor)? {
@@ -4521,10 +4650,30 @@ impl TollgateService {
                     continue;
                 }
             }
-            return Err(ServiceError::Invariant(format!(
-                "unknown unmerged source ancestor {ancestor}"
-            )));
+            let historical_prefix = {
+                let data = runtime.data.lock();
+                is_historical_prefix(&data, ancestor)
+            };
+            if historical_prefix {
+                return Err(ServiceError::StaleQueuePrefix {
+                    source_parent_oid: probe.parent_oid.clone(),
+                    release_oid: state.master_oid.clone(),
+                    queue_revision: state.queue_revision,
+                    current_prefix_oid,
+                });
+            }
+            return Err(ServiceError::UnknownSourceAncestor {
+                ancestor: ancestor.clone(),
+                release_oid: state.master_oid.clone(),
+                queue_revision: state.queue_revision,
+                current_prefix_oid,
+            });
         }
+        let dependencies = active_items
+            .iter()
+            .filter(|item| dependency_ids.contains(&item.id))
+            .map(|item| item.id)
+            .collect::<Vec<_>>();
         let mut ordered_ids = existing_ids;
         let mut sources = existing_oids;
         ordered_ids.push(item_id);
@@ -4639,9 +4788,18 @@ impl TollgateService {
             source_oid: item.source_oid.clone(),
             tested_oid: generation.tested_oid.clone(),
         };
-        let event = runtime.store.complete_approval(
+        let speculative_ref = runtime
+            .git
+            .retain_speculative_object(
+                &runtime.mirror,
+                &generation.id.to_string(),
+                &generation.tested_oid,
+            )
+            .await?;
+        let event = match runtime.store.complete_approval(
             &item,
             &generation,
+            state.queue_revision,
             if promotion_authorized {
                 Actor::Ui
             } else {
@@ -4651,7 +4809,38 @@ impl TollgateService {
             command_kind,
             &request_digest,
             &result,
-        )?;
+        ) {
+            Ok(event) => event,
+            Err(StoreError::RevisionConflict { .. }) => {
+                runtime
+                    .git
+                    .delete_source_ref(&speculative_ref, &generation.tested_oid)
+                    .await?;
+                runtime
+                    .git
+                    .delete_source_ref(&item.source_ref, &item.source_oid)
+                    .await?;
+                runtime.store.set_intent_state(
+                    command_id,
+                    IntentState::Canceled,
+                    &serde_json::json!({"recovery": "stale-queue-during-enqueue"}),
+                )?;
+                let current_state = runtime.store.repository_state()?;
+                let current_items = runtime.store.queue_items()?;
+                let current_generations = runtime.store.generations()?;
+                return Err(ServiceError::StaleQueuePrefix {
+                    source_parent_oid: probe.parent_oid,
+                    release_oid: current_state.master_oid.clone(),
+                    queue_revision: current_state.queue_revision,
+                    current_prefix_oid: current_queue_prefix_from(
+                        &current_state,
+                        &current_items,
+                        &current_generations,
+                    ),
+                });
+            }
+            Err(error) => return Err(error.into()),
+        };
         {
             let mut data = runtime.data.lock();
             data.state.queue_revision += 1;
@@ -5031,6 +5220,7 @@ impl TollgateService {
             evidence_reused,
             authorized_at,
         };
+        retain_speculative_generations(&runtime, &generations).await?;
         let event = runtime.store.authorize_candidate(
             &state,
             &ordered,
@@ -6663,6 +6853,7 @@ impl TollgateService {
                 .map(|item| item.id)
                 .collect(),
         };
+        retain_speculative_generations(&runtime, &generations).await?;
         let event = runtime.store.replace_queue_structure(
             &state,
             &ordered,
@@ -6962,6 +7153,7 @@ impl TollgateService {
                     .state
                     .transition(ItemEvent::GenerationPrepared)
                     .map_err(|error| ServiceError::Invariant(error.to_string()))?;
+                retain_speculative_generations(&runtime, std::slice::from_ref(&generation)).await?;
                 runtime.store.replace_generation(&generation)?;
                 runtime.data.lock().push_generation(generation);
                 self.replace_item(&runtime, item.clone())?;
@@ -9252,6 +9444,7 @@ impl TollgateService {
                 .state
                 .transition(ItemEvent::GenerationPrepared)
                 .map_err(|error| ServiceError::Invariant(error.to_string()))?;
+            retain_speculative_generations(runtime, std::slice::from_ref(&generation)).await?;
             runtime.store.replace_generation(&generation)?;
             runtime.data.lock().push_generation(generation);
             self.replace_item(runtime, item)?;
@@ -9386,6 +9579,7 @@ impl TollgateService {
                 config.step_graph_digest.clone(),
                 state.engine_epoch,
             );
+            retain_speculative_generations(&runtime, std::slice::from_ref(&generation)).await?;
             runtime.store.replace_generation(&generation)?;
             let mut item = survivors[position].clone();
             item.state = item
@@ -12476,8 +12670,8 @@ mod tests {
     use std::process::Command as StdCommand;
     use tollgate_git::USER_BRANCH;
 
-    fn git(directory: &Path, args: &[&str]) -> String {
-        let output = StdCommand::new("git")
+    fn git_output(directory: &Path, args: &[&str]) -> std::process::Output {
+        StdCommand::new("git")
             .current_dir(directory)
             .args(args)
             .env("GIT_AUTHOR_NAME", "Tollgate Test")
@@ -12485,7 +12679,11 @@ mod tests {
             .env("GIT_COMMITTER_NAME", "Tollgate Test")
             .env("GIT_COMMITTER_EMAIL", "test@example.com")
             .output()
-            .unwrap();
+            .unwrap()
+    }
+
+    fn git(directory: &Path, args: &[&str]) -> String {
+        let output = git_output(directory, args);
         assert!(
             output.status.success(),
             "git {:?}: {}",
@@ -15318,13 +15516,425 @@ policy = "clone"
         assert!(message.contains("messages.json"));
         assert!(message.contains(&source_base));
         assert!(message.contains(&release));
-        assert!(message.contains("rebase onto the latest release"));
+        assert!(message.contains("rebase the single task commit onto the latest release"));
         let snapshot = service
             .repository_snapshot(initialized.state.id)
             .await
             .unwrap();
         assert!(snapshot.queue.is_empty());
         assert_eq!(snapshot.state.queue_revision, 0);
+    }
+
+    #[tokio::test]
+    async fn conflicted_candidate_rebased_onto_active_prefix_submits_after_queue_extension() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        let queued_worktree = temporary.path().join("queued");
+        let task_worktree = temporary.path().join("task");
+        let extension_worktree = temporary.path().join("extension");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("messages.json"), "base\n").unwrap();
+        git(&repository, &["add", "messages.json"]);
+        git(&repository, &["commit", "-m", "base"]);
+        let base = git(&repository, &["rev-parse", "HEAD"]);
+        for (branch, path) in [("queued", &queued_worktree), ("task", &task_worktree)] {
+            git(
+                &repository,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    branch,
+                    path.to_str().unwrap(),
+                    &base,
+                ],
+            );
+        }
+        std::fs::write(queued_worktree.join("messages.json"), "queued\n").unwrap();
+        git(
+            &queued_worktree,
+            &["commit", "-am", "update generated messages"],
+        );
+        std::fs::remove_file(task_worktree.join("messages.json")).unwrap();
+        git(&task_worktree, &["add", "messages.json"]);
+        git(
+            &task_worktree,
+            &["commit", "-m", "remove generated messages"],
+        );
+        std::fs::write(repository.join("release.txt"), "release\n").unwrap();
+        git(&repository, &["add", "release.txt"]);
+        git(&repository, &["commit", "-m", "advance release"]);
+        git(&repository, &["switch", "--detach", USER_BRANCH]);
+
+        let service = TollgateService::open(temporary.path().join("support"))
+            .await
+            .unwrap();
+        let initialized = service
+            .initialize_repository(&repository, Some("sleep 30".into()))
+            .await
+            .unwrap();
+        let queued = service
+            .submit_candidate_from(
+                initialized.state.id,
+                "HEAD".into(),
+                Some(queued_worktree.to_string_lossy().into_owned()),
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            queued.source_oid, queued.tested_oid,
+            "fixture must exercise a synthetic prefix rather than an active source OID"
+        );
+        let queued_view = service
+            .item_details(initialized.state.id, queued.item_id)
+            .await
+            .unwrap();
+        let generation = queued_view.generation.unwrap();
+        assert_eq!(
+            git(
+                &repository,
+                &[
+                    "rev-parse",
+                    &format!("refs/tollgate/speculative/{}", generation.id)
+                ],
+            ),
+            queued.tested_oid.to_hex()
+        );
+
+        let conflict = service
+            .submit_candidate_from(
+                initialized.state.id,
+                "HEAD".into(),
+                Some(task_worktree.to_string_lossy().into_owned()),
+                CommandId::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            conflict,
+            ServiceError::Git(GitError::SyntheticConflict { .. })
+        ));
+
+        let rebase = git_output(
+            &task_worktree,
+            &["rebase", "--onto", &queued.tested_oid.to_hex(), &base],
+        );
+        assert!(
+            !rebase.status.success(),
+            "rebase should require delete resolution"
+        );
+        git(&task_worktree, &["rm", "messages.json"]);
+        git(
+            &task_worktree,
+            &["-c", "core.editor=true", "rebase", "--continue"],
+        );
+        assert_eq!(
+            git(&task_worktree, &["show", "-s", "--format=%P", "HEAD"]),
+            queued.tested_oid.to_hex()
+        );
+
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "extension",
+                extension_worktree.to_str().unwrap(),
+                INTEGRATION_REF,
+            ],
+        );
+        std::fs::write(extension_worktree.join("extension.txt"), "extension\n").unwrap();
+        git(&extension_worktree, &["add", "extension.txt"]);
+        git(
+            &extension_worktree,
+            &["commit", "-m", "extend speculative queue"],
+        );
+        let extension = service
+            .submit_candidate_from(
+                initialized.state.id,
+                "HEAD".into(),
+                Some(extension_worktree.to_string_lossy().into_owned()),
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        let recovered = service
+            .submit_candidate_from(
+                initialized.state.id,
+                "HEAD".into(),
+                Some(task_worktree.to_string_lossy().into_owned()),
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        let recovered_view = service
+            .item_details(initialized.state.id, recovered.item_id)
+            .await
+            .unwrap();
+        assert_eq!(recovered_view.item.dependencies, vec![queued.item_id]);
+        assert_eq!(
+            recovered_view.generation.unwrap().expected_parent_oid,
+            extension.tested_oid
+        );
+    }
+
+    #[tokio::test]
+    async fn candidate_prefix_promoted_immediately_before_submission_is_authoritative() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        let queued_worktree = temporary.path().join("queued");
+        let task_worktree = temporary.path().join("task");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("base.txt"), "base\n").unwrap();
+        git(&repository, &["add", "base.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "queued",
+                queued_worktree.to_str().unwrap(),
+                USER_BRANCH,
+            ],
+        );
+        std::fs::write(queued_worktree.join("queued.txt"), "queued\n").unwrap();
+        git(&queued_worktree, &["add", "queued.txt"]);
+        git(&queued_worktree, &["commit", "-m", "queued"]);
+        std::fs::write(repository.join("release.txt"), "release\n").unwrap();
+        git(&repository, &["add", "release.txt"]);
+        git(&repository, &["commit", "-m", "advance release"]);
+        git(&repository, &["switch", "--detach", USER_BRANCH]);
+
+        let service = TollgateService::open(temporary.path().join("support"))
+            .await
+            .unwrap();
+        let initialized = service
+            .initialize_repository(&repository, Some("true".into()))
+            .await
+            .unwrap();
+        let queued = service
+            .submit_candidate_from(
+                initialized.state.id,
+                "HEAD".into(),
+                Some(queued_worktree.to_string_lossy().into_owned()),
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "task",
+                task_worktree.to_str().unwrap(),
+                &queued.tested_oid.to_hex(),
+            ],
+        );
+        std::fs::write(task_worktree.join("task.txt"), "task\n").unwrap();
+        git(&task_worktree, &["add", "task.txt"]);
+        git(&task_worktree, &["commit", "-m", "task"]);
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let revision = loop {
+            let snapshot = service
+                .repository_snapshot(initialized.state.id)
+                .await
+                .unwrap();
+            let view = snapshot
+                .queue
+                .iter()
+                .find(|view| view.item.id == queued.item_id)
+                .unwrap();
+            if view.item.state == QueueItemState::Ready {
+                break snapshot.state.queue_revision;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        service
+            .authorize_candidate(
+                initialized.state.id,
+                queued.item_id,
+                revision,
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        loop {
+            let snapshot = service
+                .repository_snapshot(initialized.state.id)
+                .await
+                .unwrap();
+            if snapshot.history_items.iter().any(|view| {
+                view.item.id == queued.item_id && view.item.state == QueueItemState::Promoted
+            }) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let submitted = service
+            .submit_candidate_from(
+                initialized.state.id,
+                "HEAD".into(),
+                Some(task_worktree.to_string_lossy().into_owned()),
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        let view = service
+            .item_details(initialized.state.id, submitted.item_id)
+            .await
+            .unwrap();
+        assert!(view.item.dependencies.is_empty());
+        assert_eq!(view.item.source_oid, submitted.tested_oid);
+    }
+
+    #[tokio::test]
+    async fn canceled_speculative_parent_returns_structured_stale_queue_context() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        let queued_worktree = temporary.path().join("queued");
+        let extension_worktree = temporary.path().join("extension");
+        let task_worktree = temporary.path().join("task");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("base.txt"), "base\n").unwrap();
+        git(&repository, &["add", "base.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "queued",
+                queued_worktree.to_str().unwrap(),
+                USER_BRANCH,
+            ],
+        );
+        std::fs::write(queued_worktree.join("queued.txt"), "queued\n").unwrap();
+        git(&queued_worktree, &["add", "queued.txt"]);
+        git(&queued_worktree, &["commit", "-m", "queued"]);
+        std::fs::write(repository.join("release.txt"), "release\n").unwrap();
+        git(&repository, &["add", "release.txt"]);
+        git(&repository, &["commit", "-m", "advance release"]);
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "extension",
+                extension_worktree.to_str().unwrap(),
+                USER_BRANCH,
+            ],
+        );
+        std::fs::write(extension_worktree.join("extension.txt"), "extension\n").unwrap();
+        git(&extension_worktree, &["add", "extension.txt"]);
+        git(&extension_worktree, &["commit", "-m", "extension"]);
+        git(&repository, &["switch", "--detach", USER_BRANCH]);
+
+        let service = TollgateService::open(temporary.path().join("support"))
+            .await
+            .unwrap();
+        let initialized = service
+            .initialize_repository(&repository, Some("true".into()))
+            .await
+            .unwrap();
+        service.shutting_down.store(true, Ordering::Release);
+        let queued = service
+            .submit_candidate_from(
+                initialized.state.id,
+                "HEAD".into(),
+                Some(queued_worktree.to_string_lossy().into_owned()),
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        let extension = service
+            .submit_candidate_from(
+                initialized.state.id,
+                "HEAD".into(),
+                Some(extension_worktree.to_string_lossy().into_owned()),
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            service
+                .item_details(initialized.state.id, extension.item_id)
+                .await
+                .unwrap()
+                .generation
+                .unwrap()
+                .ordered_item_ids,
+            vec![queued.item_id, extension.item_id]
+        );
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "task",
+                task_worktree.to_str().unwrap(),
+                &queued.tested_oid.to_hex(),
+            ],
+        );
+        std::fs::write(task_worktree.join("task.txt"), "task\n").unwrap();
+        git(&task_worktree, &["add", "task.txt"]);
+        git(&task_worktree, &["commit", "-m", "task"]);
+        let runtime = service.runtime(initialized.state.id).await.unwrap();
+        let mut canceled = runtime
+            .data
+            .lock()
+            .items
+            .iter()
+            .find(|item| item.id == queued.item_id)
+            .cloned()
+            .unwrap();
+        canceled.state = canceled.state.transition(ItemEvent::Canceled).unwrap();
+        canceled.terminal_reason = Some("canceled-by-user".into());
+        service.replace_item(&runtime, canceled).unwrap();
+        drop(runtime);
+        let after_cancel = service
+            .repository_snapshot(initialized.state.id)
+            .await
+            .unwrap();
+        assert_eq!(after_cancel.queue.len(), 1);
+        assert_eq!(after_cancel.queue[0].item.id, extension.item_id);
+        let error = service
+            .submit_candidate_from(
+                initialized.state.id,
+                "HEAD".into(),
+                Some(task_worktree.to_string_lossy().into_owned()),
+                CommandId::new(),
+            )
+            .await
+            .unwrap_err();
+        match error {
+            ServiceError::StaleQueuePrefix {
+                source_parent_oid,
+                release_oid,
+                queue_revision,
+                current_prefix_oid,
+            } => {
+                assert_eq!(source_parent_oid, queued.tested_oid);
+                assert_eq!(release_oid, after_cancel.state.master_oid);
+                assert_eq!(queue_revision, after_cancel.state.queue_revision);
+                assert_eq!(current_prefix_oid, after_cancel.state.master_oid);
+            }
+            error => panic!("expected stale queue prefix, got {error}"),
+        }
     }
 
     #[tokio::test]

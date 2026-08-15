@@ -10,7 +10,7 @@ use tollgate_domain::{BuildsetId, CommandId, QueueItemId, RepositoryId};
 use tollgate_git::{GitRepository, USER_BRANCH, USER_BRANCH_REF};
 use tollgate_ipc::{
     Frame, FrameCodec, FrameKind, Handshake, HandshakeAck, IpcCommand, IpcResponse,
-    MAX_CONTROL_PAYLOAD, MAX_LOG_PAYLOAD, PROTOCOL_VERSION, verify_peer_uid,
+    MAX_CONTROL_PAYLOAD, MAX_LOG_PAYLOAD, PROTOCOL_VERSION, StructuredError, verify_peer_uid,
 };
 use tollgate_service::{AppSnapshot, DiagnoseResult, QueueItemView, RepositorySnapshot};
 use uuid::Uuid;
@@ -203,14 +203,44 @@ enum ArtifactCommand {
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
+    let json = cli.json;
     match run(cli).await {
         Ok(code) => ExitCode::from(code),
         Err(error) => {
-            eprintln!("tg: {error:#}");
+            if json {
+                if let Some(error) = error.downcast_ref::<IpcRequestError>() {
+                    eprintln!("{}", serde_json::json!({"ok": false, "error": error.0}));
+                } else {
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({
+                            "ok": false,
+                            "error": {
+                                "code": "cli-error",
+                                "message": format!("{error:#}"),
+                                "retryable": false
+                            }
+                        })
+                    );
+                }
+            } else {
+                eprintln!("tg: {error:#}");
+            }
             ExitCode::from(classify_exit(&error))
         }
     }
 }
+
+#[derive(Debug)]
+struct IpcRequestError(StructuredError);
+
+impl std::fmt::Display for IpcRequestError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0.message)
+    }
+}
+
+impl std::error::Error for IpcRequestError {}
 
 async fn run(cli: Cli) -> anyhow::Result<u8> {
     let mut client = IpcClient::connect(cli.no_launch).await?;
@@ -1211,12 +1241,16 @@ impl IpcClient {
                 return if response.ok {
                     Ok(response.result.unwrap_or(serde_json::Value::Null))
                 } else {
-                    Err(anyhow!(
-                        response
-                            .error
-                            .map(|error| error.message)
-                            .unwrap_or_else(|| "unknown service error".into())
-                    ))
+                    Err(anyhow!(IpcRequestError(response.error.unwrap_or_else(
+                        || {
+                            StructuredError {
+                                code: "unknown-service-error".into(),
+                                message: "unknown service error".into(),
+                                retryable: false,
+                                details: None,
+                            }
+                        }
+                    ))))
                 };
             }
         }
@@ -1952,6 +1986,14 @@ fn oid_value(value: &serde_json::Value) -> String {
     short_oid(value["bytes"].as_str().unwrap_or("?"))
 }
 fn classify_exit(error: &anyhow::Error) -> u8 {
+    if let Some(error) = error.downcast_ref::<IpcRequestError>()
+        && matches!(
+            error.0.code.as_str(),
+            "stale-queue-prefix" | "unknown-source-ancestor" | "revision-conflict"
+        )
+    {
+        return 4;
+    }
     let message = error.to_string();
     if message.contains("configuration")
         || message.contains("argument")

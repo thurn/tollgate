@@ -22,11 +22,13 @@ use tollgate_ipc::{
 };
 use tollgate_service::{
     AppSnapshot, ApproveResult, CandidateAuthorizationResult, DoctorReport, EnvironmentView,
-    QueueReorderResult, RemoteSyncResult, RepositorySnapshot, TollgateService,
+    QueueReorderResult, RemoteSyncResult, RepositorySnapshot, ServiceError, TollgateService,
     WorktreeOperationResult,
 };
 
 type Service = Arc<TollgateService>;
+
+const STRUCTURED_SERVICE_ERROR_PREFIX: &str = "tollgate-structured-error:";
 
 struct QuitCoordinator {
     confirmed: AtomicBool,
@@ -1060,7 +1062,7 @@ async fn execute_ipc_command(service: &Service, command: IpcCommand) -> IpcRespo
                         command_id,
                     )
                     .await
-                    .map_err(|error| error.to_string())?,
+                    .map_err(encode_candidate_submission_error)?,
             )
             .map_err(|error| error.to_string()),
             IpcCommand::Candidate {
@@ -1072,7 +1074,7 @@ async fn execute_ipc_command(service: &Service, command: IpcCommand) -> IpcRespo
                 service
                     .submit_candidate_from(repository_id, revision, worktree_path, command_id)
                     .await
-                    .map_err(|error| error.to_string())?,
+                    .map_err(encode_candidate_submission_error)?,
             )
             .map_err(|error| error.to_string()),
             IpcCommand::AuthorizeCandidate {
@@ -1374,16 +1376,68 @@ async fn execute_ipc_command(service: &Service, command: IpcCommand) -> IpcRespo
             result: Some(value),
             error: None,
         },
-        Err(message) => IpcResponse {
-            ok: false,
-            result: None,
-            error: Some(StructuredError {
-                code: classify_service_error(&message).into(),
-                message,
-                retryable: false,
-            }),
-        },
+        Err(message) => {
+            let error = message
+                .strip_prefix(STRUCTURED_SERVICE_ERROR_PREFIX)
+                .and_then(|encoded| serde_json::from_str(encoded).ok())
+                .unwrap_or_else(|| StructuredError {
+                    code: classify_service_error(&message).into(),
+                    message,
+                    retryable: false,
+                    details: None,
+                });
+            IpcResponse {
+                ok: false,
+                result: None,
+                error: Some(error),
+            }
+        }
     }
+}
+
+fn encode_candidate_submission_error(error: ServiceError) -> String {
+    let message = error.to_string();
+    let structured = match error {
+        ServiceError::StaleQueuePrefix {
+            source_parent_oid,
+            release_oid,
+            queue_revision,
+            current_prefix_oid,
+        } => Some(StructuredError {
+            code: "stale-queue-prefix".into(),
+            message: message.clone(),
+            retryable: true,
+            details: Some(serde_json::json!({
+                "source_parent_oid": source_parent_oid,
+                "release_oid": release_oid,
+                "queue_revision": queue_revision,
+                "current_prefix_oid": current_prefix_oid,
+                "retry": "Refresh status, rebase the single task commit onto current_prefix_oid (or release_oid when equal), resolve and regenerate, then resubmit."
+            })),
+        }),
+        ServiceError::UnknownSourceAncestor {
+            ancestor,
+            release_oid,
+            queue_revision,
+            current_prefix_oid,
+        } => Some(StructuredError {
+            code: "unknown-source-ancestor".into(),
+            message: message.clone(),
+            retryable: true,
+            details: Some(serde_json::json!({
+                "ancestor_oid": ancestor,
+                "release_oid": release_oid,
+                "queue_revision": queue_revision,
+                "current_prefix_oid": current_prefix_oid,
+                "retry": "Rebase the single task commit onto current_prefix_oid (or release_oid when equal), then resubmit."
+            })),
+        }),
+        _ => None,
+    };
+    structured
+        .and_then(|error| serde_json::to_string(&error).ok())
+        .map(|encoded| format!("{STRUCTURED_SERVICE_ERROR_PREFIX}{encoded}"))
+        .unwrap_or(message)
 }
 
 fn classify_service_error(message: &str) -> &'static str {
@@ -1397,5 +1451,47 @@ fn classify_service_error(message: &str) -> &'static str {
         "repository-blocked"
     } else {
         "service-error"
+    }
+}
+
+#[cfg(test)]
+mod ipc_error_tests {
+    use super::*;
+    use tollgate_domain::GitOid;
+
+    #[test]
+    fn stale_candidate_error_preserves_retry_context() {
+        let release_oid = GitOid::from_hex("1111111111111111111111111111111111111111").unwrap();
+        let source_parent_oid =
+            GitOid::from_hex("2222222222222222222222222222222222222222").unwrap();
+        let current_prefix_oid =
+            GitOid::from_hex("3333333333333333333333333333333333333333").unwrap();
+        let encoded = encode_candidate_submission_error(ServiceError::StaleQueuePrefix {
+            source_parent_oid: source_parent_oid.clone(),
+            release_oid: release_oid.clone(),
+            queue_revision: 42,
+            current_prefix_oid: current_prefix_oid.clone(),
+        });
+        let error: StructuredError = serde_json::from_str(
+            encoded
+                .strip_prefix(STRUCTURED_SERVICE_ERROR_PREFIX)
+                .expect("stale errors must cross IPC as structured errors"),
+        )
+        .unwrap();
+        assert_eq!(error.code, "stale-queue-prefix");
+        assert!(error.retryable);
+        assert_eq!(error.details.as_ref().unwrap()["queue_revision"], 42);
+        assert_eq!(
+            error.details.as_ref().unwrap()["release_oid"],
+            serde_json::to_value(release_oid).unwrap()
+        );
+        assert_eq!(
+            error.details.as_ref().unwrap()["source_parent_oid"],
+            serde_json::to_value(source_parent_oid).unwrap()
+        );
+        assert_eq!(
+            error.details.as_ref().unwrap()["current_prefix_oid"],
+            serde_json::to_value(current_prefix_oid).unwrap()
+        );
     }
 }

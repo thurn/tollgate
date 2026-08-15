@@ -44,6 +44,8 @@ pub enum StoreError {
     Json(#[from] serde_json::Error),
     #[error("database integrity check failed: {0}")]
     Integrity(String),
+    #[error("queue revision conflict: expected {expected}, actual {actual}")]
+    RevisionConflict { expected: u64, actual: u64 },
     #[error("repository state has not been initialized")]
     RepositoryMissing,
     #[error("SQLite {actual} is too old; Tollgate requires 3.51.3 or newer")]
@@ -379,6 +381,7 @@ impl RepositoryStore {
         &self,
         item: &QueueItem,
         generation: &ValidationGeneration,
+        expected_revision: u64,
         actor: Actor,
         command_id: CommandId,
         command_kind: &str,
@@ -392,6 +395,12 @@ impl RepositoryStore {
             [item.repository_id.to_string()],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
+        if revision as u64 != expected_revision {
+            return Err(StoreError::RevisionConflict {
+                expected: expected_revision,
+                actual: revision as u64,
+            });
+        }
         let new_revision = revision + 1;
         let new_sequence = sequence + 1;
         transaction.execute(
@@ -2116,7 +2125,11 @@ CREATE INDEX IF NOT EXISTS events_kind_time ON events(kind,created_at);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tollgate_domain::{BlockReason, GitOid, ObjectFormat, RepositoryExecutionState};
+    use tollgate_domain::{
+        BlockReason, CleanupState, GitOid, ObjectFormat, QueueItemId, QueueItemKind,
+        QueueItemState, RemoteState, RepositoryExecutionState, SignatureState, SourceMetadata,
+        ValidationGenerationId,
+    };
 
     fn oid(value: u8) -> GitOid {
         GitOid::new(ObjectFormat::Sha1, vec![value; 20]).unwrap()
@@ -2259,5 +2272,101 @@ mod tests {
         store.deactivate_volume_reservation(first).unwrap();
         store.reserve_volume(second, "shared", 200).unwrap();
         assert_eq!(store.active_volume_reservation("shared").unwrap(), 200);
+    }
+
+    #[test]
+    fn approval_completion_rejects_queue_change_after_preflight_atomically() {
+        let store = RepositoryStore::open_in_memory().unwrap();
+        let mut state = RepositoryState {
+            id: RepositoryId::new(),
+            name: "candidate-race".into(),
+            path: "/candidate-race".into(),
+            integration_ref: "refs/heads/release".into(),
+            master_oid: oid(1),
+            queue_revision: 0,
+            event_sequence: 0,
+            engine_epoch: 1,
+            execution_state: RepositoryExecutionState::Active,
+            block_reasons: Vec::new(),
+            active_configuration_digest: "digest".into(),
+            active_window: 20,
+            active_window_floor: 3,
+            active_window_ceiling: 20,
+            remote_enabled: false,
+        };
+        store.initialize_repository(&state).unwrap();
+        let item_id = QueueItemId::new();
+        let source_oid = oid(2);
+        let generation = ValidationGeneration::derive(
+            ValidationGenerationId::new(),
+            item_id,
+            state.master_oid.clone(),
+            vec![item_id],
+            vec![source_oid.clone()],
+            vec![source_oid.clone()],
+            state.master_oid.clone(),
+            source_oid.clone(),
+            "digest".into(),
+            "steps".into(),
+            state.engine_epoch,
+        );
+        let item = QueueItem {
+            id: item_id,
+            repository_id: state.id,
+            kind: QueueItemKind::Gate,
+            enqueue_sequence: 1,
+            source_oid: source_oid.clone(),
+            source_ref: format!("refs/tollgate/sources/{item_id}"),
+            metadata: SourceMetadata {
+                subject: "candidate".into(),
+                message_hash: "message".into(),
+                author_name: "Tollgate Test".into(),
+                author_email: "test@example.com".into(),
+                branch: Some("task".into()),
+                worktree_path: Some("/candidate-race/task".into()),
+                signature_state: SignatureState::Unknown,
+                approved_at: OffsetDateTime::now_utc(),
+                purpose: Some("candidate".into()),
+            },
+            state: QueueItemState::Queued,
+            terminal_reason: None,
+            remote_state: RemoteState::Disabled,
+            cleanup_state: CleanupState::NotEligible,
+            dependencies: Vec::new(),
+            promotion_authorized: false,
+            promotion_authorized_at: None,
+            promotion_authorized_by: None,
+            current_generation_id: Some(generation.id),
+            buildset_id: None,
+            certificate_id: None,
+        };
+        let command_id = CommandId::new();
+        store
+            .prepare_approval(state.id, &item, command_id, "request")
+            .unwrap();
+
+        state.queue_revision = 1;
+        store.update_repository_state(&state).unwrap();
+        let error = store
+            .complete_approval(
+                &item,
+                &generation,
+                0,
+                Actor::Cli,
+                command_id,
+                "candidate",
+                "request",
+                &serde_json::json!({"item_id": item_id}),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            StoreError::RevisionConflict {
+                expected: 0,
+                actual: 1
+            }
+        ));
+        assert!(store.queue_items().unwrap().is_empty());
+        assert_eq!(store.unfinished_approvals().unwrap().len(), 1);
     }
 }

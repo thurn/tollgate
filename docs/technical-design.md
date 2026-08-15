@@ -322,7 +322,7 @@ All Tollgate-internal plumbing operations, including mirror fetches, synthetic c
 - the resolved source is one commit object with exactly one parent;
 - the source is not already an ancestor of `release`;
 - the source OID is not already active in the queue;
-- every unmerged source ancestor is either literal `release` history, an active known source item, or a previously promoted source item whose promoted OID is still in `release` history;
+- every unmerged source ancestor is either literal `release` history, an active known source item, a prefix OID from a current speculative generation, or a previously promoted source item whose promoted OID is still in `release` history;
 - effective configuration is valid enough to construct a gate buildset.
 
 Root and merge commits are rejected in v1. Ignored files do not make a developer worktree dirty. Approval captures source subject, full message hash, author/committer metadata, signature verification state, branch/ref OID if present, worktree path/identity, and approval time for display and cleanup; only the OID defines content.
@@ -330,8 +330,8 @@ Root and merge commits are rejected in v1. Ignored files do not make a developer
 The source retention ref and queue item are created as one recoverable operation:
 
 1. A full-durability transaction allocates the item/enqueue IDs and inserts an approval intent containing repository, command ID, source OID, exact retention-ref name, expected ref nonexistence, source-worktree snapshot, and prospective queue mutation. No active queue item is visible yet.
-2. The hooks-disabled Git profile creates the retention ref with an explicit nonexistence assertion and verifies that it resolves to the source OID.
-3. A second full-durability transaction inserts the queue item/dependencies, advances the queue revision and event sequence, marks the intent complete, and stores the idempotent command result.
+2. The hooks-disabled Git profile creates the source retention ref with an explicit nonexistence assertion, constructs the prospective generation, and retains its tested OID under `refs/tollgate/speculative/<generation-id>` in the authoritative object database.
+3. A second full-durability transaction compares the queue revision captured by preflight, then inserts the queue item/dependencies, advances the queue revision and event sequence, marks the intent complete, and stores the idempotent command result. A revision mismatch rolls back the whole database transaction, removes the just-created refs with exact-old-OID assertions, and returns current stale-queue context.
 
 Recovery for a prepared approval intent has only three outcomes: a missing ref proves no Git change and permits retry/cancel; a ref equal to the recorded source OID permits exactly-once database completion; any other ref blocks as ownership ambiguity. Removal is allowed only for a canceled prepared intent whose ref still equals the recorded source OID, using an old-OID delete assertion. A queue item is never created for a mismatching ref, and a ref is never removed merely because its name has the Tollgate prefix.
 
@@ -344,9 +344,10 @@ Queue order alone creates a speculative relationship, not a hard dependency. A h
 For source B, Tollgate walks from B's parent through first-parent ancestry until it reaches a literal ancestor of current `release`. Every intervening commit is resolved by exact OID, never by branch name, patch ID, or content similarity:
 
 - An OID matching an active queue item's source OID creates an active hard-dependency edge.
+- An OID matching a prefix in a current validation generation creates hard-dependency edges to the active items represented through that point in the prefix. A source commit rebased onto the displayed tested prefix is therefore a supported candidate input.
 - An OID matching a promoted item's source OID is a satisfied dependency only when that item's recorded promoted synthetic OID is a literal ancestor of current `release`.
-- An OID belonging to a failed, canceled, superseded, or otherwise unsuccessful item makes approval fail with the corresponding dependency reason.
-- An unknown OID makes approval fail rather than silently approving additional code.
+- An OID matching only an invalidated, failed, canceled, superseded, or otherwise historical speculative generation returns a retryable `stale-queue-prefix` result containing the current release OID, queue revision, current prefix OID, and recovery procedure.
+- An unknown OID returns an actionable source-ancestry rejection rather than silently approving additional code or escaping as an internal invariant failure.
 
 Tollgate retains the durable mapping from each promoted source OID to its exact promoted synthetic OID indefinitely with audit metadata. This allows B, whose original parent is source A, to recognize that dependency after A has landed as synthetic commit `S_A`. Satisfied dependencies remain historical provenance but no longer constrain active queue order; active edges do.
 
@@ -367,6 +368,8 @@ The execution mirror is initialized as a disposable bare repository and is never
 - internal mirror refs under `refs/tollgate/` that make active synthetic objects reachable.
 
 Mirror synchronization uses explicit local fetches/refspecs. Deleting or rebuilding the mirror invalidates no durable result by itself: a completed tested object retained in the authoritative repository can still be verified. Missing active synthetic objects are deterministically reconstructed only if the stored validation-generation inputs reproduce the same OIDs; otherwise those buildsets are invalidated and rerun.
+
+Every current speculative generation also has an authoritative retention ref under `refs/tollgate/speculative/<generation-id>`. This makes a displayed `generation.tested_oid` immediately usable as a rebase base from any repository worktree and keeps historical OIDs recognizable long enough to distinguish ordinary stale-prefix churn from unsupported ancestry.
 
 ### 9.5 Synthetic prefix construction
 
@@ -395,6 +398,8 @@ Builder commands use only the recorded Git-semantics profile. The test suite con
 ### 9.6 Queue revisions, validation generations, and invalidation
 
 Every queue mutation advances the repository's monotonic queue revision. Commands use that revision to reject stale reorder, cancellation, cleanup, and other impact-sensitive requests. A queue revision is not evidence that code must be retested.
+
+Candidate submission captures the revision used for ancestry classification and synthesis, then compares it again inside the same SQLite transaction that makes the queue item visible. A still-current prefix is accepted, a prefix already promoted into `release` is authoritative history, and any lost compare-and-swap returns structured stale-queue data. Queue promotion, extension, cancellation, supersession, or replacement must never surface as an internal service invariant failure.
 
 Each active item is instead assigned an immutable validation generation identified by a digest of:
 
