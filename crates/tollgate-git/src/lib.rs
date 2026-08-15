@@ -32,14 +32,40 @@ pub enum GitError {
     UnsupportedObjectFormat(String),
     #[error("source commit must have exactly one parent")]
     InvalidSourceShape,
-    #[error("synthetic commit is empty or conflicts with its prefix")]
+    #[error("Git could not rebase the requested commit")]
     Unmergeable,
+    #[error(
+        "cannot synthesize source {source_oid}: merge conflicts in {conflicting_paths:?} (source base {source_parent_oid}; current queue prefix {prefix_oid}); rebase onto the latest release (or the displayed queue prefix when an earlier candidate is involved), resolve the listed paths, regenerate derived files, and resubmit"
+    )]
+    SyntheticConflict {
+        source_oid: GitOid,
+        source_parent_oid: GitOid,
+        prefix_oid: GitOid,
+        conflicting_paths: Vec<String>,
+    },
+    #[error(
+        "cannot synthesize source {source_oid}: the patch is empty (source base {source_parent_oid}; current queue prefix {prefix_oid}); its changes are already present, so there is nothing new to validate"
+    )]
+    SyntheticEmpty {
+        source_oid: GitOid,
+        source_parent_oid: GitOid,
+        prefix_oid: GitOid,
+    },
     #[error("malformed raw commit: {0}")]
     MalformedCommit(String),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("object id error: {0}")]
     Oid(#[from] tollgate_domain::DomainError),
+}
+
+impl GitError {
+    pub fn is_synthetic_rejection(&self) -> bool {
+        matches!(
+            self,
+            Self::SyntheticConflict { .. } | Self::SyntheticEmpty { .. }
+        )
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -745,6 +771,7 @@ impl GitRepository {
         let mut parent = base.clone();
         let mut result = Vec::with_capacity(sources.len());
         for source in sources {
+            let source_parent = self.commit_parent_oid(source).await?;
             let apply = internal_command(&self.profile.executable, builder)
                 .args([
                     "cherry-pick",
@@ -757,11 +784,55 @@ impl GitRepository {
                 .output()
                 .await?;
             if !apply.status.success() {
+                let mut conflicting_paths = nul_delimited_strings(
+                    run_internal(
+                        &self.profile.executable,
+                        builder,
+                        ["diff", "--name-only", "--diff-filter=U", "-z"],
+                    )
+                    .await?,
+                );
+                conflicting_paths.sort();
+                conflicting_paths.dedup();
+                let attempted_tree = if conflicting_paths.is_empty() {
+                    Some(GitOid::from_hex(
+                        text(
+                            run_internal(&self.profile.executable, builder, ["write-tree"]).await?,
+                        )?
+                        .trim(),
+                    )?)
+                } else {
+                    None
+                };
+                let parent_tree = self.mirror_tree_oid(mirror, &parent).await?;
                 let _ = internal_command(&self.profile.executable, builder)
-                    .args(["cherry-pick", "--abort"])
+                    .args(["reset", "--hard", &parent.to_hex()])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
                     .status()
                     .await;
-                return Err(GitError::Unmergeable);
+                if !conflicting_paths.is_empty() {
+                    return Err(GitError::SyntheticConflict {
+                        source_oid: source.clone(),
+                        source_parent_oid: source_parent,
+                        prefix_oid: parent,
+                        conflicting_paths,
+                    });
+                }
+                if attempted_tree.as_ref() == Some(&parent_tree) {
+                    return Err(GitError::SyntheticEmpty {
+                        source_oid: source.clone(),
+                        source_parent_oid: source_parent,
+                        prefix_oid: parent,
+                    });
+                }
+                return Err(GitError::Command {
+                    command: format!(
+                        "git cherry-pick --no-commit --strategy=ort {}",
+                        source.to_hex()
+                    ),
+                    stderr: String::from_utf8_lossy(&apply.stderr).trim().into(),
+                });
             }
             let tree = GitOid::from_hex(
                 text(run_raw(&self.profile.executable, builder, ["write-tree"]).await?)?.trim(),
@@ -778,7 +849,11 @@ impl GitRepository {
                 .trim(),
             )?;
             if tree == parent_tree {
-                return Err(GitError::Unmergeable);
+                return Err(GitError::SyntheticEmpty {
+                    source_oid: source.clone(),
+                    source_parent_oid: source_parent,
+                    prefix_oid: parent,
+                });
             }
             let raw_source = run_raw(
                 &self.profile.executable,
@@ -1681,6 +1756,14 @@ fn text(bytes: Vec<u8>) -> Result<String, GitError> {
     String::from_utf8(bytes).map_err(|error| GitError::InvalidOutput(error.to_string()))
 }
 
+fn nul_delimited_strings(bytes: Vec<u8>) -> Vec<String> {
+    bytes
+        .split(|byte| *byte == 0)
+        .filter(|field| !field.is_empty())
+        .map(|field| String::from_utf8_lossy(field).into_owned())
+        .collect()
+}
+
 fn canonical_git_path(bytes: Vec<u8>) -> Result<PathBuf, GitError> {
     let path = PathBuf::from(text(bytes)?.trim());
     std::fs::canonicalize(&path).map_err(Into::into)
@@ -2150,6 +2233,116 @@ mod tests {
         assert_eq!(chain[0].oid, a_oid);
         assert_eq!(chain[1].oid, b_oid);
         assert_ne!(chain[0].oid, chain[1].oid);
+    }
+
+    #[tokio::test]
+    async fn reports_conflicting_paths_and_source_base_when_prefix_synthesis_fails() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("messages.json"), "base\n").unwrap();
+        git(&repository, &["add", "messages.json"]);
+        git(&repository, &["commit", "-m", "base"]);
+        let source_base = git(&repository, &["rev-parse", "HEAD"]);
+
+        let adapter = GitRepository::discover(&repository).await.unwrap();
+        adapter
+            .initialize_integration_ref_from_master()
+            .await
+            .unwrap();
+        git(&repository, &["checkout", "-b", "feature"]);
+        std::fs::write(repository.join("messages.json"), "feature\n").unwrap();
+        git(&repository, &["commit", "-am", "update generated messages"]);
+        let source = GitOid::from_hex(&git(&repository, &["rev-parse", "HEAD"])).unwrap();
+        adapter
+            .create_source_ref(QueueItemId::new(), &source)
+            .await
+            .unwrap();
+
+        git(&repository, &["checkout", USER_BRANCH]);
+        std::fs::write(repository.join("messages.json"), "release\n").unwrap();
+        git(&repository, &["commit", "-am", "advance release"]);
+        git(&repository, &["branch", "-f", INTEGRATION_BRANCH, "HEAD"]);
+        let prefix = GitOid::from_hex(&git(&repository, &["rev-parse", "HEAD"])).unwrap();
+        let mirror = temporary.path().join("mirror.git");
+        adapter.initialize_mirror(&mirror).await.unwrap();
+
+        let error = adapter
+            .construct_prefix(
+                &mirror,
+                &temporary.path().join("builder"),
+                &prefix,
+                std::slice::from_ref(&source),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            &error,
+            GitError::SyntheticConflict {
+                source_oid,
+                source_parent_oid,
+                prefix_oid,
+                conflicting_paths,
+            } if source_oid == &source
+                && source_parent_oid.to_hex() == source_base
+                && prefix_oid == &prefix
+                && conflicting_paths == &["messages.json"]
+        ));
+        let message = error.to_string();
+        assert!(message.contains("messages.json"));
+        assert!(message.contains(&source_base));
+        assert!(message.contains(&prefix.to_hex()));
+        assert!(message.contains("rebase onto the latest release"));
+    }
+
+    #[tokio::test]
+    async fn distinguishes_an_empty_synthetic_patch_from_a_conflict() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("file.txt"), "base\n").unwrap();
+        git(&repository, &["add", "file.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+        let base = GitOid::from_hex(&git(&repository, &["rev-parse", "HEAD"])).unwrap();
+        git(
+            &repository,
+            &["commit", "--allow-empty", "-m", "empty source"],
+        );
+        let source = GitOid::from_hex(&git(&repository, &["rev-parse", "HEAD"])).unwrap();
+
+        let adapter = GitRepository::discover(&repository).await.unwrap();
+        adapter
+            .initialize_integration_ref_from_master()
+            .await
+            .unwrap();
+        adapter
+            .create_source_ref(QueueItemId::new(), &source)
+            .await
+            .unwrap();
+        let mirror = temporary.path().join("mirror.git");
+        adapter.initialize_mirror(&mirror).await.unwrap();
+
+        let error = adapter
+            .construct_prefix(
+                &mirror,
+                &temporary.path().join("builder"),
+                &source,
+                std::slice::from_ref(&source),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            GitError::SyntheticEmpty {
+                source_oid,
+                source_parent_oid,
+                prefix_oid,
+            } if source_oid == source && source_parent_oid == base && prefix_oid == source
+        ));
     }
 
     #[tokio::test]

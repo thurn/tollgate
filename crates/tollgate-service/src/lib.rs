@@ -2918,7 +2918,7 @@ impl TollgateService {
                 .await
             {
                 Ok(synthetic) => synthetic,
-                Err(GitError::Unmergeable) => {
+                Err(error) if error.is_synthetic_rejection() => {
                     runtime
                         .git
                         .delete_source_ref(&item.source_ref, &item.source_oid)
@@ -4379,7 +4379,7 @@ impl TollgateService {
             .await
         {
             Ok(synthetic) => synthetic,
-            Err(GitError::Unmergeable) => {
+            Err(error) if error.is_synthetic_rejection() => {
                 runtime
                     .git
                     .delete_source_ref(&item.source_ref, &item.source_oid)
@@ -4389,7 +4389,7 @@ impl TollgateService {
                     IntentState::Canceled,
                     &serde_json::json!({"approval": "unmergeable"}),
                 )?;
-                return Err(GitError::Unmergeable.into());
+                return Err(error.into());
             }
             Err(error) => return Err(error.into()),
         };
@@ -8900,7 +8900,7 @@ impl TollgateService {
                 .await
             {
                 Ok(_) => viable.push(item),
-                Err(GitError::Unmergeable) => {
+                Err(error) if error.is_synthetic_rejection() => {
                     removed.insert(item.id);
                     item.state = item
                         .state
@@ -14329,6 +14329,67 @@ policy = "clone"
                 .count(),
             2
         );
+    }
+
+    #[tokio::test]
+    async fn candidate_conflict_reports_paths_and_stale_base_without_creating_an_item() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        let feature = temporary.path().join("feature");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("messages.json"), "base\n").unwrap();
+        git(&repository, &["add", "messages.json"]);
+        git(&repository, &["commit", "-m", "base"]);
+        let source_base = git(&repository, &["rev-parse", "HEAD"]);
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                feature.to_str().unwrap(),
+                USER_BRANCH,
+            ],
+        );
+        std::fs::write(feature.join("messages.json"), "feature\n").unwrap();
+        git(&feature, &["commit", "-am", "regenerate messages"]);
+
+        std::fs::write(repository.join("messages.json"), "release\n").unwrap();
+        git(&repository, &["commit", "-am", "advance release"]);
+        let release = git(&repository, &["rev-parse", "HEAD"]);
+        git(&repository, &["switch", "--detach", USER_BRANCH]);
+
+        let service = TollgateService::open(temporary.path().join("support"))
+            .await
+            .unwrap();
+        let initialized = service
+            .initialize_repository(&repository, Some("true".into()))
+            .await
+            .unwrap();
+        let error = service
+            .submit_candidate_from(
+                initialized.state.id,
+                "HEAD".into(),
+                Some(feature.to_string_lossy().into_owned()),
+                CommandId::new(),
+            )
+            .await
+            .unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("merge conflicts"));
+        assert!(message.contains("messages.json"));
+        assert!(message.contains(&source_base));
+        assert!(message.contains(&release));
+        assert!(message.contains("rebase onto the latest release"));
+        let snapshot = service
+            .repository_snapshot(initialized.state.id)
+            .await
+            .unwrap();
+        assert!(snapshot.queue.is_empty());
+        assert_eq!(snapshot.state.queue_revision, 0);
     }
 
     #[tokio::test]
