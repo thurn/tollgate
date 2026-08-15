@@ -51,8 +51,9 @@ tg status <candidate-id>
 ```
 
 In JSON mode, `tg status <candidate-id>` returns only that candidate's detailed
-status. Omitting the ID retains the repository-wide snapshot used to inspect the
-current speculative queue and its generation prefixes.
+status through a candidate-specific service read. Omitting the ID retains the
+repository-wide snapshot used to inspect the current speculative queue and its
+generation prefixes.
 
 JSON `--wait` output is newline-delimited and compact: after the command result,
 Tollgate emits an item wait-status record only when the item or repository block
@@ -60,6 +61,10 @@ state changes. Waiting never streams periodic repository or detailed buildset
 snapshots; use `tg status <candidate-id>` for the full candidate evidence view.
 
 `--wait` returns when validation has produced promotion-grade evidence (or a conclusive failure), while `release` remains unchanged. A user later grants authority to the exact retained candidate with `tg approve <candidate-id>`; that authority atomically covers its active hard dependencies because they are part of the retained source history. Granting authority to a retained candidate lets it bypass unrelated candidates still awaiting authority, rebuilding only the affected suffix. Tollgate retains the admission order and all exact completed evidence: if independent later approvals close every authorization gap before promotion, it restores that order, cancels redundant bypass work, and reuses every certificate whose complete validation identity still matches. An explicit `tg reorder` replaces the retained admission order. `tg cancel <candidate-id>` cancels it. For the original one-phase user workflow, `tg approve HEAD` still submits and authorizes in one command.
+
+If a concurrent approval already granted authority to that candidate as an
+active dependency, repeating `tg approve <candidate-id>` succeeds without
+changing the queue revision; `--wait` then follows the already-authorized item.
 
 If synthesis conflicts with an earlier candidate, the `generation.tested_oid` shown by `tg --json status` is a supported recovery base. Tollgate retains every displayed speculative generation under `refs/tollgate/speculative/`, so the OID is available in every worktree of the registered repository. For a single task commit, use this flow:
 

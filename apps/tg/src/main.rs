@@ -356,7 +356,12 @@ async fn run(cli: Cli) -> anyhow::Result<u8> {
             };
             print_wait_value(response.clone(), cli.json, args.wait, |value| {
                 println!(
-                    "Approved {}{}\n  authority  {}\n  source  {}\n  tested  {}\n  queue revision {}",
+                    "{} {}{}\n  authority  {}\n  source  {}\n  tested  {}\n  queue revision {}",
+                    if value["already_authorized"].as_bool() == Some(true) {
+                        "Already approved"
+                    } else {
+                        "Approved"
+                    },
                     value["item_id"].as_str().unwrap_or("?"),
                     if value["evidence_reused"].as_bool() == Some(true) {
                         " (completed validation reused)"
@@ -364,6 +369,9 @@ async fn run(cli: Cli) -> anyhow::Result<u8> {
                         ""
                     },
                     match value["authorized_item_ids"].as_array() {
+                        _ if value["already_authorized"].as_bool() == Some(true) => {
+                            "already granted".into()
+                        }
                         Some(items) if items.len() > 1 => {
                             format!("{} candidates (including dependencies)", items.len())
                         }
@@ -531,11 +539,27 @@ async fn run(cli: Cli) -> anyhow::Result<u8> {
             print_queue(&repository, cli.json)?;
         }
         TopCommand::Status { id } => {
-            let repository = select_repository(&mut client, cli.repository).await?;
-            if cli.json {
-                println!("{}", status_json(&repository, id)?);
+            if let Some(item_id) = id {
+                let view: QueueItemView = serde_json::from_value(
+                    client
+                        .request(IpcCommand::ItemDetails {
+                            repository_id: cli.repository,
+                            item_id,
+                        })
+                        .await?,
+                )?;
+                if cli.json {
+                    println!("{}", serde_json::to_string_pretty(&view)?);
+                } else {
+                    print_item_status(&view);
+                }
             } else {
-                print_status(&repository, id);
+                let repository = select_repository(&mut client, cli.repository).await?;
+                if cli.json {
+                    println!("{}", serde_json::to_string_pretty(&repository)?);
+                } else {
+                    print_status(&repository, None);
+                }
             }
         }
         TopCommand::Wait { id } => {
@@ -1789,57 +1813,7 @@ fn print_queue(repository: &RepositorySnapshot, json: bool) -> anyhow::Result<()
 fn print_status(repository: &RepositorySnapshot, id: Option<QueueItemId>) {
     if let Some(id) = id {
         if let Some(view) = status_view(repository, id) {
-            println!(
-                "{}\n  state       {:?}\n  authority   {}\n  source      {}\n  tested      {}\n  generation  {}\n  evidence    {}",
-                view.item.metadata.subject,
-                view.item.state,
-                if view.item.promotion_authorized {
-                    "promotion authorized"
-                } else {
-                    "validation only"
-                },
-                view.item.source_oid.short(),
-                view.generation
-                    .as_ref()
-                    .map(|value| value.tested_oid.short())
-                    .unwrap_or_else(|| "—".into()),
-                view.generation
-                    .as_ref()
-                    .map(|value| &value.identity_digest[..10])
-                    .unwrap_or("—"),
-                if view.certificate.is_some() {
-                    "promotion-grade certificate ready"
-                } else {
-                    "not complete"
-                }
-            );
-            if let Some(attribution) = &view.failure_attribution {
-                println!(
-                    "  failure     {:?}\n  base        {}\n  environment {}",
-                    attribution.origin,
-                    attribution.base_oid.short(),
-                    &attribution.environment_fingerprint[..12]
-                );
-                for step in &attribution.steps {
-                    println!(
-                        "    {}: {:?} (candidate {}, base {})",
-                        step.name,
-                        step.origin,
-                        step.candidate_result,
-                        step.baseline_result
-                            .as_deref()
-                            .unwrap_or("no comparable run")
-                    );
-                    for diagnostic in &step.diagnostics {
-                        println!("      [{}] {}", diagnostic.code, diagnostic.message);
-                        if let Some(tollgate_domain::RepairCommand::Argv { argv }) =
-                            &diagnostic.repair
-                        {
-                            println!("      suggested repair: {}", argv.join(" "));
-                        }
-                    }
-                }
-            }
+            print_item_status(view);
         } else {
             println!("Queue item {id} was not found in the recent snapshot.");
         }
@@ -1858,6 +1832,59 @@ fn print_status(repository: &RepositorySnapshot, id: Option<QueueItemId>) {
     );
 }
 
+fn print_item_status(view: &QueueItemView) {
+    println!(
+        "{}\n  state       {:?}\n  authority   {}\n  source      {}\n  tested      {}\n  generation  {}\n  evidence    {}",
+        view.item.metadata.subject,
+        view.item.state,
+        if view.item.promotion_authorized {
+            "promotion authorized"
+        } else {
+            "validation only"
+        },
+        view.item.source_oid.short(),
+        view.generation
+            .as_ref()
+            .map(|value| value.tested_oid.short())
+            .unwrap_or_else(|| "—".into()),
+        view.generation
+            .as_ref()
+            .map(|value| &value.identity_digest[..10])
+            .unwrap_or("—"),
+        if view.certificate.is_some() {
+            "promotion-grade certificate ready"
+        } else {
+            "not complete"
+        }
+    );
+    if let Some(attribution) = &view.failure_attribution {
+        println!(
+            "  failure     {:?}\n  base        {}\n  environment {}",
+            attribution.origin,
+            attribution.base_oid.short(),
+            &attribution.environment_fingerprint[..12]
+        );
+        for step in &attribution.steps {
+            println!(
+                "    {}: {:?} (candidate {}, base {})",
+                step.name,
+                step.origin,
+                step.candidate_result,
+                step.baseline_result
+                    .as_deref()
+                    .unwrap_or("no comparable run")
+            );
+            for diagnostic in &step.diagnostics {
+                println!("      [{}] {}", diagnostic.code, diagnostic.message);
+                if let Some(tollgate_domain::RepairCommand::Argv { argv }) = &diagnostic.repair {
+                    println!("      suggested repair: {}", argv.join(" "));
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 fn status_json(repository: &RepositorySnapshot, id: Option<QueueItemId>) -> anyhow::Result<String> {
     if let Some(id) = id {
         let view = status_view(repository, id)

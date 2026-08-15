@@ -1034,6 +1034,16 @@ async fn execute_ipc_command(service: &Service, command: IpcCommand) -> IpcRespo
                     .map_err(|error| error.to_string())?,
             )
             .map_err(|error| error.to_string()),
+            IpcCommand::ItemDetails {
+                repository_id,
+                item_id,
+            } => serde_json::to_value(
+                service
+                    .item_details_by_id(repository_id, item_id)
+                    .await
+                    .map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string()),
             IpcCommand::ItemWaitStatus {
                 repository_id,
                 item_id,

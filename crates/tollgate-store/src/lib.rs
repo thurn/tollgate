@@ -1306,6 +1306,29 @@ impl RepositoryStore {
         )?)
     }
 
+    pub fn record_command_result<R: Serialize>(
+        &self,
+        repository_id: RepositoryId,
+        command_id: CommandId,
+        command_kind: &str,
+        request_digest: &str,
+        response: &R,
+    ) -> Result<(), StoreError> {
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let event_sequence: i64 = transaction.query_row(
+            "SELECT event_sequence FROM repository_state WHERE repository_id=?1",
+            [repository_id.to_string()],
+            |row| row.get(0),
+        )?;
+        transaction.execute(
+            "INSERT INTO command_results (command_id, command_kind, request_digest, response_json, event_sequence, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![command_id.to_string(), command_kind, request_digest, encode(response)?, event_sequence, now()],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn complete_operation<R: Serialize>(
         &self,

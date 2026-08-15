@@ -216,6 +216,11 @@ pub enum IpcCommand {
         repository_id: RepositoryId,
         item_id: QueueItemId,
     },
+    ItemDetails {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        repository_id: Option<RepositoryId>,
+        item_id: QueueItemId,
+    },
     ItemWaitStatus {
         repository_id: RepositoryId,
         item_id: QueueItemId,
@@ -535,6 +540,26 @@ mod tests {
             FrameCodec.decode(&mut bytes),
             Err(ProtocolError::OversizedPayload { .. })
         ));
+    }
+
+    #[test]
+    fn item_details_can_resolve_a_globally_unique_item_without_a_repository_snapshot() {
+        let item_id = QueueItemId::new();
+        let value = serde_json::to_value(IpcCommand::ItemDetails {
+            repository_id: None,
+            item_id,
+        })
+        .unwrap();
+        assert_eq!(value["command"], "item-details");
+        assert_eq!(value["item_id"], item_id.to_string());
+        assert!(value.get("repository_id").is_none());
+        assert_eq!(
+            serde_json::from_value::<IpcCommand>(value).unwrap(),
+            IpcCommand::ItemDetails {
+                repository_id: None,
+                item_id,
+            }
+        );
     }
 
     #[tokio::test]
