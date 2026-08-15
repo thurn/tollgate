@@ -59,11 +59,16 @@ To submit every clean, linear commit on local `master` after the certified
 tg push-master
 ```
 
-The command authorizes the commits oldest-first and returns after scheduling.
-Use `tg push-master --wait` to remain attached until the final commit is
-promoted and synchronized to the configured remote. Remote pushing must be
-enabled for the repository. Bare `tg push` retains its narrower recovery
-meaning: retrying a push of commits that Tollgate has already certified.
+The command first rebases a clean, stale local `master` range onto the current
+certified `release` when necessary, authorizes the commits oldest-first, and
+returns after scheduling. As certified history advances, Tollgate projects the
+latest speculative tested chain back onto an unchanged, clean local `master`,
+placing the newly certified commits beneath the submitted commits without a
+temporary divergence. New commits or working-tree changes prevent automatic
+projection and are left untouched. Use `tg push-master --wait` when a foreground
+result is useful. Remote pushing must be enabled for the repository. Bare `tg
+push` retains its narrower recovery meaning: retrying a push of commits that
+Tollgate has already certified.
 
 ## Diagnosing CI failures
 

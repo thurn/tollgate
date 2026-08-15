@@ -139,7 +139,7 @@ struct DiagnoseArgs {
 
 #[derive(Args)]
 struct PushMasterArgs {
-    #[arg(long, help = "Wait for every master commit to be promoted and pushed")]
+    #[arg(long, help = "Wait for validation and remote synchronization")]
     wait: bool,
 }
 
@@ -1251,11 +1251,38 @@ async fn push_master(
         ));
     }
     master_git.ensure_clean().await?;
-    let master_oid = git.resolve_oid(USER_BRANCH_REF).await?;
+    let release_oid = git.integration_oid().await?;
+    let mut master_oid = git.resolve_oid(USER_BRANCH_REF).await?;
     if master_git.resolve_oid("HEAD").await? != master_oid {
         return Err(anyhow!(
             "master worktree HEAD does not match the local master ref"
         ));
+    }
+
+    let mut rebased_from = None;
+    if !git.is_ancestor(&release_oid, &master_oid).await? {
+        let merge_base = git.merge_base_oid(&release_oid, &master_oid).await?;
+        let stale_sources = git
+            .first_parent_commits_between(&merge_base, &master_oid)
+            .await?;
+        if let Some(active) = repository
+            .queue
+            .iter()
+            .find(|view| stale_sources.contains(&view.item.source_oid))
+        {
+            return Err(anyhow!(
+                "master commit {} is still active as candidate {}; wait for it to finish before rebasing master",
+                active.item.source_oid.short(),
+                active.item.id
+            ));
+        }
+        let old_master = master_oid.clone();
+        master_oid = master_git
+            .rebase_user_master_onto_release(&old_master)
+            .await?;
+        if master_oid != old_master {
+            rebased_from = Some(old_master);
+        }
     }
 
     let source_oids = git.unmerged_user_master_commits().await?;
@@ -1265,10 +1292,17 @@ async fn push_master(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
                     "status": "up-to-date",
-                    "release_oid": repository.state.master_oid,
+                    "release_oid": release_oid,
                     "master_oid": master_oid,
+                    "rebased_from": rebased_from,
                     "items": [],
                 }))?
+            );
+        } else if let Some(old_master) = rebased_from {
+            println!(
+                "Updated local master {} to certified release {}.",
+                old_master.short(),
+                master_oid.short()
             );
         } else {
             println!("Local master has no commits beyond certified release.");
@@ -1276,7 +1310,6 @@ async fn push_master(
         return Ok(0);
     }
 
-    let release_oid = repository.state.master_oid.clone();
     let mut scheduled = Vec::with_capacity(source_oids.len());
     for source_oid in source_oids {
         let existing = repository
@@ -1334,6 +1367,7 @@ async fn push_master(
         "status": "scheduled",
         "release_oid": release_oid,
         "master_oid": master_oid,
+        "rebased_from": rebased_from,
         "items": scheduled,
         "tail_item_id": tail_id,
         "queue_revision": repository.state.queue_revision,
@@ -1347,9 +1381,16 @@ async fn push_master(
             oid_value(&value["master_oid"]),
             tail_id,
         );
-        println!(
-            "Tollgate will push the certified chain to the configured remote after it passes."
-        );
+        if value["rebased_from"].is_object() {
+            println!("  rebased  stale local master onto certified release");
+        }
+        if wait {
+            println!("Waiting for Tollgate to certify, push, and synchronize local master.");
+        } else {
+            println!(
+                "Tollgate will keep a clean, unchanged local master projected onto newly certified history while validation runs."
+            );
+        }
         Ok(())
     })?;
     if wait {

@@ -825,13 +825,36 @@ impl GitRepository {
         buildset_ref: &str,
         oid: &GitOid,
     ) -> Result<(), GitError> {
-        let destination = format!("refs/tollgate/tested/{buildset_ref}");
-        if let Ok(existing) = self.resolve_oid(&destination).await {
+        self.retain_mirror_object(mirror, &format!("refs/tollgate/tested/{buildset_ref}"), oid)
+            .await
+    }
+
+    pub async fn retain_projected_object(
+        &self,
+        mirror: &Path,
+        generation_ref: &str,
+        oid: &GitOid,
+    ) -> Result<(), GitError> {
+        self.retain_mirror_object(
+            mirror,
+            &format!("refs/tollgate/projected/{generation_ref}"),
+            oid,
+        )
+        .await
+    }
+
+    async fn retain_mirror_object(
+        &self,
+        mirror: &Path,
+        destination: &str,
+        oid: &GitOid,
+    ) -> Result<(), GitError> {
+        if let Ok(existing) = self.resolve_oid(destination).await {
             return if existing == *oid {
                 Ok(())
             } else {
                 Err(GitError::InvalidOutput(format!(
-                    "tested-object ref {destination} already records a different object"
+                    "retained-object ref {destination} already records a different object"
                 )))
             };
         }
@@ -845,16 +868,16 @@ impl GitRepository {
         .await?;
         let zero = "0".repeat(self.profile.object_format.byte_len() * 2);
         let update = self
-            .git(["update-ref", &destination, &oid.to_hex(), &zero])
+            .git(["update-ref", destination, &oid.to_hex(), &zero])
             .await;
         let _ = self.git(["update-ref", "-d", &incoming]).await;
         if let Err(error) = update {
-            if self.resolve_oid(&destination).await.ok().as_ref() == Some(oid) {
+            if self.resolve_oid(destination).await.ok().as_ref() == Some(oid) {
                 return Ok(());
             }
             return Err(error);
         }
-        if self.resolve_oid(&destination).await? != *oid {
+        if self.resolve_oid(destination).await? != *oid {
             return Err(GitError::InvalidOutput(
                 "tested object retention mismatch".into(),
             ));
@@ -1037,9 +1060,10 @@ impl GitRepository {
     pub async fn sync_user_master(
         &self,
         tested_new: &GitOid,
-        remote_tracking: Option<(&str, &str)>,
+        replace_source: Option<&GitOid>,
+        remote_tracking: Option<(&str, &str, &GitOid)>,
     ) -> Result<UserMasterSyncOutcome, GitError> {
-        if let Some((remote, branch)) = remote_tracking {
+        if let Some((remote, branch, remote_oid)) = remote_tracking {
             let tracking_ref = format!("refs/remotes/{remote}/{branch}");
             if !self
                 .git_status(["check-ref-format", &tracking_ref])
@@ -1052,12 +1076,12 @@ impl GitRepository {
                 });
             }
             let current_tracking = self.optional_ref_oid(&tracking_ref).await?;
-            if current_tracking.as_ref() != Some(tested_new) {
+            if current_tracking.as_ref() != Some(remote_oid) {
                 let expected = current_tracking
                     .as_ref()
                     .map(GitOid::to_hex)
                     .unwrap_or_else(|| "0".repeat(self.profile.object_format.byte_len() * 2));
-                self.git(["update-ref", &tracking_ref, &tested_new.to_hex(), &expected])
+                self.git(["update-ref", &tracking_ref, &remote_oid.to_hex(), &expected])
                     .await?;
             }
         }
@@ -1098,6 +1122,39 @@ impl GitRepository {
 
         if current == *tested_new {
             return Ok(UserMasterSyncOutcome::AlreadyCurrent { path });
+        }
+        if replace_source == Some(&current) {
+            if let Some(path) = path {
+                run_internal(
+                    &self.profile.executable,
+                    &path,
+                    ["reset", "--keep", &tested_new.to_hex()],
+                )
+                .await?;
+                let checkout = Self::discover(&path).await?;
+                if checkout.resolve_oid("HEAD").await? != *tested_new
+                    || self.resolve_oid(USER_BRANCH_REF).await? != *tested_new
+                {
+                    return Err(GitError::InvalidOutput(
+                        "projected master checkout result mismatch".into(),
+                    ));
+                }
+                checkout.ensure_clean().await?;
+                return Ok(UserMasterSyncOutcome::UpdatedCheckout { path });
+            }
+            self.git([
+                "update-ref",
+                USER_BRANCH_REF,
+                &tested_new.to_hex(),
+                &current.to_hex(),
+            ])
+            .await?;
+            if self.resolve_oid(USER_BRANCH_REF).await? != *tested_new {
+                return Err(GitError::InvalidOutput(
+                    "projected master ref result mismatch".into(),
+                ));
+            }
+            return Ok(UserMasterSyncOutcome::UpdatedRef);
         }
         if !self.is_ancestor(&current, tested_new).await? {
             return Ok(UserMasterSyncOutcome::NeedsAttention {
@@ -1287,6 +1344,84 @@ impl GitRepository {
             .map(GitOid::from_hex)
             .collect::<Result<Vec<_>, _>>()
             .map_err(Into::into)
+    }
+
+    pub async fn merge_base_oid(&self, left: &GitOid, right: &GitOid) -> Result<GitOid, GitError> {
+        let output = self
+            .git(["merge-base", &left.to_hex(), &right.to_hex()])
+            .await?;
+        GitOid::from_hex(text(output)?.trim()).map_err(Into::into)
+    }
+
+    pub async fn rebase_user_master_onto_release(
+        &self,
+        expected_master: &GitOid,
+    ) -> Result<GitOid, GitError> {
+        self.ensure_clean().await?;
+        if self.current_branch().await?.as_deref() != Some(USER_BRANCH)
+            || self.resolve_oid("HEAD").await? != *expected_master
+            || self.resolve_oid(USER_BRANCH_REF).await? != *expected_master
+        {
+            return Err(GitError::InvalidOutput(
+                "master moved after push preflight".into(),
+            ));
+        }
+        let release = self.integration_oid().await?;
+        if release == *expected_master || self.is_ancestor(&release, expected_master).await? {
+            return Ok(expected_master.clone());
+        }
+        let base = self.merge_base_oid(&release, expected_master).await?;
+        let commits = self
+            .first_parent_commits_between(&base, expected_master)
+            .await?;
+        let mut expected_parent = base.clone();
+        for commit in &commits {
+            let parent = self.commit_parent_oid(commit).await?;
+            if parent != expected_parent {
+                return Err(GitError::InvalidOutput(format!(
+                    "master commit {} does not directly follow {}; only a linear, merge-free master range can be rebased",
+                    commit.short(),
+                    expected_parent.short()
+                )));
+            }
+            expected_parent = commit.clone();
+        }
+        let operation = if commits.is_empty() {
+            internal_command(&self.profile.executable, &self.worktree_root)
+                .args(["merge", "--ff-only", &release.to_hex()])
+                .output()
+                .await?
+        } else {
+            internal_command(&self.profile.executable, &self.worktree_root)
+                .args([
+                    "rebase",
+                    "--onto",
+                    &release.to_hex(),
+                    &base.to_hex(),
+                    USER_BRANCH,
+                ])
+                .output()
+                .await?
+        };
+        if !operation.status.success() {
+            if !commits.is_empty() {
+                let _ = internal_command(&self.profile.executable, &self.worktree_root)
+                    .args(["rebase", "--abort"])
+                    .status()
+                    .await;
+            }
+            return Err(GitError::Unmergeable);
+        }
+        let new_master = self.resolve_oid(USER_BRANCH_REF).await?;
+        if self.resolve_oid("HEAD").await? != new_master
+            || !self.is_ancestor(&release, &new_master).await?
+        {
+            return Err(GitError::InvalidOutput(
+                "rebased master did not descend from certified release".into(),
+            ));
+        }
+        self.ensure_clean().await?;
+        Ok(new_master)
     }
 
     pub async fn unmerged_user_master_commits(&self) -> Result<Vec<GitOid>, GitError> {
@@ -1702,6 +1837,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rebases_diverged_master_commits_onto_release() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("base.txt"), "base\n").unwrap();
+        git(&repository, &["add", "base.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+
+        let adapter = GitRepository::discover(&repository).await.unwrap();
+        adapter
+            .initialize_integration_ref_from_master()
+            .await
+            .unwrap();
+        std::fs::write(repository.join("master.txt"), "master\n").unwrap();
+        git(&repository, &["add", "master.txt"]);
+        git(&repository, &["commit", "-m", "master"]);
+        let old_master = adapter.resolve_oid(USER_BRANCH_REF).await.unwrap();
+        let base = adapter.commit_parent_oid(&old_master).await.unwrap();
+        git(&repository, &["checkout", "--detach", &base.to_hex()]);
+        std::fs::write(repository.join("release.txt"), "release\n").unwrap();
+        git(&repository, &["add", "release.txt"]);
+        git(&repository, &["commit", "-m", "release"]);
+        git(&repository, &["branch", "-f", INTEGRATION_BRANCH, "HEAD"]);
+        let release = adapter.integration_oid().await.unwrap();
+        git(&repository, &["checkout", USER_BRANCH]);
+
+        let new_master = adapter
+            .rebase_user_master_onto_release(&old_master)
+            .await
+            .unwrap();
+
+        assert_ne!(new_master, old_master);
+        assert_eq!(
+            adapter.commit_parent_oid(&new_master).await.unwrap(),
+            release
+        );
+        assert_eq!(
+            std::fs::read_to_string(repository.join("master.txt")).unwrap(),
+            "master\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repository.join("release.txt")).unwrap(),
+            "release\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn projects_an_unchanged_master_source_to_its_tested_commit() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("base.txt"), "base\n").unwrap();
+        git(&repository, &["add", "base.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+        let base = git(&repository, &["rev-parse", "HEAD"]);
+        std::fs::write(repository.join("source.txt"), "source\n").unwrap();
+        git(&repository, &["add", "source.txt"]);
+        git(&repository, &["commit", "-m", "source"]);
+        let source = GitOid::from_hex(&git(&repository, &["rev-parse", "HEAD"])).unwrap();
+
+        let tested_worktree = temporary.path().join("tested");
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "tested",
+                tested_worktree.to_str().unwrap(),
+                &base,
+            ],
+        );
+        std::fs::write(tested_worktree.join("release.txt"), "release\n").unwrap();
+        std::fs::write(tested_worktree.join("source.txt"), "source\n").unwrap();
+        git(&tested_worktree, &["add", "release.txt", "source.txt"]);
+        git(&tested_worktree, &["commit", "-m", "tested"]);
+        let tested = GitOid::from_hex(&git(&tested_worktree, &["rev-parse", "HEAD"])).unwrap();
+
+        let adapter = GitRepository::discover(&tested_worktree).await.unwrap();
+        let outcome = adapter
+            .sync_user_master(&tested, Some(&source), None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            UserMasterSyncOutcome::UpdatedCheckout {
+                path: std::fs::canonicalize(&repository).unwrap()
+            }
+        );
+        assert_eq!(adapter.resolve_oid(USER_BRANCH_REF).await.unwrap(), tested);
+        assert_eq!(
+            std::fs::read_to_string(repository.join("release.txt")).unwrap(),
+            "release\n"
+        );
+    }
+
+    #[tokio::test]
     async fn synchronizes_checked_out_master_and_its_files_by_fast_forward() {
         let temporary = tempfile::tempdir().unwrap();
         let repository = temporary.path().join("repository");
@@ -1733,7 +1968,7 @@ mod tests {
             &["update-ref", "refs/remotes/origin/master", &base.to_hex()],
         );
         let outcome = adapter
-            .sync_user_master(&promoted, Some(("origin", "master")))
+            .sync_user_master(&promoted, None, Some(("origin", "master", &promoted)))
             .await
             .unwrap();
 
@@ -1770,6 +2005,7 @@ mod tests {
         git(&repository, &["add", "file.txt"]);
         git(&repository, &["commit", "-m", "base"]);
         let master = git(&repository, &["rev-parse", "HEAD"]);
+        let master_oid = GitOid::from_hex(&master).unwrap();
 
         let feature = temporary.path().join("feature");
         git(
@@ -1788,7 +2024,10 @@ mod tests {
         std::fs::write(repository.join("file.txt"), "local edit\n").unwrap();
 
         let adapter = GitRepository::discover(&feature).await.unwrap();
-        let outcome = adapter.sync_user_master(&promoted, None).await.unwrap();
+        let outcome = adapter
+            .sync_user_master(&promoted, Some(&master_oid), None)
+            .await
+            .unwrap();
 
         assert!(matches!(
             outcome,
@@ -1817,7 +2056,10 @@ mod tests {
         let promoted = GitOid::from_hex(&git(&repository, &["rev-parse", "HEAD"])).unwrap();
 
         let adapter = GitRepository::discover(&repository).await.unwrap();
-        let outcome = adapter.sync_user_master(&promoted, None).await.unwrap();
+        let outcome = adapter
+            .sync_user_master(&promoted, None, None)
+            .await
+            .unwrap();
 
         assert_eq!(outcome, UserMasterSyncOutcome::UpdatedRef);
         assert_eq!(
