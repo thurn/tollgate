@@ -3,6 +3,7 @@
 use std::{
     ffi::OsStr,
     io::{Seek, SeekFrom},
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     process::Stdio,
 };
@@ -83,6 +84,19 @@ pub struct GitRepository {
     pub worktree_root: PathBuf,
     pub common_dir: PathBuf,
     pub profile: GitSemanticsProfile,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FileIdentity {
+    pub device: u64,
+    pub inode: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RegisteredWorktree {
+    pub path: PathBuf,
+    pub head: GitOid,
+    pub branch: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -280,6 +294,72 @@ impl GitRepository {
             [path] => Ok(Some(path.clone())),
             _ => Err(GitError::InvalidOutput(format!(
                 "branch `{branch_ref}` is checked out in multiple worktrees"
+            ))),
+        }
+    }
+
+    pub fn directory_identity(path: &Path) -> Result<FileIdentity, GitError> {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(GitError::InvalidOutput(format!(
+                "worktree path is not a direct directory: {}",
+                path.display()
+            )));
+        }
+        Ok(FileIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+
+    pub async fn registered_worktree(
+        &self,
+        requested: &Path,
+    ) -> Result<Option<RegisteredWorktree>, GitError> {
+        let bytes = self.git(["worktree", "list", "--porcelain", "-z"]).await?;
+        let requested_canonical = std::fs::canonicalize(requested).ok();
+        let mut path = None;
+        let mut head = None;
+        let mut branch = None;
+        let mut matches = Vec::new();
+        for field in bytes.split(|byte| *byte == 0) {
+            if field.is_empty() {
+                if let (Some(path), Some(head)) = (path.take(), head.take()) {
+                    let exact = requested_canonical
+                        .as_ref()
+                        .and_then(|requested| {
+                            std::fs::canonicalize(&path)
+                                .ok()
+                                .map(|registered| &registered == requested)
+                        })
+                        .unwrap_or_else(|| path == requested);
+                    if exact {
+                        matches.push(RegisteredWorktree {
+                            path,
+                            head,
+                            branch: branch.take(),
+                        });
+                    }
+                }
+                path = None;
+                head = None;
+                branch = None;
+                continue;
+            }
+            if let Some(value) = field.strip_prefix(b"worktree ") {
+                path = Some(PathBuf::from(String::from_utf8_lossy(value).into_owned()));
+            } else if let Some(value) = field.strip_prefix(b"HEAD ") {
+                head = Some(GitOid::from_hex(&String::from_utf8_lossy(value))?);
+            } else if let Some(value) = field.strip_prefix(b"branch refs/heads/") {
+                branch = Some(String::from_utf8_lossy(value).into_owned());
+            }
+        }
+        match matches.as_slice() {
+            [] => Ok(None),
+            [registration] => Ok(Some(registration.clone())),
+            _ => Err(GitError::InvalidOutput(format!(
+                "path `{}` is registered as multiple worktrees",
+                requested.display()
             ))),
         }
     }
@@ -529,11 +609,28 @@ impl GitRepository {
         branch: &str,
         expected_source: &GitOid,
     ) -> Result<bool, GitError> {
+        let approved_identity = Self::directory_identity(worktree)?;
         let worktree = std::fs::canonicalize(worktree)?;
         if worktree == self.worktree_root || matches!(branch, USER_BRANCH | INTEGRATION_BRANCH) {
             return Ok(false);
         }
+        let registration = self.registered_worktree(&worktree).await?.ok_or_else(|| {
+            GitError::InvalidOutput("cleanup path is not an exact registered worktree".into())
+        })?;
+        if registration.path != worktree
+            || registration.branch.as_deref() != Some(branch)
+            || registration.head != *expected_source
+        {
+            return Err(GitError::InvalidOutput(
+                "cleanup worktree registration differs from approved path, branch, or OID".into(),
+            ));
+        }
         let discovered = Self::discover(&worktree).await?;
+        if discovered.worktree_root != worktree {
+            return Err(GitError::InvalidOutput(
+                "cleanup path only discovers an ancestor worktree".into(),
+            ));
+        }
         if discovered.common_dir != self.common_dir {
             return Err(GitError::InvalidOutput(
                 "cleanup worktree belongs to a different repository".into(),
@@ -551,15 +648,37 @@ impl GitRepository {
                 "cleanup branch moved after approval".into(),
             ));
         }
-        self.git([
-            "worktree",
-            "remove",
-            "--force",
-            worktree.to_string_lossy().as_ref(),
-        ])
-        .await?;
-        self.git(["update-ref", "-d", &branch_ref, &expected_source.to_hex()])
-            .await?;
+        if Self::directory_identity(&worktree)? != approved_identity {
+            return Err(GitError::InvalidOutput(
+                "cleanup worktree path was replaced after approval".into(),
+            ));
+        }
+        let removal = self
+            .git([
+                "worktree",
+                "remove",
+                "--force",
+                worktree.to_string_lossy().as_ref(),
+            ])
+            .await;
+        if self.registered_worktree(&worktree).await?.is_some() {
+            removal?;
+            return Err(GitError::InvalidOutput(
+                "Git reported success but the worktree remains registered".into(),
+            ));
+        }
+        match self.optional_ref_oid(&branch_ref).await? {
+            Some(observed) if observed == *expected_source => {
+                self.git(["update-ref", "-d", &branch_ref, &expected_source.to_hex()])
+                    .await?;
+            }
+            Some(_) => {
+                return Err(GitError::InvalidOutput(
+                    "cleanup branch moved while removing its worktree".into(),
+                ));
+            }
+            None => {}
+        }
         Ok(true)
     }
 
@@ -1826,6 +1945,230 @@ mod tests {
             Some(USER_BRANCH)
         );
         adapter.ensure_integration_not_checked_out().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn exact_registration_rejects_an_orphan_that_only_discovers_its_parent() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("file.txt"), "base\n").unwrap();
+        git(&repository, &["add", "file.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+        let orphan = repository.join(".worktrees/orphan/ui/.vite/deps");
+        std::fs::create_dir_all(&orphan).unwrap();
+        std::fs::write(orphan.join("_metadata.json"), "{}").unwrap();
+        let orphan_root = repository.join(".worktrees/orphan");
+
+        let adapter = GitRepository::discover(&repository).await.unwrap();
+        let ancestor = GitRepository::discover(&orphan_root).await.unwrap();
+        assert_eq!(
+            ancestor.worktree_root,
+            std::fs::canonicalize(&repository).unwrap()
+        );
+        assert!(
+            adapter
+                .registered_worktree(&orphan_root)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let source = adapter.resolve_oid("HEAD").await.unwrap();
+        let error = adapter
+            .cleanup_linked_source_worktree(&orphan_root, "feature", &source)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("not an exact registered worktree")
+        );
+        assert!(orphan.join("_metadata.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cleanup_rejects_a_symlink_alias_before_removal() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        let feature = temporary.path().join("feature");
+        let alias = temporary.path().join("feature-alias");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("file.txt"), "base\n").unwrap();
+        git(&repository, &["add", "file.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                feature.to_str().unwrap(),
+            ],
+        );
+        symlink(&feature, &alias).unwrap();
+
+        let adapter = GitRepository::discover(&repository).await.unwrap();
+        let source = adapter.resolve_oid("refs/heads/feature").await.unwrap();
+        let error = adapter
+            .cleanup_linked_source_worktree(&alias, "feature", &source)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("not a direct directory"));
+        assert!(
+            adapter
+                .registered_worktree(&feature)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_preserves_dirty_and_different_repository_worktrees() {
+        let temporary = tempfile::tempdir().unwrap();
+        let first = temporary.path().join("first");
+        let first_feature = temporary.path().join("first-feature");
+        let second = temporary.path().join("second");
+        let second_feature = temporary.path().join("second-feature");
+        for repository in [&first, &second] {
+            std::fs::create_dir(repository).unwrap();
+            git(repository, &["init", "-b", USER_BRANCH]);
+            std::fs::write(repository.join("file.txt"), "base\n").unwrap();
+            git(repository, &["add", "file.txt"]);
+            git(repository, &["commit", "-m", "base"]);
+        }
+        git(
+            &first,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "first-feature",
+                first_feature.to_str().unwrap(),
+            ],
+        );
+        git(
+            &second,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "second-feature",
+                second_feature.to_str().unwrap(),
+            ],
+        );
+        std::fs::write(first_feature.join("file.txt"), "dirty\n").unwrap();
+
+        let adapter = GitRepository::discover(&first).await.unwrap();
+        let first_source = adapter
+            .resolve_oid("refs/heads/first-feature")
+            .await
+            .unwrap();
+        let dirty = adapter
+            .cleanup_linked_source_worktree(&first_feature, "first-feature", &first_source)
+            .await
+            .unwrap_err();
+        assert!(matches!(dirty, GitError::DirtyWorktree(_)));
+        let second_adapter = GitRepository::discover(&second).await.unwrap();
+        let second_source = second_adapter
+            .resolve_oid("refs/heads/second-feature")
+            .await
+            .unwrap();
+        let foreign = adapter
+            .cleanup_linked_source_worktree(&second_feature, "second-feature", &second_source)
+            .await
+            .unwrap_err();
+        assert!(
+            foreign
+                .to_string()
+                .contains("not an exact registered worktree")
+        );
+        assert!(
+            adapter
+                .registered_worktree(&first_feature)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            second_adapter
+                .registered_worktree(&second_feature)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_accepts_git_unregistration_with_residual_generated_files() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        let feature = temporary.path().join("feature");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("file.txt"), "base\n").unwrap();
+        git(&repository, &["add", "file.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                feature.to_str().unwrap(),
+            ],
+        );
+        let git_marker = feature.join(".git");
+        let cache = feature.join("ui/.vite/deps");
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let survivor_stop = std::sync::Arc::clone(&stop);
+        let survivor = std::thread::spawn(move || {
+            while git_marker.exists() {
+                std::thread::yield_now();
+            }
+            while !survivor_stop.load(std::sync::atomic::Ordering::Acquire) {
+                let _ = std::fs::create_dir_all(&cache);
+                let _ = std::fs::write(cache.join("_metadata.json"), "{}");
+                let _ = std::fs::write(cache.join("package.json"), "{}");
+            }
+            std::fs::create_dir_all(&cache).unwrap();
+            std::fs::write(cache.join("_metadata.json"), "{}").unwrap();
+            std::fs::write(cache.join("package.json"), "{}").unwrap();
+        });
+
+        let adapter = GitRepository::discover(&repository).await.unwrap();
+        let source = adapter.resolve_oid("refs/heads/feature").await.unwrap();
+        assert!(
+            adapter
+                .cleanup_linked_source_worktree(&feature, "feature", &source)
+                .await
+                .unwrap()
+        );
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        survivor.join().unwrap();
+
+        assert!(feature.join("ui/.vite/deps/_metadata.json").exists());
+        assert!(
+            adapter
+                .registered_worktree(&feature)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            adapter
+                .optional_ref_oid("refs/heads/feature")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

@@ -1315,7 +1315,7 @@ impl RepositoryStore {
             params![state.id.to_string(), encode(&persisted_state)?, state.queue_revision as i64, sequence as i64, now()],
         )?;
         transaction.execute(
-            "UPDATE operation_intents SET state='completed', observed_json=?2, updated_at=?3 WHERE repository_id=?1 AND command_id=?4 AND kind=?5 AND state IN ('prepared','external-applied')",
+            "UPDATE operation_intents SET state='completed', observed_json=?2, updated_at=?3 WHERE repository_id=?1 AND command_id=?4 AND kind=?5 AND state IN ('prepared','external-applied','needs-attention')",
             params![state.id.to_string(), encode(observed)?, now(), command_id.to_string(), intent_kind],
         )?;
         transaction.execute(
@@ -1386,6 +1386,73 @@ impl RepositoryStore {
             result.push((command_id, kind, evidence, state));
         }
         Ok(result)
+    }
+
+    pub fn recoverable_operations(
+        &self,
+        kinds: &[&str],
+    ) -> Result<Vec<(CommandId, String, serde_json::Value, IntentState)>, StoreError> {
+        let connection = self.connection.lock();
+        let mut statement = connection.prepare(
+            "SELECT command_id, kind, expected_json, observed_json, state FROM operation_intents WHERE state IN ('prepared','external-applied','needs-attention') ORDER BY created_at",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?;
+        let mut result = Vec::new();
+        for row in rows {
+            let (command_id, kind, expected, observed, state) = row?;
+            if !kinds.contains(&kind.as_str()) {
+                continue;
+            }
+            let command_id = command_id.parse().map_err(|error| {
+                StoreError::Integrity(format!("invalid operation command ID: {error}"))
+            })?;
+            let state = match state.as_str() {
+                "prepared" => IntentState::Prepared,
+                "external-applied" => IntentState::ExternalApplied,
+                "needs-attention" => IntentState::NeedsAttention,
+                other => {
+                    return Err(StoreError::Integrity(format!(
+                        "invalid recoverable operation state {other}"
+                    )));
+                }
+            };
+            let mut evidence: serde_json::Value = serde_json::from_str(&expected)?;
+            if let Some(observed) = observed {
+                let observed: serde_json::Value = serde_json::from_str(&observed)?;
+                if let Some(remote_oid) = observed.get("observed_remote_oid") {
+                    evidence["observed_remote_oid"] = remote_oid.clone();
+                }
+            }
+            result.push((command_id, kind, evidence, state));
+        }
+        Ok(result)
+    }
+
+    pub fn cancel_attention_intent(
+        &self,
+        command_id: CommandId,
+        evidence: &impl Serialize,
+    ) -> Result<(), StoreError> {
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "UPDATE operation_intents SET state='canceled', observed_json=?2, updated_at=?3 WHERE command_id=?1 AND state='needs-attention'",
+            params![command_id.to_string(), encode(evidence)?, now()],
+        )?;
+        transaction.execute(
+            "UPDATE volume_reservations SET active=0 WHERE intent_id IN (SELECT intent_id FROM operation_intents WHERE command_id=?1)",
+            [command_id.to_string()],
+        )?;
+        transaction.commit()?;
+        Ok(())
     }
 
     pub fn completed_operation_evidence(

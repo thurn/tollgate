@@ -23,7 +23,8 @@ use tokio_util::sync::CancellationToken;
 use tollgate_config::{CachePolicy, EffectiveConfig, EffectiveStep};
 use tollgate_domain::*;
 use tollgate_git::{
-    GitError, GitRepository, INTEGRATION_REF, USER_BRANCH, USER_BRANCH_REF, UserMasterSyncOutcome,
+    FileIdentity, GitError, GitRepository, INTEGRATION_BRANCH, INTEGRATION_REF, USER_BRANCH,
+    USER_BRANCH_REF, UserMasterSyncOutcome,
 };
 use tollgate_runner::apfs::{CloneManifest, force_clone_file, force_clone_tree, verify_clone_tree};
 use tollgate_runner::{
@@ -122,6 +123,13 @@ pub struct DoctorReport {
     pub generated_at: OffsetDateTime,
     pub checks: Vec<DiagnosticCheck>,
     pub healthy: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorktreeRemovalObservation {
+    Intact,
+    Removed,
+    Residual,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1211,20 +1219,27 @@ impl TollgateService {
         self: &Arc<Self>,
         runtime: &Arc<RepositoryRuntime>,
     ) -> Result<(), ServiceError> {
-        for (command_id, kind, evidence, _) in runtime.store.unfinished_operations(&[
-            "cancel",
-            "pause",
-            "resume",
-            "config-apply",
-            "config-regenerate",
-            "worktree-create",
-            "worktree-remove",
-            "update",
-            "slot-reset",
-            "cleanup",
-            "user-master-sync",
-            "reconcile",
-        ])? {
+        for (command_id, kind, evidence, intent_state) in
+            runtime.store.recoverable_operations(&[
+                "cancel",
+                "pause",
+                "resume",
+                "config-apply",
+                "config-regenerate",
+                "worktree-create",
+                "worktree-remove",
+                "update",
+                "slot-reset",
+                "cleanup",
+                "user-master-sync",
+                "reconcile",
+            ])?
+        {
+            if intent_state == IntentState::NeedsAttention
+                && !matches!(kind.as_str(), "worktree-remove" | "cleanup")
+            {
+                continue;
+            }
             match kind.as_str() {
                 "config-regenerate" => {
                     self.reconcile_config_regeneration(runtime, command_id, &evidence)
@@ -1232,8 +1247,14 @@ impl TollgateService {
                     continue;
                 }
                 "worktree-create" | "worktree-remove" | "update" => {
-                    self.reconcile_worktree_mutation(runtime, command_id, &kind, &evidence)
-                        .await?;
+                    self.reconcile_worktree_mutation(
+                        runtime,
+                        command_id,
+                        &kind,
+                        &evidence,
+                        intent_state,
+                    )
+                    .await?;
                     continue;
                 }
                 "slot-reset" => {
@@ -1242,7 +1263,7 @@ impl TollgateService {
                     continue;
                 }
                 "cleanup" => {
-                    self.reconcile_source_cleanup(runtime, command_id, &evidence)
+                    self.reconcile_source_cleanup(runtime, command_id, &evidence, intent_state)
                         .await?;
                     continue;
                 }
@@ -1402,6 +1423,7 @@ impl TollgateService {
             runtime.data.lock().state = state;
             let _ = runtime.events.send(event);
         }
+        self.clear_worktree_removal_block_if_resolved(runtime)?;
         Ok(())
     }
 
@@ -1714,12 +1736,189 @@ impl TollgateService {
                 data.state.block_reasons.push(BlockReason {
                     code: code.into(),
                     message,
-                    recovery_action: "Preserve the affected paths and use guided reconciliation after inspecting the prepared operation evidence.".into(),
+                    recovery_action: if code == "worktree-remove-ambiguous" {
+                        "Preserve the path. Restore its prepared identity or move a replacement aside, then restart Tollgate; exact worktree evidence will be reconciled automatically.".into()
+                    } else {
+                        "Preserve the affected paths and inspect the prepared operation evidence before recovery.".into()
+                    },
                 });
             }
             data.state.clone()
         };
         runtime.store.update_repository_state(&state)?;
+        Ok(())
+    }
+
+    fn cancel_recovery_intent(
+        &self,
+        runtime: &Arc<RepositoryRuntime>,
+        command_id: CommandId,
+        intent_state: IntentState,
+        reason: &str,
+    ) -> Result<(), ServiceError> {
+        let evidence = serde_json::json!({"recovery": reason});
+        if intent_state == IntentState::NeedsAttention {
+            runtime
+                .store
+                .cancel_attention_intent(command_id, &evidence)?;
+        } else {
+            runtime
+                .store
+                .set_intent_state(command_id, IntentState::Canceled, &evidence)?;
+        }
+        self.clear_worktree_removal_block_if_resolved(runtime)
+    }
+
+    fn clear_worktree_removal_block_if_resolved(
+        &self,
+        runtime: &Arc<RepositoryRuntime>,
+    ) -> Result<(), ServiceError> {
+        let unresolved = runtime
+            .store
+            .recoverable_operations(&["worktree-remove"])?
+            .into_iter()
+            .any(|(_, _, _, state)| state == IntentState::NeedsAttention);
+        if unresolved {
+            return Ok(());
+        }
+        let state = {
+            let mut data = runtime.data.lock();
+            data.state
+                .block_reasons
+                .retain(|reason| reason.code != "worktree-remove-ambiguous");
+            if data.state.execution_state == RepositoryExecutionState::Blocked
+                && data.state.block_reasons.is_empty()
+            {
+                data.state.execution_state = RepositoryExecutionState::Active;
+            }
+            data.state.clone()
+        };
+        runtime.store.update_repository_state(&state)?;
+        Ok(())
+    }
+
+    async fn observe_worktree_removal(
+        &self,
+        runtime: &Arc<RepositoryRuntime>,
+        evidence: &serde_json::Value,
+        path: &Path,
+        branch: &str,
+        expected: &GitOid,
+    ) -> Result<WorktreeRemovalObservation, String> {
+        if !path.is_absolute() {
+            return Err("Prepared worktree path is not absolute".into());
+        }
+        if matches!(branch, USER_BRANCH | INTEGRATION_BRANCH) {
+            return Err("Prepared removal targets a protected master or release branch".into());
+        }
+        if let Some(common_dir) = evidence.get("common_dir") {
+            let common_dir: PathBuf = serde_json::from_value(common_dir.clone())
+                .map_err(|error| format!("Prepared common directory is malformed: {error}"))?;
+            if common_dir != runtime.git.common_dir {
+                return Err(
+                    "Prepared removal belongs to a different repository common directory".into(),
+                );
+            }
+        }
+        let expected_identity: Option<FileIdentity> = evidence
+            .get("path_identity")
+            .filter(|value| !value.is_null())
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|error| format!("Prepared path identity is malformed: {error}"))?;
+        let registration = runtime
+            .git
+            .registered_worktree(path)
+            .await
+            .map_err(|error| error.to_string())?;
+        let metadata = match std::fs::symlink_metadata(path) {
+            Ok(metadata) => Some(metadata),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(format!("Prepared path cannot be inspected: {error}")),
+        };
+        if let Some(registration) = registration {
+            let Some(metadata) = metadata else {
+                return Err("Worktree is still registered but its path is absent".into());
+            };
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err("Registered worktree path was replaced with an unsafe entry".into());
+            }
+            let identity =
+                GitRepository::directory_identity(path).map_err(|error| error.to_string())?;
+            if expected_identity.is_some_and(|expected| expected != identity) {
+                return Err("Registered worktree path identity changed after preparation".into());
+            }
+            let canonical = std::fs::canonicalize(path).map_err(|error| error.to_string())?;
+            if registration.path != canonical
+                || registration.branch.as_deref() != Some(branch)
+                || registration.head != *expected
+            {
+                return Err(
+                    "Registered worktree path, branch, or OID differs from prepared evidence"
+                        .into(),
+                );
+            }
+            let discovered = GitRepository::discover(path)
+                .await
+                .map_err(|error| error.to_string())?;
+            if discovered.worktree_root != canonical
+                || discovered.common_dir != runtime.git.common_dir
+                || discovered
+                    .current_branch()
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .as_deref()
+                    != Some(branch)
+                || discovered
+                    .resolve_oid("HEAD")
+                    .await
+                    .map_err(|error| error.to_string())?
+                    != *expected
+            {
+                return Err("Exact linked worktree identity no longer matches its evidence".into());
+            }
+            return Ok(WorktreeRemovalObservation::Intact);
+        }
+
+        match metadata {
+            None => Ok(WorktreeRemovalObservation::Removed),
+            Some(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err(
+                        "Unregistered worktree path was replaced with an unsafe entry".into(),
+                    );
+                }
+                let identity =
+                    GitRepository::directory_identity(path).map_err(|error| error.to_string())?;
+                if expected_identity.is_some_and(|expected| expected != identity) {
+                    return Err("Unregistered worktree path was replaced after preparation".into());
+                }
+                if std::fs::symlink_metadata(path.join(".git")).is_ok() {
+                    return Err(
+                        "Unregistered path now contains repository identity metadata".into(),
+                    );
+                }
+                Ok(WorktreeRemovalObservation::Residual)
+            }
+        }
+    }
+
+    async fn finish_unregistered_worktree_branch(
+        &self,
+        runtime: &Arc<RepositoryRuntime>,
+        branch: &str,
+        expected: &GitOid,
+    ) -> Result<(), ServiceError> {
+        let branch_ref = format!("refs/heads/{branch}");
+        if let Some(observed) = runtime.git.optional_ref_oid(&branch_ref).await? {
+            if observed != *expected {
+                return Err(ServiceError::Invariant(
+                    "Removed worktree's branch moved after preparation".into(),
+                ));
+            }
+            runtime.git.delete_source_ref(&branch_ref, expected).await?;
+        }
         Ok(())
     }
 
@@ -1827,6 +2026,7 @@ impl TollgateService {
         command_id: CommandId,
         kind: &str,
         evidence: &serde_json::Value,
+        intent_state: IntentState,
     ) -> Result<(), ServiceError> {
         let request_digest = evidence
             .get("request_digest")
@@ -1911,41 +2111,46 @@ impl TollgateService {
                 serde_json::from_value(evidence.get("expected_oid").cloned().ok_or_else(
                     || ServiceError::Invariant("worktree removal omitted OID".into()),
                 )?)?;
-            if tokio::fs::try_exists(&path).await? {
-                let observed = GitRepository::discover(&path).await?;
-                if observed.common_dir == runtime.git.common_dir
-                    && observed.current_branch().await?.as_deref() == Some(branch)
-                    && observed.resolve_oid("HEAD").await? == expected
-                {
-                    runtime.store.set_intent_state(
-                        command_id,
-                        IntentState::Canceled,
-                        &serde_json::json!({"recovery": "worktree-remove-not-applied"}),
-                    )?;
-                    return Ok(());
-                }
-                return self.mark_ambiguous_mutation_recovery(
+            if matches!(branch, USER_BRANCH | INTEGRATION_BRANCH) {
+                return self.cancel_recovery_intent(
                     runtime,
                     command_id,
-                    "worktree-remove-ambiguous",
-                    "Worktree still exists but no longer matches the prepared removal evidence"
-                        .into(),
+                    intent_state,
+                    "canceled-malformed-protected-worktree-removal",
                 );
             }
-            let branch_ref = format!("refs/heads/{branch}");
-            if let Some(observed) = runtime.git.optional_ref_oid(&branch_ref).await? {
-                if observed != expected {
+            let observation = match self
+                .observe_worktree_removal(runtime, evidence, &path, branch, &expected)
+                .await
+            {
+                Ok(observation) => observation,
+                Err(message) => {
                     return self.mark_ambiguous_mutation_recovery(
                         runtime,
                         command_id,
                         "worktree-remove-ambiguous",
-                        "Removed worktree's branch moved after the operation was prepared".into(),
+                        message,
                     );
                 }
-                runtime
-                    .git
-                    .delete_source_ref(&branch_ref, &expected)
-                    .await?;
+            };
+            if observation == WorktreeRemovalObservation::Intact {
+                return self.cancel_recovery_intent(
+                    runtime,
+                    command_id,
+                    intent_state,
+                    "worktree-remove-not-applied",
+                );
+            }
+            if let Err(error) = self
+                .finish_unregistered_worktree_branch(runtime, branch, &expected)
+                .await
+            {
+                return self.mark_ambiguous_mutation_recovery(
+                    runtime,
+                    command_id,
+                    "worktree-remove-ambiguous",
+                    error.to_string(),
+                );
             }
             let result = WorktreeOperationResult {
                 action: "removed".into(),
@@ -1953,15 +2158,21 @@ impl TollgateService {
                 branch: Some(branch.into()),
                 old_oid: Some(expected),
                 new_oid: None,
-                message: "Recovered a verified worktree removal after restart.".into(),
+                message: if observation == WorktreeRemovalObservation::Residual {
+                    "Recovered a verified Git worktree removal; unregistered residual files were preserved."
+                        .into()
+                } else {
+                    "Recovered a verified worktree removal after restart.".into()
+                },
             };
-            return self.complete_recovered_worktree_operation(
+            self.complete_recovered_worktree_operation(
                 runtime,
                 command_id,
                 kind,
                 request_digest,
                 result,
-            );
+            )?;
+            return self.clear_worktree_removal_block_if_resolved(runtime);
         }
 
         let old: GitOid =
@@ -2158,6 +2369,7 @@ impl TollgateService {
         runtime: &Arc<RepositoryRuntime>,
         command_id: CommandId,
         evidence: &serde_json::Value,
+        _intent_state: IntentState,
     ) -> Result<(), ServiceError> {
         let item_id: QueueItemId = serde_json::from_value(
             evidence
@@ -2181,20 +2393,22 @@ impl TollgateService {
                 .cloned()
                 .ok_or_else(|| ServiceError::Invariant("cleanup omitted OID".into()))?,
         )?;
-        let branch_ref = format!("refs/heads/{branch}");
-        if tokio::fs::try_exists(&path).await? {
-            let worktree = GitRepository::discover(&path).await?;
-            if worktree.common_dir != runtime.git.common_dir
-                || worktree.current_branch().await?.as_deref() != Some(branch)
-                || worktree.resolve_oid("HEAD").await? != expected_oid
-            {
+        let observation = match self
+            .observe_worktree_removal(runtime, evidence, &path, branch, &expected_oid)
+            .await
+        {
+            Ok(observation) => observation,
+            Err(message) => {
                 runtime.store.set_intent_state(
                     command_id,
                     IntentState::NeedsAttention,
-                    &serde_json::json!({"recovery": "cleanup-worktree-mismatch"}),
+                    &serde_json::json!({"recovery": "cleanup-worktree-mismatch", "message": message}),
                 )?;
                 return self.set_cleanup_attention(runtime, item_id);
             }
+        };
+        if observation == WorktreeRemovalObservation::Intact {
+            let worktree = GitRepository::discover(&path).await?;
             if let Err(error) = worktree.ensure_clean().await {
                 if matches!(error, GitError::DirtyWorktree(_)) {
                     runtime.store.set_intent_state(
@@ -2210,19 +2424,16 @@ impl TollgateService {
                 .git
                 .cleanup_linked_source_worktree(&path, branch, &expected_oid)
                 .await?;
-        } else if let Some(observed) = runtime.git.optional_ref_oid(&branch_ref).await? {
-            if observed != expected_oid {
-                runtime.store.set_intent_state(
-                    command_id,
-                    IntentState::NeedsAttention,
-                    &serde_json::json!({"recovery": "cleanup-branch-moved", "observed": observed}),
-                )?;
-                return self.set_cleanup_attention(runtime, item_id);
-            }
-            runtime
-                .git
-                .delete_source_ref(&branch_ref, &expected_oid)
-                .await?;
+        } else if let Err(error) = self
+            .finish_unregistered_worktree_branch(runtime, branch, &expected_oid)
+            .await
+        {
+            runtime.store.set_intent_state(
+                command_id,
+                IntentState::NeedsAttention,
+                &serde_json::json!({"recovery": "cleanup-branch-moved", "error": error.to_string()}),
+            )?;
+            return self.set_cleanup_attention(runtime, item_id);
         }
         self.complete_source_cleanup(runtime, item_id, command_id, evidence, Actor::Recovery)
     }
@@ -5939,17 +6150,47 @@ impl TollgateService {
     ) -> Result<WorktreeOperationResult, ServiceError> {
         let runtime = self.runtime(repository_id).await?;
         let _mutation = runtime.mutation.lock().await;
-        let path = std::fs::canonicalize(path)?;
+        let requested = PathBuf::from(path);
+        let path_identity = GitRepository::directory_identity(&requested)?;
+        let path = std::fs::canonicalize(&requested)?;
+        let registration = runtime
+            .git
+            .registered_worktree(&path)
+            .await?
+            .ok_or_else(|| {
+                ServiceError::Invariant(
+                    "requested path is not an exact registered linked worktree".into(),
+                )
+            })?;
+        let branch = registration.branch.ok_or_else(|| {
+            ServiceError::Invariant("refusing to remove a detached worktree".into())
+        })?;
+        let oid = registration.head;
+        if path == runtime.git.worktree_root
+            || matches!(branch.as_str(), USER_BRANCH | INTEGRATION_BRANCH)
+        {
+            return Err(ServiceError::Invariant(
+                "primary, master, or release worktrees cannot be removed by Tollgate".into(),
+            ));
+        }
         let worktree = GitRepository::discover(&path).await?;
+        if worktree.worktree_root != path {
+            return Err(ServiceError::Invariant(
+                "requested path only discovers an ancestor repository".into(),
+            ));
+        }
         if worktree.common_dir != runtime.git.common_dir {
             return Err(ServiceError::Invariant(
                 "worktree belongs to a different registered repository".into(),
             ));
         }
-        let branch = worktree.current_branch().await?.ok_or_else(|| {
-            ServiceError::Invariant("refusing to remove a detached worktree".into())
-        })?;
-        let oid = worktree.resolve_oid("HEAD").await?;
+        if worktree.current_branch().await?.as_deref() != Some(&branch)
+            || worktree.resolve_oid("HEAD").await? != oid
+        {
+            return Err(ServiceError::Invariant(
+                "registered worktree identity changed while preparing removal".into(),
+            ));
+        }
         if runtime.data.lock().items.iter().any(|item| {
             !item.state.is_terminal()
                 && (item.source_oid == oid
@@ -5980,6 +6221,8 @@ impl TollgateService {
                 "path": path,
                 "branch": branch,
                 "expected_oid": oid,
+                "common_dir": runtime.git.common_dir,
+                "path_identity": path_identity,
             }),
         )?;
         if !runtime
@@ -6785,6 +7028,32 @@ impl TollgateService {
                     recovery_action,
                 });
             };
+
+        let execution_healthy = state.execution_state != RepositoryExecutionState::Blocked;
+        let execution_detail = if state.block_reasons.is_empty() {
+            format!("{:?}", state.execution_state)
+        } else {
+            state
+                .block_reasons
+                .iter()
+                .map(|reason| format!("{}: {}", reason.code, reason.message))
+                .collect::<Vec<_>>()
+                .join("; ")
+        };
+        let execution_recovery = (!execution_healthy).then(|| {
+            state
+                .block_reasons
+                .iter()
+                .map(|reason| reason.recovery_action.as_str())
+                .collect::<Vec<_>>()
+                .join(" ")
+        });
+        push(
+            "Repository execution",
+            execution_healthy,
+            execution_detail,
+            execution_recovery,
+        );
 
         let integrity = runtime.store.integrity_check()?;
         let sqlite_healthy = integrity.len() == 1 && integrity[0] == "ok";
@@ -9962,6 +10231,7 @@ impl TollgateService {
             return self.replace_item(runtime, item);
         };
         let command_id = CommandId::new();
+        let path_identity = GitRepository::directory_identity(Path::new(&path)).ok();
         let request_digest = command_digest(&serde_json::json!({
             "repository_id": item.repository_id,
             "item_id": item.id,
@@ -9975,6 +10245,8 @@ impl TollgateService {
             "path": path,
             "branch": branch,
             "expected_oid": item.source_oid,
+            "common_dir": runtime.git.common_dir,
+            "path_identity": path_identity,
         });
         runtime
             .store
@@ -12321,6 +12593,464 @@ mod tests {
             .unwrap();
         assert!(matches!(slots.status, DiagnosticStatus::Healthy));
         assert_eq!(slots.detail, "1 registered slot(s) passed ownership checks");
+    }
+
+    #[tokio::test]
+    async fn doctor_reports_repository_blocks_and_their_recovery_actions() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("base.txt"), "base\n").unwrap();
+        git(&repository, &["add", "base.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+        let service = TollgateService::open(temporary.path().join("support"))
+            .await
+            .unwrap();
+        let initialized = service
+            .initialize_repository_with_options(&repository, Some("true".into()), false)
+            .await
+            .unwrap();
+        let runtime = service.runtime(initialized.state.id).await.unwrap();
+        let blocked = {
+            let mut data = runtime.data.lock();
+            data.state.execution_state = RepositoryExecutionState::Blocked;
+            data.state.block_reasons.push(BlockReason {
+                code: "worktree-remove-ambiguous".into(),
+                message: "Prepared path was replaced".into(),
+                recovery_action: "Move the replacement aside and restart Tollgate.".into(),
+            });
+            data.state.clone()
+        };
+        runtime.store.update_repository_state(&blocked).unwrap();
+
+        let report = service.doctor(initialized.state.id).await.unwrap();
+        assert!(!report.healthy);
+        let execution = report
+            .checks
+            .iter()
+            .find(|check| check.name == "Repository execution")
+            .unwrap();
+        assert!(matches!(execution.status, DiagnosticStatus::Attention));
+        assert!(execution.detail.contains("worktree-remove-ambiguous"));
+        assert_eq!(
+            execution.recovery_action.as_deref(),
+            Some("Move the replacement aside and restart Tollgate.")
+        );
+    }
+
+    #[tokio::test]
+    async fn worktree_remove_rejects_orphans_and_primary_checkout_before_preparing_intents() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("base.txt"), "base\n").unwrap();
+        git(&repository, &["add", "base.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+        let service = TollgateService::open(temporary.path().join("support"))
+            .await
+            .unwrap();
+        let initialized = service
+            .initialize_repository_with_options(&repository, Some("true".into()), false)
+            .await
+            .unwrap();
+        let orphan = repository.join(".worktrees/orphan/ui/.vite/deps");
+        std::fs::create_dir_all(&orphan).unwrap();
+        std::fs::write(orphan.join("_metadata.json"), "{}").unwrap();
+        let orphan_root = repository.join(".worktrees/orphan");
+        let orphan_command = CommandId::new();
+        let error = service
+            .remove_worktree(
+                initialized.state.id,
+                orphan_root.to_string_lossy().into_owned(),
+                orphan_command,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("not an exact registered linked worktree")
+        );
+        let primary_command = CommandId::new();
+        let error = service
+            .remove_worktree(
+                initialized.state.id,
+                repository.to_string_lossy().into_owned(),
+                primary_command,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("primary, master, or release"));
+        let store = &service.runtime(initialized.state.id).await.unwrap().store;
+        assert!(
+            store
+                .operation_evidence(orphan_command, "worktree-remove")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .operation_evidence(primary_command, "worktree-remove")
+                .unwrap()
+                .is_none()
+        );
+        assert!(orphan.join("_metadata.json").exists());
+    }
+
+    #[tokio::test]
+    async fn removal_observation_distinguishes_intact_removed_residual_and_replaced_paths() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        let feature = temporary.path().join("feature");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("base.txt"), "base\n").unwrap();
+        git(&repository, &["add", "base.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                feature.to_str().unwrap(),
+            ],
+        );
+        let service = TollgateService::open(temporary.path().join("support"))
+            .await
+            .unwrap();
+        let initialized = service
+            .initialize_repository_with_options(&repository, Some("true".into()), false)
+            .await
+            .unwrap();
+        let runtime = service.runtime(initialized.state.id).await.unwrap();
+        let source = runtime.git.resolve_oid("refs/heads/feature").await.unwrap();
+        let exact_evidence = serde_json::json!({
+            "common_dir": runtime.git.common_dir,
+            "path_identity": GitRepository::directory_identity(&feature).unwrap(),
+        });
+        assert_eq!(
+            service
+                .observe_worktree_removal(&runtime, &exact_evidence, &feature, "feature", &source,)
+                .await
+                .unwrap(),
+            WorktreeRemovalObservation::Intact
+        );
+
+        git(
+            &repository,
+            &["worktree", "remove", "--force", feature.to_str().unwrap()],
+        );
+        git(&repository, &["branch", "-D", "feature"]);
+        assert_eq!(
+            service
+                .observe_worktree_removal(&runtime, &exact_evidence, &feature, "feature", &source,)
+                .await
+                .unwrap(),
+            WorktreeRemovalObservation::Removed
+        );
+
+        std::fs::create_dir_all(feature.join("ui/.vite/deps")).unwrap();
+        std::fs::write(feature.join("ui/.vite/deps/package.json"), "{}").unwrap();
+        assert_eq!(
+            service
+                .observe_worktree_removal(
+                    &runtime,
+                    &serde_json::json!({}),
+                    &feature,
+                    "feature",
+                    &source,
+                )
+                .await
+                .unwrap(),
+            WorktreeRemovalObservation::Residual
+        );
+        let replacement = service
+            .observe_worktree_removal(&runtime, &exact_evidence, &feature, "feature", &source)
+            .await
+            .unwrap_err();
+        assert!(replacement.contains("replaced after preparation"));
+        assert!(feature.join("ui/.vite/deps/package.json").exists());
+    }
+
+    #[tokio::test]
+    async fn restart_resolves_legacy_cleanup_residual_and_malformed_master_intent_idempotently() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        let feature = repository.join(".worktrees/feature");
+        let support = temporary.path().join("support");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("base.txt"), "base\n").unwrap();
+        git(&repository, &["add", "base.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                feature.to_str().unwrap(),
+            ],
+        );
+        std::fs::write(feature.join("feature.txt"), "feature\n").unwrap();
+        git(&feature, &["add", "feature.txt"]);
+        git(&feature, &["commit", "-m", "feature"]);
+
+        let service = TollgateService::open(support.clone()).await.unwrap();
+        let initialized = service
+            .initialize_repository_with_options(&repository, Some("true".into()), false)
+            .await
+            .unwrap();
+        service.shutting_down.store(true, Ordering::Release);
+        let candidate = service
+            .submit_candidate_from(
+                initialized.state.id,
+                "HEAD".into(),
+                Some(feature.to_string_lossy().into_owned()),
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        let runtime = service.runtime(initialized.state.id).await.unwrap();
+        let mut item = runtime
+            .data
+            .lock()
+            .items
+            .iter()
+            .find(|item| item.id == candidate.item_id)
+            .cloned()
+            .unwrap();
+        item.state = QueueItemState::Promoted;
+        item.cleanup_state = CleanupState::NeedsAttention;
+        service.replace_item(&runtime, item.clone()).unwrap();
+
+        let cleanup_command = CommandId::new();
+        let cleanup_digest = "legacy-cleanup-digest";
+        runtime
+            .store
+            .prepare_operation(
+                initialized.state.id,
+                "cleanup",
+                cleanup_command,
+                &serde_json::json!({
+                    "request_digest": cleanup_digest,
+                    "item_id": item.id,
+                    "path": feature,
+                    "branch": "feature",
+                    "expected_oid": item.source_oid,
+                }),
+            )
+            .unwrap();
+        runtime
+            .store
+            .set_intent_state(
+                cleanup_command,
+                IntentState::NeedsAttention,
+                &serde_json::json!({"error": "Directory not empty"}),
+            )
+            .unwrap();
+        git(
+            &repository,
+            &["worktree", "remove", "--force", feature.to_str().unwrap()],
+        );
+        git(&repository, &["branch", "-D", "feature"]);
+        let residual = feature.join("ui/.vite/deps");
+        std::fs::create_dir_all(&residual).unwrap();
+        std::fs::write(residual.join("_metadata.json"), "{}").unwrap();
+        std::fs::write(residual.join("package.json"), "{}").unwrap();
+
+        let malformed_command = CommandId::new();
+        runtime
+            .store
+            .prepare_operation(
+                initialized.state.id,
+                "worktree-remove",
+                malformed_command,
+                &serde_json::json!({
+                    "request_digest": "malformed-master-digest",
+                    "path": feature,
+                    "branch": USER_BRANCH,
+                    "expected_oid": item.source_oid,
+                }),
+            )
+            .unwrap();
+        runtime
+            .store
+            .set_intent_state(
+                malformed_command,
+                IntentState::NeedsAttention,
+                &serde_json::json!({"recovery": "worktree-remove-ambiguous"}),
+            )
+            .unwrap();
+        let blocked = {
+            let mut data = runtime.data.lock();
+            data.state.execution_state = RepositoryExecutionState::Blocked;
+            data.state.block_reasons.push(BlockReason {
+                code: "worktree-remove-ambiguous".into(),
+                message: "Worktree still exists but no longer matches evidence".into(),
+                recovery_action: "legacy unavailable guidance".into(),
+            });
+            data.state.clone()
+        };
+        runtime.store.update_repository_state(&blocked).unwrap();
+        std::fs::write(repository.join("later.txt"), "later\n").unwrap();
+        git(&repository, &["add", "later.txt"]);
+        git(&repository, &["commit", "-m", "master advanced"]);
+        drop(runtime);
+        drop(service);
+
+        let reopened = TollgateService::open(support.clone()).await.unwrap();
+        let snapshot = reopened
+            .repository_snapshot(initialized.state.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot.state.execution_state,
+            RepositoryExecutionState::Active
+        );
+        assert!(snapshot.state.block_reasons.is_empty());
+        let recovered_item = snapshot
+            .history_items
+            .iter()
+            .find(|view| view.item.id == item.id)
+            .unwrap();
+        assert_eq!(recovered_item.item.cleanup_state, CleanupState::Completed);
+        assert!(residual.join("_metadata.json").exists());
+        let recovered_runtime = reopened.runtime(initialized.state.id).await.unwrap();
+        assert!(
+            recovered_runtime
+                .store
+                .checked_command_response::<MutationResult>(
+                    cleanup_command,
+                    "cleanup",
+                    cleanup_digest,
+                )
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            recovered_runtime
+                .store
+                .recoverable_operations(&["cleanup", "worktree-remove"])
+                .unwrap()
+                .is_empty()
+        );
+        drop(recovered_runtime);
+        drop(reopened);
+
+        let reopened_again = TollgateService::open(support).await.unwrap();
+        let second_snapshot = reopened_again
+            .repository_snapshot(initialized.state.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            second_snapshot.state.execution_state,
+            RepositoryExecutionState::Active
+        );
+        assert_eq!(
+            second_snapshot
+                .history_items
+                .iter()
+                .find(|view| view.item.id == item.id)
+                .unwrap()
+                .item
+                .cleanup_state,
+            CleanupState::Completed
+        );
+        assert!(residual.join("package.json").exists());
+    }
+
+    #[tokio::test]
+    async fn restart_blocks_when_a_prepared_worktree_path_was_replaced() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        let feature = temporary.path().join("feature");
+        let displaced = temporary.path().join("displaced-feature");
+        let support = temporary.path().join("support");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("base.txt"), "base\n").unwrap();
+        git(&repository, &["add", "base.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                feature.to_str().unwrap(),
+            ],
+        );
+        let source = GitOid::from_hex(&git(&feature, &["rev-parse", "HEAD"])).unwrap();
+
+        let service = TollgateService::open(support.clone()).await.unwrap();
+        let initialized = service
+            .initialize_repository_with_options(&repository, Some("true".into()), false)
+            .await
+            .unwrap();
+        let runtime = service.runtime(initialized.state.id).await.unwrap();
+        let command_id = CommandId::new();
+        runtime
+            .store
+            .prepare_operation(
+                initialized.state.id,
+                "worktree-remove",
+                command_id,
+                &serde_json::json!({
+                    "request_digest": "replacement-digest",
+                    "path": std::fs::canonicalize(&feature).unwrap(),
+                    "branch": "feature",
+                    "expected_oid": source,
+                    "common_dir": runtime.git.common_dir,
+                    "path_identity": GitRepository::directory_identity(&feature).unwrap(),
+                }),
+            )
+            .unwrap();
+        runtime
+            .store
+            .set_intent_state(
+                command_id,
+                IntentState::NeedsAttention,
+                &serde_json::json!({"recovery": "simulated-crash"}),
+            )
+            .unwrap();
+        std::fs::rename(&feature, &displaced).unwrap();
+        std::fs::create_dir(&feature).unwrap();
+        std::fs::write(feature.join("replacement.txt"), "preserve me\n").unwrap();
+        drop(runtime);
+        drop(service);
+
+        let reopened = TollgateService::open(support).await.unwrap();
+        let snapshot = reopened
+            .repository_snapshot(initialized.state.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot.state.execution_state,
+            RepositoryExecutionState::Blocked
+        );
+        assert!(
+            snapshot
+                .state
+                .block_reasons
+                .iter()
+                .any(|reason| reason.code == "worktree-remove-ambiguous"
+                    && reason.message.contains("identity changed"))
+        );
+        let report = reopened.doctor(initialized.state.id).await.unwrap();
+        assert!(!report.healthy);
+        assert!(feature.join("replacement.txt").exists());
+        assert!(displaced.join(".git").exists());
+        assert_eq!(
+            git(&repository, &["rev-parse", "refs/heads/feature"]),
+            source.to_hex()
+        );
     }
 
     #[tokio::test]
