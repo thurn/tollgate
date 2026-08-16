@@ -257,31 +257,13 @@ async fn main() -> anyhow::Result<()> {
                     observed_descendants
                         .extend(descendants.iter().map(ProcessIdentity::instance));
                     record_owned_process_groups(root, &descendants, &mut owned_process_groups);
-                    if let Some(escaped) = descendants
-                        .iter()
-                        .find(|process| {
-                            process.session_id != root.session_id
-                                || process.process_group != child_pid
-                                    && !owned_process_groups.contains(&process.process_group)
-                        })
+                    if let Some((escaped, diagnostic)) = descendants.iter().find_map(|process| {
+                        containment_violation(root, child_pid, process, &owned_process_groups)
+                            .map(|diagnostic| (process, diagnostic))
+                    })
                     {
                         containment_escaped = true;
-                        if escaped.session_id != root.session_id {
-                            terminate_escaped_process(escaped.pid, escaped.process_group);
-                        } else {
-                            terminate_process(escaped.pid);
-                        }
-                        let diagnostic = if escaped.session_id != root.session_id {
-                            format!(
-                                "Tollgate rejected an unsupported session escape by descendant PID {}.",
-                                escaped.pid
-                            )
-                        } else {
-                            format!(
-                                "Tollgate rejected descendant PID {} joining unrelated process group {}.",
-                                escaped.pid, escaped.process_group
-                            )
-                        };
+                        terminate_descendant(root, escaped, &owned_process_groups);
                         containment_diagnostic = Some(diagnostic.clone());
                         let diagnostic = format!("{diagnostic}\n");
                         let _ = send(&mut output, &Output::Log { nonce: nonce.clone(), stream: "stderr", payload_base64: STANDARD.encode(diagnostic) }).await;
@@ -307,29 +289,18 @@ async fn main() -> anyhow::Result<()> {
     {
         let descendants = descendants_of(&root.instance(), &processes, &observed_descendants);
         record_owned_process_groups(root, &descendants, &mut owned_process_groups);
-        let detached = descendants
+        for process in descendants
             .iter()
             .filter(|process| process.process_group != child_pid)
-            .collect::<Vec<_>>();
-        if !detached.is_empty() {
-            for process in &detached {
-                if process.session_id != root.session_id
-                    || owned_process_groups.contains(&process.process_group)
-                {
-                    terminate_escaped_process(process.pid, process.process_group);
-                } else {
-                    terminate_process(process.pid);
-                }
-            }
-            if !timed_out && !canceled {
+        {
+            let violation = containment_violation(root, child_pid, process, &owned_process_groups);
+            terminate_descendant(root, process, &owned_process_groups);
+            if !timed_out
+                && !canceled
+                && let Some(diagnostic) = violation
+            {
                 containment_escaped = true;
-                containment_diagnostic.get_or_insert_with(|| {
-                    format!(
-                        "Tollgate rejected {} supervised descendant{} that outlived the root command.",
-                        detached.len(),
-                        if detached.len() == 1 { "" } else { "s" }
-                    )
-                });
+                containment_diagnostic.get_or_insert(diagnostic);
             }
         }
     }
@@ -391,22 +362,19 @@ async fn main() -> anyhow::Result<()> {
                     observed_descendants
                         .extend(descendants.iter().map(ProcessIdentity::instance));
                     record_owned_process_groups(root, &descendants, &mut owned_process_groups);
-                    for escaped in descendants.iter().filter(|process| process.process_group != child_pid) {
-                        if escaped.session_id != root.session_id
-                            || owned_process_groups.contains(&escaped.process_group)
+                    for descendant in descendants.iter().filter(|process| process.process_group != child_pid) {
+                        let violation = containment_violation(
+                            root,
+                            child_pid,
+                            descendant,
+                            &owned_process_groups,
+                        );
+                        terminate_descendant(root, descendant, &owned_process_groups);
+                        if !timed_out && !canceled
+                            && let Some(diagnostic) = violation
                         {
-                            terminate_escaped_process(escaped.pid, escaped.process_group);
-                        } else {
-                            terminate_process(escaped.pid);
-                        }
-                        if !timed_out && !canceled {
                             containment_escaped = true;
-                            containment_diagnostic.get_or_insert_with(|| {
-                                format!(
-                                    "Tollgate rejected supervised descendant PID {} because it outlived the root command.",
-                                    escaped.pid
-                                )
-                            });
+                            containment_diagnostic.get_or_insert(diagnostic);
                         }
                     }
                 }
@@ -425,6 +393,13 @@ async fn main() -> anyhow::Result<()> {
     };
     #[cfg(not(unix))]
     let signal = None;
+    let process_group_reaped = group_is_empty(child_pid)
+        && match root_identity.as_ref() {
+            Some(root) => {
+                wait_for_supervised_descendants_to_exit(root, &observed_descendants).await
+            }
+            None => true,
+        };
     send(
         &mut output,
         &Output::Terminal {
@@ -434,7 +409,7 @@ async fn main() -> anyhow::Result<()> {
             timed_out,
             canceled,
             pipes_eof,
-            process_group_reaped: group_is_empty(child_pid),
+            process_group_reaped,
             rss_exceeded,
             containment_escaped,
             containment_diagnostic,
@@ -474,7 +449,7 @@ async fn terminate_named_pipe_holders(paths: &[PathBuf]) -> bool {
             .iter()
             .find(|process| process.pid == pid)
             .map_or(pid, |process| process.process_group);
-        terminate_escaped_process(pid, process_group);
+        terminate_process_group(pid, process_group);
     }
     escaped
 }
@@ -623,6 +598,43 @@ fn record_owned_process_groups(
     );
 }
 
+fn containment_violation(
+    root: &ProcessIdentity,
+    root_process_group: u32,
+    descendant: &ProcessIdentity,
+    owned_process_groups: &HashSet<u32>,
+) -> Option<String> {
+    if descendant.session_id != root.session_id {
+        return Some(format!(
+            "Tollgate rejected an unsupported session escape by descendant PID {}.",
+            descendant.pid
+        ));
+    }
+    if descendant.process_group != root_process_group
+        && !owned_process_groups.contains(&descendant.process_group)
+    {
+        return Some(format!(
+            "Tollgate rejected descendant PID {} joining unrelated process group {}.",
+            descendant.pid, descendant.process_group
+        ));
+    }
+    None
+}
+
+fn terminate_descendant(
+    root: &ProcessIdentity,
+    descendant: &ProcessIdentity,
+    owned_process_groups: &HashSet<u32>,
+) {
+    if descendant.session_id != root.session_id
+        || owned_process_groups.contains(&descendant.process_group)
+    {
+        terminate_process_group(descendant.pid, descendant.process_group);
+    } else {
+        terminate_process(descendant.pid);
+    }
+}
+
 fn terminate_process(pid: u32) {
     #[cfg(unix)]
     {
@@ -636,7 +648,7 @@ fn terminate_process(pid: u32) {
     }
 }
 
-fn terminate_escaped_process(pid: u32, process_group: u32) {
+fn terminate_process_group(pid: u32, process_group: u32) {
     #[cfg(unix)]
     {
         use nix::{
@@ -647,6 +659,30 @@ fn terminate_escaped_process(pid: u32, process_group: u32) {
         if let Ok(process_group) = i32::try_from(process_group) {
             let _ = killpg(Pid::from_raw(process_group), Signal::SIGKILL);
         }
+    }
+}
+
+async fn wait_for_supervised_descendants_to_exit(
+    root: &ProcessIdentity,
+    observed_descendants: &HashSet<ProcessInstance>,
+) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        while tokio::time::Instant::now() < deadline {
+            if process_table().await.is_some_and(|processes| {
+                descendants_of(&root.instance(), &processes, observed_descendants).is_empty()
+            }) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (root, observed_descendants);
+        true
     }
 }
 

@@ -140,6 +140,37 @@ fn same_session_subgroup_is_allowed_when_the_root_waits_for_it() {
 }
 
 #[test]
+fn same_session_subgroup_that_outlives_a_successful_root_is_reaped_without_failure() {
+    let temporary = tempfile::tempdir().unwrap();
+    let pid_path = temporary.path().join("subgroup.pids");
+    let script = format!(
+        "import os,time\np=os.fork()\nif p == 0:\n os.setpgid(0,0)\n member=os.fork()\n if member == 0:\n  time.sleep(30)\n  os._exit(0)\n open({:?},'w').write(f'{{os.getpid()}} {{member}}')\n time.sleep(30)\n os._exit(0)\ntime.sleep(0.3)\nos._exit(0)",
+        pid_path.to_string_lossy()
+    );
+
+    let terminal = run_worker(
+        temporary.path(),
+        "containment-successful-root-with-tail-subgroup",
+        &script,
+        5_000,
+    );
+    let subgroup_pids = std::fs::read_to_string(pid_path)
+        .unwrap()
+        .split_whitespace()
+        .map(|pid| pid.parse::<i32>().unwrap())
+        .collect::<Vec<_>>();
+
+    assert_eq!(terminal["exit_code"], 0);
+    assert_eq!(terminal["signal"], serde_json::Value::Null);
+    assert_eq!(terminal["containment_escaped"], false);
+    assert_eq!(terminal["containment_diagnostic"], serde_json::Value::Null);
+    assert_eq!(terminal["process_group_reaped"], true);
+    for pid in subgroup_pids {
+        assert_eq!(kill(Pid::from_raw(pid), None), Err(Errno::ESRCH));
+    }
+}
+
+#[test]
 fn timed_out_same_session_subgroup_is_reaped_without_a_containment_failure() {
     let temporary = tempfile::tempdir().unwrap();
     let pid_path = temporary.path().join("subgroup.pid");
