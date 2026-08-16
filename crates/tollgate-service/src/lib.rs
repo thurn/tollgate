@@ -10947,6 +10947,7 @@ impl TollgateService {
             .unwrap_or_else(|error| UserMasterSyncOutcome::NeedsAttention {
                 path: None,
                 reason: error.to_string(),
+                status_entries: Vec::new(),
             });
         let needs_attention = matches!(&outcome, UserMasterSyncOutcome::NeedsAttention { .. });
         if needs_attention {
@@ -14358,6 +14359,237 @@ policy = "clone"
         assert_eq!(
             git(&repository, &["rev-parse", USER_BRANCH_REF]),
             old_master
+        );
+    }
+
+    #[tokio::test]
+    async fn promotion_syncs_clean_master_with_unignored_registered_source_worktree() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        let remote = temporary.path().join("remote.git");
+        let candidate_worktree = repository.join(".worktrees/candidate");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("base.txt"), "base\n").unwrap();
+        git(&repository, &["add", "base.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+        git(
+            temporary.path(),
+            &["init", "--bare", remote.to_str().unwrap()],
+        );
+        git(
+            &repository,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&repository, &["push", "-u", "origin", USER_BRANCH]);
+        std::fs::create_dir(repository.join(".worktrees")).unwrap();
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "candidate",
+                candidate_worktree.to_str().unwrap(),
+                USER_BRANCH,
+            ],
+        );
+        std::fs::write(candidate_worktree.join("feature.txt"), "feature\n").unwrap();
+        git(&candidate_worktree, &["add", "feature.txt"]);
+        git(&candidate_worktree, &["commit", "-m", "feature"]);
+        assert_eq!(
+            git(&repository, &["ls-files", "--others", "--exclude-standard"]),
+            ".worktrees/candidate/"
+        );
+
+        let service = TollgateService::open(temporary.path().join("support"))
+            .await
+            .unwrap();
+        let initialized = service
+            .initialize_repository(&repository, Some("test -f feature.txt".into()))
+            .await
+            .unwrap();
+        std::fs::write(
+            repository.join(".git/tollgate/config.toml"),
+            r#"version = 1
+sync_user_master = true
+
+[remote]
+enabled = true
+name = "origin"
+branch = "master"
+
+[[step]]
+name = "ci"
+run = "test -f feature.txt"
+"#,
+        )
+        .unwrap();
+        service
+            .apply_configuration(initialized.state.id, CommandId::new())
+            .await
+            .unwrap();
+        let approved = service
+            .approve_from(
+                initialized.state.id,
+                "HEAD".into(),
+                Some(candidate_worktree.to_string_lossy().into_owned()),
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let snapshot = service
+                .repository_snapshot(initialized.state.id)
+                .await
+                .unwrap();
+            if snapshot.history_items.iter().any(|view| {
+                view.item.id == approved.item_id
+                    && view.item.cleanup_state == CleanupState::Completed
+            }) {
+                assert!(
+                    snapshot
+                        .history
+                        .iter()
+                        .any(|event| event.kind == "user-master.synchronized")
+                );
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        let promoted = approved.tested_oid.to_hex();
+        assert_eq!(git(&repository, &["rev-parse", INTEGRATION_REF]), promoted);
+        assert_eq!(git(&repository, &["rev-parse", USER_BRANCH_REF]), promoted);
+        assert_eq!(
+            git(&repository, &["ls-remote", "origin", "refs/heads/master"])
+                .split_whitespace()
+                .next()
+                .unwrap(),
+            promoted
+        );
+        assert!(!candidate_worktree.exists());
+    }
+
+    #[tokio::test]
+    async fn promotion_does_not_sync_master_over_a_genuine_untracked_user_file() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        let remote = temporary.path().join("remote.git");
+        let candidate_worktree = repository.join(".worktrees/candidate");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("base.txt"), "base\n").unwrap();
+        git(&repository, &["add", "base.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+        let old_master = git(&repository, &["rev-parse", USER_BRANCH_REF]);
+        git(
+            temporary.path(),
+            &["init", "--bare", remote.to_str().unwrap()],
+        );
+        git(
+            &repository,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&repository, &["push", "-u", "origin", USER_BRANCH]);
+        std::fs::create_dir(repository.join(".worktrees")).unwrap();
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "candidate",
+                candidate_worktree.to_str().unwrap(),
+                USER_BRANCH,
+            ],
+        );
+        std::fs::write(candidate_worktree.join("feature.txt"), "feature\n").unwrap();
+        git(&candidate_worktree, &["add", "feature.txt"]);
+        git(&candidate_worktree, &["commit", "-m", "feature"]);
+
+        let service = TollgateService::open(temporary.path().join("support"))
+            .await
+            .unwrap();
+        let initialized = service
+            .initialize_repository(&repository, Some("test -f feature.txt".into()))
+            .await
+            .unwrap();
+        std::fs::write(
+            repository.join(".git/tollgate/config.toml"),
+            r#"version = 1
+sync_user_master = true
+
+[remote]
+enabled = true
+name = "origin"
+branch = "master"
+
+[[step]]
+name = "ci"
+run = "test -f feature.txt"
+"#,
+        )
+        .unwrap();
+        service
+            .apply_configuration(initialized.state.id, CommandId::new())
+            .await
+            .unwrap();
+        std::fs::write(repository.join("user-notes.txt"), "do not overwrite\n").unwrap();
+        let approved = service
+            .approve_from(
+                initialized.state.id,
+                "HEAD".into(),
+                Some(candidate_worktree.to_string_lossy().into_owned()),
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let attention = loop {
+            let snapshot = service
+                .repository_snapshot(initialized.state.id)
+                .await
+                .unwrap();
+            if snapshot.history_items.iter().any(|view| {
+                view.item.id == approved.item_id
+                    && view.item.cleanup_state == CleanupState::Completed
+            }) {
+                break snapshot
+                    .history
+                    .iter()
+                    .find(|event| event.kind == "user-master.sync-needs-attention")
+                    .cloned()
+                    .expect("dirty master synchronization should need attention");
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        };
+
+        let promoted = approved.tested_oid.to_hex();
+        assert_eq!(git(&repository, &["rev-parse", INTEGRATION_REF]), promoted);
+        assert_eq!(
+            git(&repository, &["rev-parse", USER_BRANCH_REF]),
+            old_master
+        );
+        assert_eq!(
+            git(&repository, &["ls-remote", "origin", "refs/heads/master"])
+                .split_whitespace()
+                .next()
+                .unwrap(),
+            promoted
+        );
+        assert_eq!(
+            std::fs::read_to_string(repository.join("user-notes.txt")).unwrap(),
+            "do not overwrite\n"
+        );
+        assert_eq!(
+            attention.payload["status_entries"],
+            serde_json::json!(["untracked: user-notes.txt"])
         );
     }
 

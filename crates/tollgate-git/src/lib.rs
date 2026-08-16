@@ -1,8 +1,9 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
     io::{Seek, SeekFrom},
+    os::unix::ffi::OsStringExt,
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     process::Stdio,
@@ -131,6 +132,8 @@ pub enum UserMasterSyncOutcome {
     NeedsAttention {
         path: Option<PathBuf>,
         reason: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        status_entries: Vec<String>,
     },
 }
 
@@ -316,30 +319,45 @@ impl GitRepository {
         &self,
         requested: &Path,
     ) -> Result<Option<RegisteredWorktree>, GitError> {
-        let bytes = self.git(["worktree", "list", "--porcelain", "-z"]).await?;
+        let registrations = self.registered_worktrees().await?;
         let requested_canonical = std::fs::canonicalize(requested).ok();
+        let matches = registrations
+            .into_iter()
+            .filter(|registration| {
+                requested_canonical
+                    .as_ref()
+                    .and_then(|requested| {
+                        std::fs::canonicalize(&registration.path)
+                            .ok()
+                            .map(|registered| &registered == requested)
+                    })
+                    .unwrap_or_else(|| registration.path == requested)
+            })
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [] => Ok(None),
+            [registration] => Ok(Some(registration.clone())),
+            _ => Err(GitError::InvalidOutput(format!(
+                "path `{}` is registered as multiple worktrees",
+                requested.display()
+            ))),
+        }
+    }
+
+    async fn registered_worktrees(&self) -> Result<Vec<RegisteredWorktree>, GitError> {
+        let bytes = self.git(["worktree", "list", "--porcelain", "-z"]).await?;
         let mut path = None;
         let mut head = None;
         let mut branch = None;
-        let mut matches = Vec::new();
+        let mut registrations = Vec::new();
         for field in bytes.split(|byte| *byte == 0) {
             if field.is_empty() {
                 if let (Some(path), Some(head)) = (path.take(), head.take()) {
-                    let exact = requested_canonical
-                        .as_ref()
-                        .and_then(|requested| {
-                            std::fs::canonicalize(&path)
-                                .ok()
-                                .map(|registered| &registered == requested)
-                        })
-                        .unwrap_or_else(|| path == requested);
-                    if exact {
-                        matches.push(RegisteredWorktree {
-                            path,
-                            head,
-                            branch: branch.take(),
-                        });
-                    }
+                    registrations.push(RegisteredWorktree {
+                        path,
+                        head,
+                        branch: branch.take(),
+                    });
                 }
                 path = None;
                 head = None;
@@ -354,42 +372,70 @@ impl GitRepository {
                 branch = Some(String::from_utf8_lossy(value).into_owned());
             }
         }
-        match matches.as_slice() {
-            [] => Ok(None),
-            [registration] => Ok(Some(registration.clone())),
-            _ => Err(GitError::InvalidOutput(format!(
-                "path `{}` is registered as multiple worktrees",
-                requested.display()
-            ))),
-        }
+        Ok(registrations)
     }
 
     pub async fn ensure_clean(&self) -> Result<(), GitError> {
-        let checks = [
+        let entries = self.dirty_status_entries(false).await?;
+        if !entries.is_empty() {
+            return Err(GitError::DirtyWorktree(entries.join(", ")));
+        }
+        Ok(())
+    }
+
+    async fn dirty_status_entries(
+        &self,
+        ignore_registered_nested_worktrees: bool,
+    ) -> Result<Vec<String>, GitError> {
+        let mut entries = Vec::new();
+        for (args, label) in [
             (
-                ["diff-index", "--quiet", "HEAD", "--"].as_slice(),
-                "staged changes",
+                ["diff", "--cached", "--name-only", "-z", "HEAD", "--"].as_slice(),
+                "staged",
             ),
-            (
-                ["diff-files", "--quiet", "--"].as_slice(),
-                "tracked modifications",
-            ),
-        ];
-        for (args, label) in checks {
-            let status = self.git_status(args.iter().copied()).await?;
-            if !status.success() {
-                return Err(GitError::DirtyWorktree(label.into()));
+            (["diff", "--name-only", "-z", "--"].as_slice(), "modified"),
+        ] {
+            for path in split_git_paths(self.git(args.iter().copied()).await?) {
+                entries.push(format!("{label}: {}", path.to_string_lossy()));
             }
         }
+
+        let ignored_worktree_roots = if ignore_registered_nested_worktrees {
+            self.verified_nested_worktree_paths().await?
+        } else {
+            Vec::new()
+        };
         let untracked = self
             .git(["ls-files", "--others", "--exclude-standard", "-z"])
             .await?;
-        if !untracked.is_empty() {
-            return Err(GitError::DirtyWorktree(
-                "non-ignored untracked files".into(),
-            ));
+        for path in split_git_paths(untracked) {
+            if !ignored_worktree_roots.contains(&path) {
+                entries.push(format!("untracked: {}", path.to_string_lossy()));
+            }
         }
-        Ok(())
+        Ok(entries)
+    }
+
+    async fn verified_nested_worktree_paths(&self) -> Result<Vec<PathBuf>, GitError> {
+        let mut paths = Vec::new();
+        for registration in self.registered_worktrees().await? {
+            let Ok(canonical) = std::fs::canonicalize(&registration.path) else {
+                continue;
+            };
+            let Ok(relative) = canonical.strip_prefix(&self.worktree_root) else {
+                continue;
+            };
+            if relative.as_os_str().is_empty() || Self::directory_identity(&canonical).is_err() {
+                continue;
+            }
+            let Ok(discovered) = Self::discover(&canonical).await else {
+                continue;
+            };
+            if discovered.worktree_root == canonical && discovered.common_dir == self.common_dir {
+                paths.push(relative.to_path_buf());
+            }
+        }
+        Ok(paths)
     }
 
     pub async fn probe_approval(&self, revision: &str) -> Result<ApprovalProbe, GitError> {
@@ -1278,6 +1324,7 @@ impl GitRepository {
                 return Ok(UserMasterSyncOutcome::NeedsAttention {
                     path: None,
                     reason: format!("remote-tracking ref `{tracking_ref}` is invalid"),
+                    status_entries: Vec::new(),
                 });
             }
             let current_tracking = self.optional_ref_oid(&tracking_ref).await?;
@@ -1295,6 +1342,7 @@ impl GitRepository {
             return Ok(UserMasterSyncOutcome::NeedsAttention {
                 path,
                 reason: "local `master` does not exist".into(),
+                status_entries: Vec::new(),
             });
         };
 
@@ -1305,15 +1353,13 @@ impl GitRepository {
                     "master worktree belongs to a different repository".into(),
                 ));
             }
-            match checkout.ensure_clean().await {
-                Ok(()) => {}
-                Err(GitError::DirtyWorktree(reason)) => {
-                    return Ok(UserMasterSyncOutcome::NeedsAttention {
-                        path: Some(path.clone()),
-                        reason: format!("master worktree is dirty: {reason}"),
-                    });
-                }
-                Err(error) => return Err(error),
+            let status_entries = checkout.dirty_status_entries(true).await?;
+            if !status_entries.is_empty() {
+                return Ok(UserMasterSyncOutcome::NeedsAttention {
+                    path: Some(path.clone()),
+                    reason: "master worktree is dirty".into(),
+                    status_entries,
+                });
             }
             if checkout.current_branch().await?.as_deref() != Some(USER_BRANCH)
                 || checkout.resolve_oid("HEAD").await? != current
@@ -1321,6 +1367,7 @@ impl GitRepository {
                 return Ok(UserMasterSyncOutcome::NeedsAttention {
                     path: Some(path.clone()),
                     reason: "master worktree HEAD does not match the local master ref".into(),
+                    status_entries: Vec::new(),
                 });
             }
         }
@@ -1344,7 +1391,10 @@ impl GitRepository {
                         "projected master checkout result mismatch".into(),
                     ));
                 }
-                checkout.ensure_clean().await?;
+                let status_entries = checkout.dirty_status_entries(true).await?;
+                if !status_entries.is_empty() {
+                    return Err(GitError::DirtyWorktree(status_entries.join(", ")));
+                }
                 return Ok(UserMasterSyncOutcome::UpdatedCheckout { path });
             }
             self.git([
@@ -1369,6 +1419,7 @@ impl GitRepository {
                     current.short(),
                     tested_new.short()
                 ),
+                status_entries: Vec::new(),
             });
         }
 
@@ -1387,7 +1438,10 @@ impl GitRepository {
                     "checked-out master fast-forward result mismatch".into(),
                 ));
             }
-            checkout.ensure_clean().await?;
+            let status_entries = checkout.dirty_status_entries(true).await?;
+            if !status_entries.is_empty() {
+                return Err(GitError::DirtyWorktree(status_entries.join(", ")));
+            }
             return Ok(UserMasterSyncOutcome::UpdatedCheckout { path });
         }
 
@@ -1884,6 +1938,14 @@ async fn run_command(mut command: Command) -> Result<Vec<u8>, GitError> {
 
 fn text(bytes: Vec<u8>) -> Result<String, GitError> {
     String::from_utf8(bytes).map_err(|error| GitError::InvalidOutput(error.to_string()))
+}
+
+fn split_git_paths(bytes: Vec<u8>) -> Vec<PathBuf> {
+    bytes
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| PathBuf::from(OsString::from_vec(path.to_vec())))
+        .collect()
 }
 
 fn nul_delimited_strings(bytes: Vec<u8>) -> Vec<String> {
@@ -2459,6 +2521,9 @@ mod tests {
         git(&feature, &["commit", "-am", "promoted"]);
         let promoted = GitOid::from_hex(&git(&feature, &["rev-parse", "HEAD"])).unwrap();
         std::fs::write(repository.join("file.txt"), "local edit\n").unwrap();
+        std::fs::write(repository.join("staged.txt"), "staged\n").unwrap();
+        git(&repository, &["add", "staged.txt"]);
+        std::fs::write(repository.join("untracked.txt"), "untracked\n").unwrap();
 
         let adapter = GitRepository::discover(&feature).await.unwrap();
         let outcome = adapter
@@ -2466,15 +2531,30 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(matches!(
+        assert_eq!(
             outcome,
-            UserMasterSyncOutcome::NeedsAttention { reason, .. }
-                if reason.contains("dirty")
-        ));
+            UserMasterSyncOutcome::NeedsAttention {
+                path: Some(std::fs::canonicalize(&repository).unwrap()),
+                reason: "master worktree is dirty".into(),
+                status_entries: vec![
+                    "staged: staged.txt".into(),
+                    "modified: file.txt".into(),
+                    "untracked: untracked.txt".into(),
+                ],
+            }
+        );
         assert_eq!(git(&repository, &["rev-parse", USER_BRANCH_REF]), master);
         assert_eq!(
             std::fs::read_to_string(repository.join("file.txt")).unwrap(),
             "local edit\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repository.join("staged.txt")).unwrap(),
+            "staged\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repository.join("untracked.txt")).unwrap(),
+            "untracked\n"
         );
     }
 
