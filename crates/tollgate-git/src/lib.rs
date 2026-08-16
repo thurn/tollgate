@@ -439,19 +439,30 @@ impl GitRepository {
     }
 
     pub async fn probe_approval(&self, revision: &str) -> Result<ApprovalProbe, GitError> {
-        self.probe_revision(revision, true).await
+        self.probe_revision(revision, true, true).await
     }
 
     pub async fn probe_check(&self, revision: &str) -> Result<ApprovalProbe, GitError> {
-        self.probe_revision(revision, false).await
+        self.probe_revision(revision, false, true).await
+    }
+
+    pub async fn probe_retained_check(
+        &self,
+        source_oid: &GitOid,
+    ) -> Result<ApprovalProbe, GitError> {
+        self.probe_revision(&source_oid.to_hex(), false, false)
+            .await
     }
 
     async fn probe_revision(
         &self,
         revision: &str,
         reject_integrated: bool,
+        require_clean: bool,
     ) -> Result<ApprovalProbe, GitError> {
-        self.ensure_clean().await?;
+        if require_clean {
+            self.ensure_clean().await?;
+        }
         self.ensure_integration_not_checked_out().await?;
         let source_oid = self.resolve_oid(revision).await?;
         let integration = self.integration_oid().await?;

@@ -1051,6 +1051,7 @@ pub struct BuildsetResult {
     pub steps: Vec<(String, StepResult)>,
     pub skipped: Vec<String>,
     pub workspace_verified: bool,
+    pub workspace_verification_error: Option<String>,
 }
 
 pub async fn run_buildset(
@@ -1229,19 +1230,22 @@ pub async fn run_buildset_scheduled(
                 .get(&step.name)
                 .is_some_and(|class| *class != StepResultClass::Success)
         });
-    let workspace_verified = if !voting_failed {
+    let workspace_verification_error = if !voting_failed {
         verify_workspace(&execution.slot_root, &execution.tested_oid)
             .await
-            .is_ok()
+            .err()
+            .map(|error| error.to_string())
     } else {
-        false
+        None
     };
+    let workspace_verified = !voting_failed && workspace_verification_error.is_none();
     Ok(BuildsetResult {
         passed: !voting_failed && workspace_verified,
         passed_with_warnings: !voting_failed && workspace_verified && warning,
         steps: ordered,
         skipped,
         workspace_verified,
+        workspace_verification_error,
     })
 }
 
@@ -1312,7 +1316,7 @@ pub async fn verify_workspace(root: &Path, tested_oid: &GitOid) -> Result<(), Ru
     }
     for (args, reason) in [
         (
-            &["diff-index", "--quiet", "HEAD", "--"][..],
+            &["diff-index", "--cached", "--quiet", "HEAD", "--"][..],
             "index differs from HEAD",
         ),
         (
@@ -1469,6 +1473,72 @@ mod tests {
         assert_eq!(result.log.stdout_end, 3);
         assert_eq!(result.log.stderr_end, 3);
         assert_ne!(result.log.hash, "");
+    }
+
+    #[tokio::test]
+    async fn successful_voting_step_with_large_stderr_reports_checkout_attestation_failure() {
+        let temporary = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .current_dir(temporary.path())
+            .args(["init", "-q"])
+            .status()
+            .unwrap();
+        std::fs::write(temporary.path().join("tracked"), "original\n").unwrap();
+        std::process::Command::new("git")
+            .current_dir(temporary.path())
+            .args(["add", "tracked"])
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .current_dir(temporary.path())
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .args(["commit", "-qm", "base"])
+            .status()
+            .unwrap();
+        let oid = std::process::Command::new("git")
+            .current_dir(temporary.path())
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let config = EffectiveConfig::parse(
+            r#"version=1
+[[step]]
+name="review"
+run='''
+awk 'BEGIN { for (i = 0; i < 409600; i++) printf "x" }' >&2
+printf 'restored asset\n' > tracked
+'''
+"#,
+        )
+        .unwrap();
+
+        let result = run_buildset(
+            &config,
+            BuildsetExecution {
+                tested_oid: GitOid::from_hex(String::from_utf8_lossy(&oid.stdout).trim()).unwrap(),
+                slot_root: temporary.path().into(),
+                log_directory: temporary.path().join("logs"),
+                environment: std::env::vars().collect(),
+                context: BTreeMap::new(),
+            },
+            &[],
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.passed);
+        assert!(!result.workspace_verified);
+        assert_eq!(result.steps.len(), 1);
+        assert_eq!(result.steps[0].1.class, StepResultClass::Success);
+        assert!(result.steps[0].1.log.stderr_end >= 400_000);
+        assert_eq!(
+            result.workspace_verification_error.as_deref(),
+            Some("workspace verification failed: tracked worktree differs from index")
+        );
     }
 
     #[tokio::test]

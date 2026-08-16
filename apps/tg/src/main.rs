@@ -1857,6 +1857,9 @@ fn print_item_status(view: &QueueItemView) {
             "not complete"
         }
     );
+    if let Some(reason) = &view.item.terminal_reason {
+        println!("  reason      {reason}");
+    }
     if let Some(attribution) = &view.failure_attribution {
         println!(
             "  failure     {:?}\n  base        {}\n  environment {}",

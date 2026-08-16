@@ -535,6 +535,11 @@ struct UserMasterSyncProjection<'a> {
     remote_oid: Option<&'a GitOid>,
 }
 
+enum CheckMode {
+    Normal,
+    RetainedCold(GitOid),
+}
+
 pub struct TollgateService {
     support_root: PathBuf,
     registry_path: PathBuf,
@@ -1293,7 +1298,7 @@ impl TollgateService {
                 Some(runtime.git.worktree_root.to_string_lossy().into_owned()),
                 CommandId::new(),
                 "bootstrap".into(),
-                false,
+                CheckMode::Normal,
             )
             .await?;
         }
@@ -4246,7 +4251,7 @@ impl TollgateService {
         command_id: CommandId,
     ) -> Result<DiagnoseResult, ServiceError> {
         let runtime = self.runtime(repository_id).await?;
-        let (generation, source_oid, attribution, worktree_path) = {
+        let (generation, source_oid, attribution) = {
             let data = runtime.data.lock();
             let item = data
                 .items
@@ -4271,7 +4276,6 @@ impl TollgateService {
                 generation,
                 item.source_oid.clone(),
                 view.failure_attribution,
-                Some(runtime.git.worktree_root.to_string_lossy().into_owned()),
             )
         };
         let repair_artifact = if verify_repair {
@@ -4302,30 +4306,30 @@ impl TollgateService {
             .check_from_with_purpose(
                 repository_id,
                 generation.expected_parent_oid.to_hex(),
-                worktree_path.clone(),
+                None,
                 command_id,
                 format!("{purpose}:base"),
-                true,
+                CheckMode::RetainedCold(generation.expected_parent_oid.clone()),
             )
             .await?;
         let first = self
             .check_from_with_purpose(
                 repository_id,
                 generation.tested_oid.to_hex(),
-                worktree_path.clone(),
+                None,
                 derived_command_id(command_id, "diagnose-candidate-1"),
                 format!("{purpose}:candidate:1"),
-                true,
+                CheckMode::RetainedCold(generation.tested_oid.clone()),
             )
             .await?;
         let second = self
             .check_from_with_purpose(
                 repository_id,
                 generation.tested_oid.to_hex(),
-                worktree_path,
+                None,
                 derived_command_id(command_id, "diagnose-candidate-2"),
                 format!("{purpose}:candidate:2"),
-                true,
+                CheckMode::RetainedCold(generation.tested_oid.clone()),
             )
             .await?;
         Ok(DiagnoseResult {
@@ -5508,7 +5512,7 @@ impl TollgateService {
             worktree_path,
             command_id,
             "check".into(),
-            false,
+            CheckMode::Normal,
         )
         .await
     }
@@ -5520,12 +5524,17 @@ impl TollgateService {
         worktree_path: Option<String>,
         command_id: CommandId,
         purpose: String,
-        cold: bool,
+        mode: CheckMode,
     ) -> Result<ApproveResult, ServiceError> {
         let runtime = self.runtime(repository_id).await?;
         let _mutation = runtime.mutation.lock().await;
         let requested_revision = revision.clone();
         let requested_worktree = worktree_path.clone();
+        let retained_source_oid = match &mode {
+            CheckMode::Normal => None,
+            CheckMode::RetainedCold(source_oid) => Some(source_oid.clone()),
+        };
+        let cold = matches!(mode, CheckMode::RetainedCold(_));
         let (mut state, mut config, mut enqueue_sequence) = {
             let data = runtime.data.lock();
             if data.state.execution_state != RepositoryExecutionState::Active {
@@ -5570,7 +5579,10 @@ impl TollgateService {
             }
             None => runtime.git.clone(),
         };
-        let probe = approval_git.probe_check(&revision).await?;
+        let probe = match retained_source_oid.as_ref() {
+            Some(source_oid) => approval_git.probe_retained_check(source_oid).await?,
+            None => approval_git.probe_check(&revision).await?,
+        };
         let request_digest = command_digest(&serde_json::json!({
             "repository_id": repository_id,
             "kind": QueueItemKind::IndependentCheck,
@@ -5578,6 +5590,7 @@ impl TollgateService {
             "worktree_path": requested_worktree,
             "purpose": purpose.clone(),
             "cold": cold,
+            "retained_source_oid": retained_source_oid,
         }))?;
         if let Some(response) =
             runtime
@@ -9049,12 +9062,18 @@ impl TollgateService {
                     .transition(ItemEvent::IndependentCheckFailed)
                     .map_err(|error| ServiceError::Invariant(error.to_string()))?;
                 item.terminal_reason = Some(
-                    if bootstrap {
-                        "baseline-failing"
-                    } else {
-                        "independent-check-failed"
-                    }
-                    .into(),
+                    outcome
+                        .workspace_verification_error
+                        .as_ref()
+                        .map(|reason| format!("checkout-verification-failed: {reason}"))
+                        .unwrap_or_else(|| {
+                            if bootstrap {
+                                "baseline-failing"
+                            } else {
+                                "independent-check-failed"
+                            }
+                            .into()
+                        }),
                 );
             }
             runtime.store.update_buildset(&buildset)?;
@@ -9166,7 +9185,13 @@ impl TollgateService {
                 .state
                 .transition(ItemEvent::VotingFailed)
                 .map_err(|error| ServiceError::Invariant(error.to_string()))?;
-            item.terminal_reason = Some("voting-validation-failed".into());
+            item.terminal_reason = Some(
+                outcome
+                    .workspace_verification_error
+                    .as_ref()
+                    .map(|reason| format!("checkout-verification-failed: {reason}"))
+                    .unwrap_or_else(|| "voting-validation-failed".into()),
+            );
             conclusive_failure = true;
         }
         runtime.store.update_buildset(&buildset)?;
@@ -14015,6 +14040,113 @@ mod tests {
                 .is_none()
         );
         assert_eq!(git(&repository, &["rev-parse", USER_BRANCH_REF]), later);
+    }
+
+    #[tokio::test]
+    async fn successful_large_stderr_candidate_names_checkout_failure_and_diagnoses_dirty_checkout()
+    {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("tracked"), "base\n").unwrap();
+        git(&repository, &["add", "tracked"]);
+        git(&repository, &["commit", "-m", "base"]);
+        let service = TollgateService::open(temporary.path().join("support"))
+            .await
+            .unwrap();
+        let command = r#"awk 'BEGIN { for (i = 0; i < 409600; i++) printf "x" }' >&2; printf 'restored asset\n' > tracked"#;
+        let initialized = service
+            .initialize_repository_with_options(&repository, Some(command.into()), false)
+            .await
+            .unwrap();
+        std::fs::write(repository.join("feature"), "feature\n").unwrap();
+        git(&repository, &["add", "feature"]);
+        git(&repository, &["commit", "-m", "feature"]);
+        let candidate = service
+            .submit_candidate_from(
+                initialized.state.id,
+                "HEAD".into(),
+                Some(repository.to_string_lossy().into_owned()),
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let item = service
+                .item_status(initialized.state.id, candidate.item_id)
+                .await
+                .unwrap();
+            if item.state == QueueItemState::Failed {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "state={:?}",
+                item.state
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let details = service
+            .item_details(initialized.state.id, candidate.item_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            details.item.terminal_reason.as_deref(),
+            Some(
+                "checkout-verification-failed: workspace verification failed: tracked worktree differs from index"
+            )
+        );
+        assert!(details.certificate.is_none());
+        assert!(details.failure_attribution.is_none());
+        assert!(
+            details
+                .buildset
+                .as_ref()
+                .unwrap()
+                .step_results
+                .iter()
+                .all(|step| step.result_class == "success" && step.exit_code == Some(0))
+        );
+        assert!(details.buildset.as_ref().unwrap().step_results[0].stderr_end >= 400_000);
+
+        std::fs::write(repository.join("tracked"), "unrelated formatting edit\n").unwrap();
+        let diagnosis = service
+            .diagnose_failure(
+                initialized.state.id,
+                candidate.item_id,
+                true,
+                false,
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(diagnosis.replay_item_ids.len(), 3);
+        for replay_id in diagnosis.replay_item_ids {
+            loop {
+                let replay = service
+                    .item_status(initialized.state.id, replay_id)
+                    .await
+                    .unwrap();
+                if replay.state.is_terminal() {
+                    assert_eq!(
+                        replay.terminal_reason.as_deref(),
+                        Some(
+                            "checkout-verification-failed: workspace verification failed: tracked worktree differs from index"
+                        )
+                    );
+                    break;
+                }
+                assert!(tokio::time::Instant::now() < deadline);
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        }
+        assert_eq!(
+            std::fs::read_to_string(repository.join("tracked")).unwrap(),
+            "unrelated formatting edit\n"
+        );
     }
 
     #[tokio::test]
