@@ -212,14 +212,14 @@ The Tauri frontend calls the same `tollgate-service` handlers in-process. Tauri 
 
 ### 8.1 Layout
 
-Authoritative durable repository state is colocated with the Git common directory:
+Authoritative runtime repository state is colocated with the Git common directory. The personal policy is stored separately in the repository root so it can be managed by a local configuration overlay:
 
 | Path | Contents |
 | --- | --- |
 | `<git-common-dir>/tollgate/state.sqlite3` | Queue, buildsets, steps, events, intents, history, slots/seeds metadata, retention metadata. |
 | `<git-common-dir>/tollgate/logs/` | Append-only active logs and compressed completed logs. |
 | `<git-common-dir>/tollgate/artifacts/` | Retained run artifacts governed by their own budget. |
-| `<git-common-dir>/tollgate/config.toml` | Required trusted local repository configuration and the sole live policy source. |
+| `<repository-root>/.tollgate/config.toml` | Required trusted local repository configuration and the sole live policy source. |
 | `<git-common-dir>/tollgate/backups/` | Rolling online database backups and migration snapshots. |
 | `refs/tollgate/sources/` | Approved source-object retention refs. |
 | `refs/tollgate/tested/` | Exact tested objects copied back from the mirror while active/audited. |
@@ -524,7 +524,7 @@ The repository supervisor may begin promotion only when:
 - the repository is neither paused nor blocked;
 - the item is the active queue head;
 - its certificate passes every current validity check;
-- a synchronous re-open, parse, canonicalization, and digest of `<git-common-dir>/tollgate/config.toml` equals the certificate's frozen configuration digest; filesystem watching is never sufficient evidence for this check;
+- a synchronous re-open, parse, canonicalization, and digest of `<repository-root>/.tollgate/config.toml` equals the certificate's frozen configuration digest; filesystem watching is never sufficient evidence for this check;
 - a synchronous probe confirms that the recorded Git executable path/file identity, versioned Git-semantics profile, object format, and engine epoch still match the validation generation;
 - authoritative local `release` still equals the certificate's expected parent;
 - `release` is not checked out in any authoritative worktree;
@@ -615,7 +615,7 @@ General feature fetching, staging, committing, inspection, and pushing remain or
 
 ### 11.1 Single trusted configuration
 
-V1 has exactly one configuration file: `<git-common-dir>/tollgate/config.toml`. It is repository-local, always trusted, defines the entire pipeline and policy, and is never read from a speculative checkout. Tollgate does not interpret `.tollgate.toml` or any other committed configuration overlay.
+V1 has exactly one configuration file: `<repository-root>/.tollgate/config.toml`. It is repository-local, always trusted, defines the entire pipeline and policy, and is read only from the registered user worktree, never from a speculative checkout. Tollgate does not interpret a root `.tollgate.toml` or any other committed configuration source.
 
 The configuration may define steps, voting/final behavior, resource ceilings, integration/remote policy, cache policy, and all other runtime settings. Tollgate expands defaults and produces one canonical representation and digest. Canonicalization fixes map ordering, default expansion, normalized relative paths, duration and size units, and schema version so the same effective configuration always hashes identically.
 

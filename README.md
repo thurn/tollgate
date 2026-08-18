@@ -29,7 +29,7 @@ Launch the app and choose **Add repository**, or run:
 tg init --run './ci'
 ```
 
-Tollgate writes its trusted policy to `<git-common-dir>/tollgate/config.toml`. The smallest valid file is:
+Tollgate writes its trusted policy to `<repository-root>/.tollgate/config.toml`. The smallest valid file is:
 
 ```toml
 version = 1
@@ -39,7 +39,7 @@ name = "ci"
 run = "./ci"
 ```
 
-Initialization leaves the current checkout unchanged. Local `master` remains a normal user-owned branch that may track and push directly to `origin/master`; Tollgate creates and exclusively manages an un-checked-out local `release` branch at the same initial commit. After certification, Tollgate fast-forwards a clean, non-divergent local `master` and its checked-out files by default. Set `sync_user_master = false` in `tollgate/config.toml` to opt out. Certified pushes map local `release` to the configured remote branch, normally `master`.
+Initialization leaves the current checkout unchanged apart from creating the local `.tollgate/config.toml` policy. Local `master` remains a normal user-owned branch that may track and push directly to `origin/master`; Tollgate creates and exclusively manages an un-checked-out local `release` branch at the same initial commit. After certification, Tollgate fast-forwards a clean, non-divergent local `master` and its checked-out files by default. Set `sync_user_master = false` in `.tollgate/config.toml` to opt out. Certified pushes map local `release` to the configured remote branch, normally `master`.
 
 A direct push from local `master` is deliberately outside Tollgate certification. Its exact remote lease prevents Tollgate from overwriting that movement; run `tg pull` to adopt the new remote tip into `release` before the next certified promotion.
 

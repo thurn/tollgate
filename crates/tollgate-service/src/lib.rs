@@ -1134,7 +1134,7 @@ impl TollgateService {
     ) -> Result<(), ServiceError> {
         let runtime = self.runtime(repository_id).await?;
         let _mutation = runtime.mutation.lock().await;
-        let path = runtime.git.common_dir.join("tollgate/config.toml");
+        let path = runtime.git.worktree_root.join(".tollgate/config.toml");
         let disk = tokio::fs::read_to_string(path)
             .await
             .ok()
@@ -1224,7 +1224,23 @@ impl TollgateService {
             }
         }
         git.initialize_integration_ref_from_master().await?;
-        let config_path = tollgate_root.join("config.toml");
+        let config_root = git.worktree_root.join(".tollgate");
+        tokio::fs::create_dir_all(&config_root).await?;
+        let exclude_path = git.common_dir.join("info/exclude");
+        let mut excludes = tokio::fs::read_to_string(&exclude_path)
+            .await
+            .unwrap_or_default();
+        if !excludes.lines().any(|line| line.trim() == ".tollgate/") {
+            if !excludes.is_empty() && !excludes.ends_with('\n') {
+                excludes.push('\n');
+            }
+            excludes.push_str(".tollgate/\n");
+            if let Some(parent) = exclude_path.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            tokio::fs::write(exclude_path, excludes).await?;
+        }
+        let config_path = config_root.join("config.toml");
         if !config_path.exists() {
             let command = command.unwrap_or_else(|| detect_command(&git.worktree_root));
             let contents = format!(
@@ -1371,7 +1387,7 @@ impl TollgateService {
             Err(error) => return Err(error.into()),
         }
         let disk_config = EffectiveConfig::parse(
-            &tokio::fs::read_to_string(git.common_dir.join("tollgate/config.toml")).await?,
+            &tokio::fs::read_to_string(git.worktree_root.join(".tollgate/config.toml")).await?,
         )?;
         let config = if disk_config.digest == state.active_configuration_digest {
             if store
@@ -2164,7 +2180,7 @@ impl TollgateService {
             serde_json::from_value(evidence.get("path").cloned().ok_or_else(|| {
                 ServiceError::Invariant("config regeneration omitted path".into())
             })?)?;
-        let expected_path = runtime.git.common_dir.join("tollgate/config.toml");
+        let expected_path = runtime.git.worktree_root.join(".tollgate/config.toml");
         if path != expected_path {
             return self.mark_ambiguous_mutation_recovery(
                 runtime,
@@ -4674,7 +4690,8 @@ impl TollgateService {
             }
         }
         let config_text =
-            tokio::fs::read_to_string(runtime.git.common_dir.join("tollgate/config.toml")).await?;
+            tokio::fs::read_to_string(runtime.git.worktree_root.join(".tollgate/config.toml"))
+                .await?;
         let current_config = EffectiveConfig::parse(&config_text);
         if current_config.is_err() {
             let state = {
@@ -5084,7 +5101,8 @@ impl TollgateService {
             return Ok(response);
         }
         let disk_config = EffectiveConfig::parse(
-            &tokio::fs::read_to_string(runtime.git.common_dir.join("tollgate/config.toml")).await?,
+            &tokio::fs::read_to_string(runtime.git.worktree_root.join(".tollgate/config.toml"))
+                .await?,
         )?;
         let observed_master = runtime.git.integration_oid().await?;
         let (
@@ -5554,7 +5572,8 @@ impl TollgateService {
             )
         };
         let disk_config = EffectiveConfig::parse(
-            &tokio::fs::read_to_string(runtime.git.common_dir.join("tollgate/config.toml")).await?,
+            &tokio::fs::read_to_string(runtime.git.worktree_root.join(".tollgate/config.toml"))
+                .await?,
         )?;
         if disk_config.digest != config.digest {
             let pending = {
@@ -7229,7 +7248,7 @@ impl TollgateService {
     ) -> Result<RepositorySnapshot, ServiceError> {
         let runtime = self.runtime(repository_id).await?;
         let _mutation = runtime.mutation.lock().await;
-        let path = runtime.git.common_dir.join("tollgate/config.toml");
+        let path = runtime.git.worktree_root.join(".tollgate/config.toml");
         let candidate = EffectiveConfig::parse(&tokio::fs::read_to_string(path).await?)?;
         let active_digest = runtime.data.lock().config.digest.clone();
         let request_digest = command_digest(&serde_json::json!({
@@ -7481,7 +7500,8 @@ impl TollgateService {
     ) -> Result<EffectiveConfig, ServiceError> {
         let runtime = self.runtime(repository_id).await?;
         Ok(EffectiveConfig::parse(
-            &tokio::fs::read_to_string(runtime.git.common_dir.join("tollgate/config.toml")).await?,
+            &tokio::fs::read_to_string(runtime.git.worktree_root.join(".tollgate/config.toml"))
+                .await?,
         )?)
     }
 
@@ -7577,7 +7597,8 @@ impl TollgateService {
             }),
         );
         let config_on_disk = EffectiveConfig::parse(
-            &tokio::fs::read_to_string(runtime.git.common_dir.join("tollgate/config.toml")).await?,
+            &tokio::fs::read_to_string(runtime.git.worktree_root.join(".tollgate/config.toml"))
+                .await?,
         );
         let config_healthy = config_on_disk
             .as_ref()
@@ -7728,7 +7749,7 @@ impl TollgateService {
             toml_string(&command)
         );
         let candidate = EffectiveConfig::parse(&contents)?;
-        let path = runtime.git.common_dir.join("tollgate/config.toml");
+        let path = runtime.git.worktree_root.join(".tollgate/config.toml");
         let old_bytes = tokio::fs::read(&path).await.unwrap_or_default();
         runtime.store.prepare_operation(
             repository_id,
@@ -8580,7 +8601,8 @@ impl TollgateService {
         }
         let dispatch_guard = runtime.mutation.lock().await;
         let config_text =
-            tokio::fs::read_to_string(runtime.git.common_dir.join("tollgate/config.toml")).await?;
+            tokio::fs::read_to_string(runtime.git.worktree_root.join(".tollgate/config.toml"))
+                .await?;
         let disk_config = EffectiveConfig::parse(&config_text);
         if disk_config.is_err() {
             let state = {
@@ -10301,7 +10323,7 @@ impl TollgateService {
                 }
             }
             let disk_config = EffectiveConfig::parse(
-                &tokio::fs::read_to_string(runtime.git.common_dir.join("tollgate/config.toml"))
+                &tokio::fs::read_to_string(runtime.git.worktree_root.join(".tollgate/config.toml"))
                     .await?,
             )?;
             let observed_master = runtime.git.integration_oid().await?;
@@ -13821,7 +13843,7 @@ mod tests {
             .await
             .unwrap();
         let runtime = service.runtime(initialized.state.id).await.unwrap();
-        let path = runtime.git.common_dir.join("tollgate/config.toml");
+        let path = runtime.git.worktree_root.join(".tollgate/config.toml");
         let old_bytes = std::fs::read(&path).unwrap();
         let contents = "version = 1\n\n[[step]]\nname = \"ci\"\nrun = \"false\"\n";
         let candidate = EffectiveConfig::parse(contents).unwrap();
@@ -14260,7 +14282,7 @@ mod tests {
             RepositoryExecutionState::Active
         );
         std::fs::write(
-            repository.join(".git/tollgate/config.toml"),
+            repository.join(".tollgate/config.toml"),
             r#"version = 1
 
 [[step]]
@@ -14455,7 +14477,7 @@ policy = "clone"
             .await
             .unwrap();
         std::fs::write(
-            repository.join(".git/tollgate/config.toml"),
+            repository.join(".tollgate/config.toml"),
             "version = 1\nsync_user_master = false\n\n[[step]]\nname = \"ci\"\nrun = \"test -f feature.txt\"\n",
         )
         .unwrap();
@@ -14542,7 +14564,7 @@ policy = "clone"
             .await
             .unwrap();
         std::fs::write(
-            repository.join(".git/tollgate/config.toml"),
+            repository.join(".tollgate/config.toml"),
             r#"version = 1
 sync_user_master = true
 
@@ -14651,7 +14673,7 @@ run = "test -f feature.txt"
             .await
             .unwrap();
         std::fs::write(
-            repository.join(".git/tollgate/config.toml"),
+            repository.join(".tollgate/config.toml"),
             r#"version = 1
 sync_user_master = true
 
@@ -16140,6 +16162,7 @@ run = "test -f feature.txt"
             3,
             "bypass work must not mint replacement certificates after exact evidence restoration"
         );
+        service.shutdown().await.unwrap();
         drop(service);
         let reopened = TollgateService::open(support).await.unwrap();
         let reopened_a = reopened
