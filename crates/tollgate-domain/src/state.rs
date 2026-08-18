@@ -204,6 +204,14 @@ pub enum CleanupState {
     NeedsAttention,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CleanupPolicy {
+    #[default]
+    Automatic,
+    RetainWorktree,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

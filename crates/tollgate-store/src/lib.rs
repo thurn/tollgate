@@ -2193,7 +2193,7 @@ CREATE INDEX IF NOT EXISTS events_kind_time ON events(kind,created_at);
 mod tests {
     use super::*;
     use tollgate_domain::{
-        BlockReason, CleanupState, GitOid, ObjectFormat, QueueItemId, QueueItemKind,
+        BlockReason, CleanupPolicy, CleanupState, GitOid, ObjectFormat, QueueItemId, QueueItemKind,
         QueueItemState, RemoteState, RepositoryExecutionState, SignatureState, SourceMetadata,
         ValidationGenerationId,
     };
@@ -2400,6 +2400,7 @@ mod tests {
             terminal_reason: None,
             remote_state: RemoteState::Disabled,
             cleanup_state: CleanupState::NotEligible,
+            cleanup_policy: CleanupPolicy::Automatic,
             dependencies: Vec::new(),
             promotion_authorized: false,
             promotion_authorized_at: None,

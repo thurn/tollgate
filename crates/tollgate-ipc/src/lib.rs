@@ -239,12 +239,16 @@ pub enum IpcCommand {
         worktree_path: Option<String>,
         #[serde(default)]
         purpose: Option<String>,
+        #[serde(default)]
+        retain_worktree: bool,
         command_id: CommandId,
     },
     Candidate {
         repository_id: RepositoryId,
         revision: String,
         worktree_path: Option<String>,
+        #[serde(default)]
+        retain_worktree: bool,
         command_id: CommandId,
     },
     AuthorizeCandidate {

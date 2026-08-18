@@ -153,12 +153,12 @@ Initialization leaves the developer's checkout unchanged and creates local `rele
 
 1. The user creates or opens a feature worktree based on the gated `release` tip or an appropriate queued dependency. The primary checkout may remain on user-owned `master`.
 2. The worktree contains one source commit. Ignored build output is allowed; staged changes, tracked modifications, and non-ignored untracked files are not.
-3. `tg candidate` captures `HEAD`, validates its shape and dependencies, creates `refs/tollgate/sources/<item-id>`, durably enqueues a non-promotable item, and returns its ID. `tg approve HEAD` remains a combined submit-and-authorize convenience.
+3. `tg candidate` captures `HEAD`, validates its shape and dependencies, creates `refs/tollgate/sources/<item-id>`, durably enqueues a non-promotable item, and returns its ID. `--retain-worktree` captures an immutable retained cleanup policy for workflows that continue using the same source worktree after promotion. `tg approve HEAD` remains a combined submit-and-authorize convenience and accepts the same policy.
 4. The app constructs synthetic prefixes, assigns new validation generations to affected items, and schedules eligible buildsets.
 5. `tg approve <candidate-id>` durably grants promotion authority to that exact retained source and every active hard dependency in its retained ancestry as one queue-revision transaction. The authorized closure may temporarily bypass unrelated unauthorized items, while hard dependencies remain ahead of their dependents. Tollgate retains admission order independently from this temporary execution order. When distributed approvals make the authorized set a contiguous admission prefix before any conflicting promotion, Tollgate restores that order, cancels redundant bypass work, and reactivates only exact completed generations whose complete validation identity and certificate still match. A passing authorized head is promoted automatically, so an unrelated candidate awaiting human authority cannot indefinitely block approved work.
 6. After local promotion, or after push succeeds when push is enabled, Tollgate synchronizes user-owned local `master` under the safe default-on policy, then automatically cleans up the source worktree and branch if all safety checks still pass.
 
-Automatic cleanup requires a non-primary linked worktree that is still at the captured source OID and has no tracked, staged, or non-ignored untracked changes. Branch deletion is an old-OID compare-and-swap. Ignored files in an eligible linked worktree are disposable by default. If any check fails, cleanup becomes `needs-attention`; promotion is never rolled back. The hidden source ref retains the commit for audit.
+Automatic cleanup requires a non-primary linked worktree that is still at the captured source OID and has no tracked, staged, or non-ignored untracked changes. Branch deletion is an old-OID compare-and-swap. Ignored files in an eligible linked worktree are disposable by default. A retained-worktree candidate finishes promotion with cleanup `not-eligible`, preserving its recorded worktree and branch. Candidate authorization and retry preserve the captured cleanup policy. If any automatic cleanup check fails, cleanup becomes `needs-attention`; promotion is never rolled back. The hidden source ref retains the commit for audit.
 
 ## 7. System architecture
 
@@ -257,7 +257,7 @@ Required database policy:
 The v1 schema must represent each of these logical entities. Migrations may split an entity across tables or add indexes/materialized read models, but may not omit an entity or merge the independent state dimensions defined below into one overloaded status:
 
 - `repository_state`: repository UUID, schema/engine epoch, integration ref, current observed OIDs, queue revision, pause/block state, and active configuration digest.
-- `queue_items`: UUIDv7/short ID, source OID/ref/worktree snapshot, source metadata, enqueue order, queue-item state, terminal reason, and separate remote and cleanup states.
+- `queue_items`: UUIDv7/short ID, source OID/ref/worktree snapshot, source metadata, enqueue order, queue-item state, terminal reason, immutable cleanup policy, and separate remote and cleanup states.
 - `item_dependencies`: hard Git dependency edges.
 - `source_promotions`: permanent exact mapping from queue item/source OID to promoted synthetic OID, old `release` OID, certificate, and promotion event.
 - `validation_generations`: item, anchored base OID, ordered prefix/digest through the item, dependency inputs, prefix OIDs, configuration and step-graph digests, engine epoch, and invalidation lineage.
@@ -976,7 +976,8 @@ The initial CLI surface is:
 | --- | --- |
 | `tg init` | Register repository, create Tollgate-owned local `release` at the exact local `master` OID without changing the checkout, create the trusted local config, validate Git/shell/APFS/ref ownership, configure resources, provision a slot, and offer bootstrap CI. |
 | `tg repo add/remove/list` | Explicit registry management. Remove unregisters by default; it does not erase durable repository state. |
-| `tg approve [<rev>] [--wait]` | Capture clean immutable source, enqueue, return item ID; optionally wait. |
+| `tg candidate [<rev>] [--wait] [--retain-worktree]` | Capture clean immutable source without promotion authority; optionally wait for validation and optionally preserve the source worktree after promotion. |
+| `tg approve [<rev>] [--wait] [--retain-worktree]` | Capture clean immutable source with promotion authority, enqueue, return item ID; optionally wait. Candidate-ID authorization uses the cleanup policy captured at submission. |
 | `tg push-master [--wait\|--status]` | Rebase a clean stale local `master` range onto certified `release` when needed, authorize each linear commit oldest-first, and return after scheduling by default. While validation runs, project an unchanged clean local tip onto rebuilt speculative history whenever certified `release` advances; `--wait` additionally waits for the tail result, while read-only `--status` reports the latest durably identified master push and any failed step. |
 | `tg queue` | Ordered active queue, queue revision, per-item validation generations, dependencies, states, and prefix OIDs. |
 | `tg status [<id>]` | Repository/item/buildset/slot summary. |

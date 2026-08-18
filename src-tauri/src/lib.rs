@@ -14,7 +14,7 @@ use tauri::{Emitter, Manager};
 use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_opener::OpenerExt;
 use tokio_util::codec::Framed;
-use tollgate_domain::{BuildsetId, CommandId, QueueItemId, RepositoryId, SlotId};
+use tollgate_domain::{BuildsetId, CleanupPolicy, CommandId, QueueItemId, RepositoryId, SlotId};
 use tollgate_ipc::{
     Frame, FrameCodec, FrameKind, Handshake, HandshakeAck, IpcCommand, IpcResponse,
     MAX_CONTROL_PAYLOAD, MAX_LOG_PAYLOAD, PROTOCOL_VERSION, StructuredError,
@@ -1071,14 +1071,20 @@ async fn execute_ipc_command(service: &Service, command: IpcCommand) -> IpcRespo
                 revision,
                 worktree_path,
                 purpose,
+                retain_worktree,
                 command_id,
             } => serde_json::to_value(
                 service
-                    .approve_from_with_purpose(
+                    .approve_from_with_cleanup_policy(
                         repository_id,
                         revision,
                         worktree_path,
                         purpose,
+                        if retain_worktree {
+                            CleanupPolicy::RetainWorktree
+                        } else {
+                            CleanupPolicy::Automatic
+                        },
                         command_id,
                     )
                     .await
@@ -1089,10 +1095,21 @@ async fn execute_ipc_command(service: &Service, command: IpcCommand) -> IpcRespo
                 repository_id,
                 revision,
                 worktree_path,
+                retain_worktree,
                 command_id,
             } => serde_json::to_value(
                 service
-                    .submit_candidate_from(repository_id, revision, worktree_path, command_id)
+                    .submit_candidate_from_with_cleanup_policy(
+                        repository_id,
+                        revision,
+                        worktree_path,
+                        if retain_worktree {
+                            CleanupPolicy::RetainWorktree
+                        } else {
+                            CleanupPolicy::Automatic
+                        },
+                        command_id,
+                    )
                     .await
                     .map_err(encode_candidate_submission_error)?,
             )

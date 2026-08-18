@@ -50,6 +50,11 @@ tg candidate HEAD --wait
 tg status <candidate-id>
 ```
 
+Long-lived stacked workflows can capture an intermediate candidate with
+`tg candidate --retain-worktree HEAD`. The retained cleanup policy is immutable candidate
+metadata: authorization and retry preserve it, promotion leaves its source worktree and branch
+available, and JSON status reports `"cleanup_policy": "retain-worktree"`.
+
 In JSON mode, `tg status <candidate-id>` returns only that candidate's detailed
 status through a candidate-specific service read. Omitting the ID retains the
 repository-wide snapshot used to inspect the current speculative queue and its

@@ -2,9 +2,9 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 use crate::{
-    BuildsetId, BuildsetState, CertificateId, CleanupState, CommandId, GitOid, QueueItemId,
-    QueueItemState, RemoteState, RepositoryExecutionState, RepositoryId, SlotId, StepAttemptId,
-    StepId, ValidationGenerationId,
+    BuildsetId, BuildsetState, CertificateId, CleanupPolicy, CleanupState, CommandId, GitOid,
+    QueueItemId, QueueItemState, RemoteState, RepositoryExecutionState, RepositoryId, SlotId,
+    StepAttemptId, StepId, ValidationGenerationId,
 };
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -82,6 +82,8 @@ pub struct QueueItem {
     pub terminal_reason: Option<String>,
     pub remote_state: RemoteState,
     pub cleanup_state: CleanupState,
+    #[serde(default)]
+    pub cleanup_policy: CleanupPolicy,
     pub dependencies: Vec<QueueItemId>,
     /// Promotion authority is deliberately separate from admission to the
     /// speculative queue. Legacy persisted items default to authorized.

@@ -406,6 +406,13 @@ pub struct ApproveResult {
     pub tested_oid: GitOid,
 }
 
+struct GateSubmission {
+    purpose: Option<String>,
+    cleanup_policy: CleanupPolicy,
+    command_id: CommandId,
+    promotion_authorized: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CandidateAuthorizationResult {
     pub item_id: QueueItemId,
@@ -3885,7 +3892,10 @@ impl TollgateService {
                     ItemEvent::PromotedWithoutPush
                 })
                 .map_err(|error| ServiceError::Invariant(error.to_string()))?;
-            item.cleanup_state = CleanupState::Pending;
+            item.cleanup_state = match item.cleanup_policy {
+                CleanupPolicy::Automatic => CleanupState::Pending,
+                CleanupPolicy::RetainWorktree => CleanupState::NotEligible,
+            };
             let mut state = runtime.data.lock().state.clone();
             state.master_oid = observed_master;
             state.queue_revision += 1;
@@ -4629,13 +4639,36 @@ impl TollgateService {
         purpose: Option<String>,
         command_id: CommandId,
     ) -> Result<ApproveResult, ServiceError> {
-        self.enqueue_gate_from(
+        self.approve_from_with_cleanup_policy(
             repository_id,
             revision,
             worktree_path,
             purpose,
+            CleanupPolicy::Automatic,
             command_id,
-            true,
+        )
+        .await
+    }
+
+    pub async fn approve_from_with_cleanup_policy(
+        self: &Arc<Self>,
+        repository_id: RepositoryId,
+        revision: String,
+        worktree_path: Option<String>,
+        purpose: Option<String>,
+        cleanup_policy: CleanupPolicy,
+        command_id: CommandId,
+    ) -> Result<ApproveResult, ServiceError> {
+        self.enqueue_gate_from(
+            repository_id,
+            revision,
+            worktree_path,
+            GateSubmission {
+                purpose,
+                cleanup_policy,
+                command_id,
+                promotion_authorized: true,
+            },
         )
         .await
     }
@@ -4657,13 +4690,34 @@ impl TollgateService {
         worktree_path: Option<String>,
         command_id: CommandId,
     ) -> Result<ApproveResult, ServiceError> {
+        self.submit_candidate_from_with_cleanup_policy(
+            repository_id,
+            revision,
+            worktree_path,
+            CleanupPolicy::Automatic,
+            command_id,
+        )
+        .await
+    }
+
+    pub async fn submit_candidate_from_with_cleanup_policy(
+        self: &Arc<Self>,
+        repository_id: RepositoryId,
+        revision: String,
+        worktree_path: Option<String>,
+        cleanup_policy: CleanupPolicy,
+        command_id: CommandId,
+    ) -> Result<ApproveResult, ServiceError> {
         self.enqueue_gate_from(
             repository_id,
             revision,
             worktree_path,
-            None,
-            command_id,
-            false,
+            GateSubmission {
+                purpose: None,
+                cleanup_policy,
+                command_id,
+                promotion_authorized: false,
+            },
         )
         .await
     }
@@ -4673,10 +4727,14 @@ impl TollgateService {
         repository_id: RepositoryId,
         revision: String,
         worktree_path: Option<String>,
-        purpose: Option<String>,
-        command_id: CommandId,
-        promotion_authorized: bool,
+        submission: GateSubmission,
     ) -> Result<ApproveResult, ServiceError> {
+        let GateSubmission {
+            purpose,
+            cleanup_policy,
+            command_id,
+            promotion_authorized,
+        } = submission;
         let runtime = self.runtime(repository_id).await?;
         let _mutation = runtime.mutation.lock().await;
         let requested_revision = revision.clone();
@@ -4735,6 +4793,7 @@ impl TollgateService {
             "revision": requested_revision,
             "worktree_path": requested_worktree,
             "purpose": purpose,
+            "cleanup_policy": cleanup_policy,
             "promotion_authorized": promotion_authorized,
         }))?;
         let command_kind = if promotion_authorized {
@@ -4907,6 +4966,7 @@ impl TollgateService {
                 RemoteState::Disabled
             },
             cleanup_state: CleanupState::NotEligible,
+            cleanup_policy,
             dependencies,
             promotion_authorized,
             promotion_authorized_at: promotion_authorized.then(OffsetDateTime::now_utc),
@@ -5670,6 +5730,7 @@ impl TollgateService {
             terminal_reason: None,
             remote_state: RemoteState::Disabled,
             cleanup_state: CleanupState::NotEligible,
+            cleanup_policy: CleanupPolicy::Automatic,
             dependencies: Vec::new(),
             promotion_authorized: false,
             promotion_authorized_at: None,
@@ -6837,7 +6898,7 @@ impl TollgateService {
         {
             return Ok(response);
         }
-        let (source, kind, promotion_authorized, worktree_path, branch) = {
+        let (source, kind, promotion_authorized, cleanup_policy, worktree_path, branch) = {
             let data = runtime.data.lock();
             let item = data
                 .items
@@ -6861,6 +6922,7 @@ impl TollgateService {
                 item.source_oid.to_hex(),
                 item.kind,
                 item.promotion_authorized,
+                item.cleanup_policy,
                 item.metadata.worktree_path.clone(),
                 item.metadata.branch.clone(),
             )
@@ -6907,6 +6969,7 @@ impl TollgateService {
                     "cold": cold,
                     "source": source,
                     "kind": kind,
+                    "cleanup_policy": cleanup_policy,
                     "worktree_path": worktree_path.clone(),
                     "branch": branch.clone(),
                     "child_command_id": child_command_id,
@@ -6921,11 +6984,24 @@ impl TollgateService {
             self.check_from(repository_id, source, worktree_path, child_command_id)
                 .await
         } else if promotion_authorized {
-            self.approve_from(repository_id, source, worktree_path, child_command_id)
-                .await
+            self.approve_from_with_cleanup_policy(
+                repository_id,
+                source,
+                worktree_path,
+                None,
+                cleanup_policy,
+                child_command_id,
+            )
+            .await
         } else {
-            self.submit_candidate_from(repository_id, source, worktree_path, child_command_id)
-                .await
+            self.submit_candidate_from_with_cleanup_policy(
+                repository_id,
+                source,
+                worktree_path,
+                cleanup_policy,
+                child_command_id,
+            )
+            .await
         };
         if result.is_err() {
             runtime.cold_sources.lock().remove(&source_oid);
@@ -10646,7 +10722,10 @@ impl TollgateService {
                     ItemEvent::PromotedWithoutPush
                 })
                 .map_err(|error| ServiceError::Invariant(error.to_string()))?;
-            item.cleanup_state = CleanupState::Pending;
+            item.cleanup_state = match item.cleanup_policy {
+                CleanupPolicy::Automatic => CleanupState::Pending,
+                CleanupPolicy::RetainWorktree => CleanupState::NotEligible,
+            };
             let mut new_state = runtime.data.lock().state.clone();
             new_state.master_oid = certificate.tested_oid.clone();
             new_state.queue_revision += 1;
@@ -10739,6 +10818,10 @@ impl TollgateService {
         runtime: &Arc<RepositoryRuntime>,
         mut item: QueueItem,
     ) -> Result<(), ServiceError> {
+        if item.cleanup_policy == CleanupPolicy::RetainWorktree {
+            item.cleanup_state = CleanupState::NotEligible;
+            return self.replace_item(runtime, item);
+        }
         let Some(path) = item.metadata.worktree_path.clone() else {
             item.cleanup_state = CleanupState::NotEligible;
             return self.replace_item(runtime, item);
@@ -13572,6 +13655,108 @@ mod tests {
         assert_eq!(
             git(&repository, &["rev-parse", "refs/heads/feature"]),
             source.to_hex()
+        );
+    }
+
+    #[tokio::test]
+    async fn retained_candidate_promotes_without_cleaning_source_worktree() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        let feature = temporary.path().join("feature");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", "master"]);
+        std::fs::write(repository.join("base.txt"), "base\n").unwrap();
+        git(&repository, &["add", "base.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                feature.to_str().unwrap(),
+                "master",
+            ],
+        );
+        std::fs::write(feature.join("feature.txt"), "feature\n").unwrap();
+        git(&feature, &["add", "feature.txt"]);
+        git(&feature, &["commit", "-m", "feature"]);
+        let source = git(&feature, &["rev-parse", "HEAD"]);
+
+        let service = TollgateService::open(temporary.path().join("support"))
+            .await
+            .unwrap();
+        let initialized = service
+            .initialize_repository_with_options(
+                &repository,
+                Some("test -f feature.txt".into()),
+                false,
+            )
+            .await
+            .unwrap();
+        let candidate = service
+            .submit_candidate_from_with_cleanup_policy(
+                initialized.state.id,
+                "HEAD".into(),
+                Some(feature.to_string_lossy().into_owned()),
+                CleanupPolicy::RetainWorktree,
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let revision = loop {
+            let snapshot = service
+                .repository_snapshot(initialized.state.id)
+                .await
+                .unwrap();
+            let view = snapshot
+                .queue
+                .iter()
+                .find(|view| view.item.id == candidate.item_id)
+                .unwrap();
+            assert_eq!(view.item.cleanup_policy, CleanupPolicy::RetainWorktree);
+            if view.item.state == QueueItemState::Ready {
+                break snapshot.state.queue_revision;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        };
+        service
+            .authorize_candidate(
+                initialized.state.id,
+                candidate.item_id,
+                revision,
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+
+        loop {
+            let snapshot = service
+                .repository_snapshot(initialized.state.id)
+                .await
+                .unwrap();
+            if let Some(view) = snapshot
+                .history_items
+                .iter()
+                .find(|view| view.item.id == candidate.item_id)
+            {
+                assert_eq!(view.item.state, QueueItemState::Promoted);
+                assert_eq!(view.item.cleanup_policy, CleanupPolicy::RetainWorktree);
+                assert_eq!(view.item.cleanup_state, CleanupState::NotEligible);
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(feature.exists());
+        assert_eq!(git(&feature, &["rev-parse", "HEAD"]), source);
+        assert_eq!(
+            git(&repository, &["rev-parse", "refs/heads/feature"]),
+            source
         );
     }
 

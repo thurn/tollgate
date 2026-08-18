@@ -49,8 +49,8 @@ enum TopCommand {
     Init(InitArgs),
     #[command(subcommand)]
     Repo(RepoCommand),
-    Candidate(RevisionArgs),
-    Approve(RevisionArgs),
+    Candidate(GateRevisionArgs),
+    Approve(GateRevisionArgs),
     PushMaster(PushMasterArgs),
     Queue,
     Status {
@@ -125,6 +125,19 @@ struct RevisionArgs {
     revision: String,
     #[arg(long, help = "Wait for validation or promotion to finish")]
     wait: bool,
+}
+
+#[derive(Args)]
+struct GateRevisionArgs {
+    #[arg(
+        default_value = "HEAD",
+        help = "Git revision; `tg approve` also accepts an existing candidate ID"
+    )]
+    revision: String,
+    #[arg(long, help = "Wait for validation or promotion to finish")]
+    wait: bool,
+    #[arg(long, help = "Preserve the source worktree and branch after promotion")]
+    retain_worktree: bool,
 }
 
 #[derive(Args)]
@@ -332,6 +345,11 @@ async fn run(cli: Cli) -> anyhow::Result<u8> {
         TopCommand::Approve(args) => {
             let repository = select_repository(&mut client, cli.repository).await?;
             let candidate_id = args.revision.parse::<QueueItemId>().ok();
+            if candidate_id.is_some() && args.retain_worktree {
+                return Err(anyhow!(
+                    "--retain-worktree is captured when a candidate is submitted and cannot be changed during authorization"
+                ));
+            }
             let response = if let Some(item_id) = candidate_id {
                 client
                     .request(IpcCommand::AuthorizeCandidate {
@@ -350,6 +368,7 @@ async fn run(cli: Cli) -> anyhow::Result<u8> {
                             std::env::current_dir()?.to_string_lossy().into_owned(),
                         ),
                         purpose: None,
+                        retain_worktree: args.retain_worktree,
                         command_id: CommandId::new(),
                     })
                     .await?
@@ -421,6 +440,7 @@ async fn run(cli: Cli) -> anyhow::Result<u8> {
                     repository_id: repository.state.id,
                     revision: args.revision,
                     worktree_path: Some(std::env::current_dir()?.to_string_lossy().into_owned()),
+                    retain_worktree: args.retain_worktree,
                     command_id: CommandId::new(),
                 })
                 .await?;
@@ -1429,6 +1449,7 @@ async fn push_master(
                         revision: source_oid.to_hex(),
                         worktree_path: Some(master_worktree.to_string_lossy().into_owned()),
                         purpose: Some("push-master".into()),
+                        retain_worktree: false,
                         command_id: CommandId::new(),
                     })
                     .await?;
@@ -2156,6 +2177,28 @@ mod tests {
         };
         assert_eq!(ids, vec![id.parse().unwrap()]);
         assert!(Cli::try_parse_from(["tg", "promote", id]).is_err());
+    }
+
+    #[test]
+    fn gate_commands_capture_retain_worktree_policy() {
+        for command in ["candidate", "approve"] {
+            let parsed = Cli::try_parse_from(["tg", command, "--retain-worktree", "HEAD"]).unwrap();
+            let args = match parsed.command {
+                TopCommand::Candidate(args) | TopCommand::Approve(args) => args,
+                _ => panic!("expected a gate command"),
+            };
+            assert!(args.retain_worktree);
+            assert_eq!(args.revision, "HEAD");
+        }
+    }
+
+    #[test]
+    fn legacy_candidate_status_defaults_to_automatic_cleanup() {
+        let repository = repository_with_candidate("019ffe40-a60d-7722-a369-2635222d1203");
+        assert_eq!(
+            repository.queue[0].item.cleanup_policy,
+            tollgate_domain::CleanupPolicy::Automatic
+        );
     }
 
     #[test]
