@@ -1393,6 +1393,13 @@ async fn push_master(
         }
     }
 
+    master_git
+        .configure_user_master_upstream(
+            &repository.configuration.remote_name,
+            &repository.configuration.remote_branch,
+        )
+        .await?;
+
     let source_oids = git.unmerged_user_master_commits().await?;
     if source_oids.is_empty() {
         if json {
@@ -2145,6 +2152,8 @@ mod tests {
                 "step_graph_digest": "step-graph-digest",
                 "steps": [],
                 "remote_enabled": false,
+                "remote_name": "origin",
+                "remote_branch": "main",
                 "runner": []
             },
             "resources": {

@@ -251,6 +251,8 @@ pub struct ConfigurationView {
     pub step_graph_digest: String,
     pub steps: Vec<EffectiveStep>,
     pub remote_enabled: bool,
+    pub remote_name: String,
+    pub remote_branch: String,
     pub runner: Vec<String>,
 }
 
@@ -4146,6 +4148,8 @@ impl TollgateService {
                 step_graph_digest: data.config.step_graph_digest.clone(),
                 steps: data.config.steps.clone(),
                 remote_enabled: data.config.remote.enabled,
+                remote_name: data.config.remote.name.clone(),
+                remote_branch: data.config.remote.branch.clone(),
                 runner: data.config.runner.clone(),
             },
             resources: ResourceView {

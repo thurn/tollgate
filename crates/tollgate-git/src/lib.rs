@@ -301,6 +301,55 @@ impl GitRepository {
         }
     }
 
+    pub async fn configure_user_master_upstream(
+        &self,
+        remote: &str,
+        branch: &str,
+    ) -> Result<(), GitError> {
+        let merge_ref = format!("refs/heads/{branch}");
+        if !self
+            .git_status(["check-ref-format", &merge_ref])
+            .await?
+            .success()
+        {
+            return Err(GitError::InvalidOutput(format!(
+                "configured remote branch `{branch}` is invalid"
+            )));
+        }
+
+        self.git([
+            "config",
+            "--local",
+            "--replace-all",
+            "branch.master.remote",
+            remote,
+        ])
+        .await?;
+        self.git([
+            "config",
+            "--local",
+            "--replace-all",
+            "branch.master.merge",
+            &merge_ref,
+        ])
+        .await?;
+
+        let configured_remote = text(
+            self.git(["config", "--local", "--get", "branch.master.remote"])
+                .await?,
+        )?;
+        let configured_merge = text(
+            self.git(["config", "--local", "--get", "branch.master.merge"])
+                .await?,
+        )?;
+        if configured_remote.trim() != remote || configured_merge.trim() != merge_ref {
+            return Err(GitError::InvalidOutput(
+                "local master upstream configuration result mismatch".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn directory_identity(path: &Path) -> Result<FileIdentity, GitError> {
         let metadata = std::fs::symlink_metadata(path)?;
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
@@ -2029,6 +2078,44 @@ mod tests {
             Some(USER_BRANCH)
         );
         adapter.ensure_integration_not_checked_out().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn configures_master_to_track_the_configured_remote_branch() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("file.txt"), "base\n").unwrap();
+        git(&repository, &["add", "file.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+        git(&repository, &["remote", "add", "origin", "unused"]);
+        git(
+            &repository,
+            &["update-ref", "refs/remotes/origin/master", "HEAD"],
+        );
+        git(
+            &repository,
+            &["update-ref", "refs/remotes/origin/main", "HEAD"],
+        );
+        git(
+            &repository,
+            &["branch", "--set-upstream-to=origin/master", USER_BRANCH],
+        );
+
+        let adapter = GitRepository::discover(&repository).await.unwrap();
+        adapter
+            .configure_user_master_upstream("origin", "main")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            git(
+                &repository,
+                &["rev-parse", "--symbolic-full-name", "@{upstream}"]
+            ),
+            "refs/remotes/origin/main"
+        );
     }
 
     #[tokio::test]
