@@ -737,9 +737,12 @@ OID role, configuration digest, step-graph digest, engine epoch, and environment
 fingerprint. A base success plus candidate failure is `candidate-introduced`;
 the same failure on both is `inherited-from-base`; contradictory outcomes for
 the exact candidate are `flaky-or-non-hermetic`; incomplete or mixed evidence is
-`origin-unknown`. A diagnostic matrix may establish a new internally consistent
-environment group after restart by running the exact base once and candidate
-twice in cold slots.
+`origin-unknown`. Retained comparison is the default diagnostic policy. An
+explicit replay reuses comparable completed or in-flight work, schedules the
+exact base only when successful base evidence is missing, and adds at most one
+candidate stability probe because the original candidate failure is already
+the first observation. A changed environment fingerprint cannot be combined
+with the original evidence.
 
 Repair verification is explicit and never mutates retained source. Tollgate
 first reproduces the diagnosed failure in a disposable checkout, executes one
@@ -987,7 +990,7 @@ The initial CLI surface is:
 | `tg retry <failed-id> [--cold]` | Fresh tail enqueue of the same source OID. |
 | `tg reorder <id>...` | Preview and reorder within hard-dependency constraints. |
 | `tg check [<rev>] [--wait]` | Independent validation with no promotion. |
-| `tg diagnose <id> [--no-replay] [--verify-repair]` | Attribute a voting failure from comparable evidence; by default run a cold base/candidate/candidate matrix, and optionally verify one structured repair into an immutable patch artifact. |
+| `tg diagnose <id> [--replay] [--verify-repair]` | Attribute a voting failure from comparable retained evidence by default; explicitly probe ambiguity or flakiness with the minimum missing cold checks, and optionally verify one structured repair into an immutable patch artifact. |
 | `tg pause/resume` | Non-destructive repository gate hold. |
 | `tg pull` | Gate-aware fetch and fast-forward adoption. |
 | `tg push` | Push only contiguous certified local `release` commits to the configured remote branch with a lease. |

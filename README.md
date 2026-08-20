@@ -112,10 +112,13 @@ evidence already exists. Tollgate reports `candidate-introduced`,
 is valid only when the frozen configuration, step graph, engine epoch, and tool
 environment match.
 
-Run `tg diagnose <candidate-id>` for a stronger experiment. Tollgate checks the
-exact anchored base once and the exact tested candidate twice in cold,
-disposable slots, then recomputes attribution from those runs. `--no-replay`
-shows retained evidence without scheduling work.
+Run `tg diagnose <candidate-id>` to attribute the failure immediately from
+retained evidence with the same tested OID, configuration digest, step-graph
+digest, engine epoch, and environment fingerprint. This is the default and does
+not schedule queue work. Add `--replay` when ambiguity or suspected flakiness
+justifies another experiment. Tollgate reuses matching retained or in-flight
+checks, runs one candidate stability probe, and checks the exact anchored base
+only when comparable base evidence is missing.
 
 A step may publish structured diagnostics by writing one JSON object per line
 to the read-only `TOLLGATE_DIAGNOSTICS_FILE` environment variable:

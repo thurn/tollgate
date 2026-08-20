@@ -227,6 +227,12 @@ pub struct DiagnoseResult {
     #[serde(default)]
     pub replay_item_ids: Vec<QueueItemId>,
     #[serde(default)]
+    pub scheduled_replay_item_ids: Vec<QueueItemId>,
+    #[serde(default)]
+    pub reused_replay_item_ids: Vec<QueueItemId>,
+    #[serde(default)]
+    pub replay_reasons: Vec<String>,
+    #[serde(default)]
     pub repair_artifact: Option<RepairArtifact>,
 }
 
@@ -530,6 +536,7 @@ struct RepositoryRuntime {
     events: broadcast::Sender<DomainEvent>,
     cancellations: Mutex<HashMap<QueueItemId, CancellationToken>>,
     mutation: tokio::sync::Mutex<()>,
+    diagnosis: tokio::sync::Mutex<()>,
     execution_permits: RwLock<Arc<Semaphore>>,
     scheduler_epoch: AtomicU64,
     dispatching: Mutex<HashSet<QueueItemId>>,
@@ -589,7 +596,8 @@ fn failure_attribution(
         data.buildsets
             .iter()
             .filter(|candidate| {
-                &candidate.tested_oid == tested_oid
+                candidate.state.is_terminal()
+                    && &candidate.tested_oid == tested_oid
                     && candidate.environment_fingerprint == environment_fingerprint
                     && data
                         .generations
@@ -602,6 +610,14 @@ fn failure_attribution(
                         })
             })
             .collect::<Vec<_>>()
+    };
+    let has_trusted_success = |candidate: &Buildset| {
+        data.certificates
+            .iter()
+            .any(|certificate| certificate.buildset_id == candidate.id)
+            || data.items.iter().any(|item| {
+                item.id == candidate.item_id && item.state == QueueItemState::CheckPassed
+            })
     };
     let diagnosis_prefix = format!("diagnose:{}:", generation.item_id);
     let latest_matrix = data
@@ -692,16 +708,18 @@ fn failure_attribution(
     let mut steps = Vec::with_capacity(failed.len());
     for result in failed {
         let has_candidate_success = candidate_replays.iter().any(|candidate| {
-            candidate
-                .step_results
-                .iter()
-                .any(|entry| entry.name == result.name && entry.result_class == "success")
+            has_trusted_success(candidate)
+                && candidate
+                    .step_results
+                    .iter()
+                    .any(|entry| entry.name == result.name && entry.result_class == "success")
         });
         let baseline = baseline_buildsets.iter().rev().find_map(|candidate| {
             candidate
                 .step_results
                 .iter()
                 .find(|entry| entry.name == result.name)
+                .filter(|entry| entry.result_class != "success" || has_trusted_success(candidate))
                 .map(|entry| (*candidate, entry))
         });
         let origin = if has_candidate_success {
@@ -4014,6 +4032,7 @@ impl TollgateService {
             events,
             cancellations: Mutex::new(HashMap::new()),
             mutation: tokio::sync::Mutex::new(()),
+            diagnosis: tokio::sync::Mutex::new(()),
             execution_permits: RwLock::new(Arc::new(Semaphore::new(repository_limit))),
             scheduler_epoch: AtomicU64::new(0),
             dispatching: Mutex::new(HashSet::new()),
@@ -4281,7 +4300,7 @@ impl TollgateService {
         command_id: CommandId,
     ) -> Result<DiagnoseResult, ServiceError> {
         let runtime = self.runtime(repository_id).await?;
-        let (generation, source_oid, attribution) = {
+        let (generation, buildset, source_oid, attribution) = {
             let data = runtime.data.lock();
             let item = data
                 .items
@@ -4294,6 +4313,7 @@ impl TollgateService {
                     "diagnosis requires a prepared validation generation".into(),
                 )
             })?;
+            let buildset = view.buildset;
             if (replay || verify_repair)
                 && (generation.configuration_digest != data.config.digest
                     || generation.step_graph_digest != data.config.step_graph_digest)
@@ -4304,6 +4324,7 @@ impl TollgateService {
             }
             (
                 generation,
+                buildset,
                 item.source_oid.clone(),
                 view.failure_attribution,
             )
@@ -4327,45 +4348,180 @@ impl TollgateService {
                 item_id,
                 attribution,
                 replay_item_ids: Vec::new(),
+                scheduled_replay_item_ids: Vec::new(),
+                reused_replay_item_ids: Vec::new(),
+                replay_reasons: vec![
+                    "retained comparable evidence selected; no full-gate execution scheduled"
+                        .into(),
+                ],
                 repair_artifact,
             });
         }
 
-        let purpose = format!("diagnose:{item_id}:{command_id}");
-        let baseline = self
-            .check_from_with_purpose(
-                repository_id,
-                generation.expected_parent_oid.to_hex(),
-                None,
-                command_id,
-                format!("{purpose}:base"),
-                CheckMode::RetainedCold(generation.expected_parent_oid.clone()),
+        let buildset = buildset.ok_or_else(|| {
+            ServiceError::Invariant("diagnostic replay requires retained buildset evidence".into())
+        })?;
+        let _diagnosis = runtime.diagnosis.lock().await;
+        let environment = self.environment.read().await.clone();
+        if environment.fingerprint != buildset.environment_fingerprint {
+            return Err(ServiceError::Invariant(
+                "the active environment changed; replay evidence would not be comparable to the original failure".into(),
+            ));
+        }
+
+        let (base_retained, candidate_probe_retained, base_in_flight, candidate_in_flight) = {
+            let data = runtime.data.lock();
+            let failed_steps = buildset
+                .step_results
+                .iter()
+                .filter(|result| result.result_class != "success")
+                .map(|result| result.name.as_str())
+                .collect::<Vec<_>>();
+            let comparable = |candidate: &Buildset, tested_oid: &GitOid| {
+                candidate.tested_oid == *tested_oid
+                    && candidate.environment_fingerprint == buildset.environment_fingerprint
+                    && data
+                        .generations
+                        .iter()
+                        .find(|entry| entry.id == candidate.validation_generation_id)
+                        .is_some_and(|entry| {
+                            entry.configuration_digest == generation.configuration_digest
+                                && entry.step_graph_digest == generation.step_graph_digest
+                                && entry.engine_epoch == generation.engine_epoch
+                        })
+            };
+            let has_results = |candidate: &Buildset, expected: &str| {
+                candidate.state.is_terminal()
+                    && failed_steps.iter().all(|name| {
+                        candidate
+                            .step_results
+                            .iter()
+                            .any(|result| result.name == *name && result.result_class == expected)
+                    })
+            };
+            let has_trusted_success = |candidate: &Buildset| {
+                data.certificates
+                    .iter()
+                    .any(|certificate| certificate.buildset_id == candidate.id)
+                    || data.items.iter().any(|item| {
+                        item.id == candidate.item_id && item.state == QueueItemState::CheckPassed
+                    })
+            };
+            let base_retained = data.buildsets.iter().any(|candidate| {
+                comparable(candidate, &generation.expected_parent_oid)
+                    && has_results(candidate, "success")
+                    && has_trusted_success(candidate)
+            });
+            let candidate_probe_retained = data.buildsets.iter().any(|candidate| {
+                candidate.id != buildset.id
+                    && comparable(candidate, &generation.tested_oid)
+                    && candidate.state.is_terminal()
+                    && failed_steps.iter().all(|name| {
+                        candidate.step_results.iter().any(|result| {
+                            result.name == *name
+                                && result.result_class != "skipped"
+                                && (result.result_class != "success"
+                                    || has_trusted_success(candidate))
+                        })
+                    })
+            });
+            let in_flight = |tested_oid: &GitOid| {
+                data.items.iter().find_map(|item| {
+                    if item.id == item_id || item.state.is_terminal() {
+                        return None;
+                    }
+                    let replay_generation = item
+                        .current_generation_id
+                        .and_then(|id| data.generations.iter().find(|entry| entry.id == id))?;
+                    let inputs_match = replay_generation.tested_oid == *tested_oid
+                        && replay_generation.configuration_digest
+                            == generation.configuration_digest
+                        && replay_generation.step_graph_digest == generation.step_graph_digest
+                        && replay_generation.engine_epoch == generation.engine_epoch;
+                    let environment_matches = item.buildset_id.is_none_or(|id| {
+                        data.buildsets
+                            .iter()
+                            .find(|entry| entry.id == id)
+                            .is_some_and(|entry| {
+                                entry.environment_fingerprint == buildset.environment_fingerprint
+                            })
+                    });
+                    (inputs_match && environment_matches).then_some(item.id)
+                })
+            };
+            (
+                base_retained,
+                candidate_probe_retained,
+                in_flight(&generation.expected_parent_oid),
+                in_flight(&generation.tested_oid),
             )
-            .await?;
-        let first = self
-            .check_from_with_purpose(
-                repository_id,
-                generation.tested_oid.to_hex(),
-                None,
-                derived_command_id(command_id, "diagnose-candidate-1"),
-                format!("{purpose}:candidate:1"),
-                CheckMode::RetainedCold(generation.tested_oid.clone()),
-            )
-            .await?;
-        let second = self
-            .check_from_with_purpose(
-                repository_id,
-                generation.tested_oid.to_hex(),
-                None,
-                derived_command_id(command_id, "diagnose-candidate-2"),
-                format!("{purpose}:candidate:2"),
-                CheckMode::RetainedCold(generation.tested_oid.clone()),
-            )
-            .await?;
+        };
+
+        let mut replay_item_ids = Vec::new();
+        let mut scheduled_replay_item_ids = Vec::new();
+        let mut reused_replay_item_ids = Vec::new();
+        let mut replay_reasons = Vec::new();
+        if base_retained {
+            replay_reasons.push(
+                "base replay omitted: a matching successful base buildset is retained".into(),
+            );
+        } else if let Some(existing) = base_in_flight {
+            replay_item_ids.push(existing);
+            reused_replay_item_ids.push(existing);
+            replay_reasons.push(format!(
+                "base replay coalesced with matching in-flight check {existing}"
+            ));
+        } else {
+            let baseline = self
+                .check_from_with_purpose(
+                    repository_id,
+                    generation.expected_parent_oid.to_hex(),
+                    None,
+                    command_id,
+                    format!("diagnose:{item_id}:base"),
+                    CheckMode::RetainedCold(generation.expected_parent_oid.clone()),
+                )
+                .await?;
+            replay_item_ids.push(baseline.item_id);
+            scheduled_replay_item_ids.push(baseline.item_id);
+            replay_reasons.push(
+                "base replay scheduled: no comparable successful base evidence exists".into(),
+            );
+        }
+        if candidate_probe_retained {
+            replay_reasons.push(
+                "candidate replay omitted: a matching repeat candidate result is retained".into(),
+            );
+        } else if let Some(existing) = candidate_in_flight {
+            replay_item_ids.push(existing);
+            reused_replay_item_ids.push(existing);
+            replay_reasons.push(format!(
+                "candidate stability probe coalesced with matching in-flight check {existing}"
+            ));
+        } else {
+            let candidate = self
+                .check_from_with_purpose(
+                    repository_id,
+                    generation.tested_oid.to_hex(),
+                    None,
+                    derived_command_id(command_id, "diagnose-candidate-stability"),
+                    format!("diagnose:{item_id}:candidate"),
+                    CheckMode::RetainedCold(generation.tested_oid.clone()),
+                )
+                .await?;
+            replay_item_ids.push(candidate.item_id);
+            scheduled_replay_item_ids.push(candidate.item_id);
+            replay_reasons.push(
+                "candidate stability probe scheduled: only the original failure is retained".into(),
+            );
+        }
         Ok(DiagnoseResult {
             item_id,
             attribution,
-            replay_item_ids: vec![baseline.item_id, first.item_id, second.item_id],
+            replay_item_ids,
+            scheduled_replay_item_ids,
+            reused_replay_item_ids,
+            replay_reasons,
             repair_artifact,
         })
     }
@@ -14334,7 +14490,8 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(diagnosis.replay_item_ids.len(), 3);
+        assert_eq!(diagnosis.replay_item_ids.len(), 2);
+        assert_eq!(diagnosis.scheduled_replay_item_ids.len(), 2);
         for replay_id in diagnosis.replay_item_ids {
             loop {
                 let replay = service
@@ -15236,7 +15393,7 @@ run = "test -f feature.txt"
         let service = TollgateService::open(temporary.path().join("support"))
             .await
             .unwrap();
-        let command = r#"if test -f broken; then printf '%s\n' '{"code":"generated-output-drift","message":"generated state is stale","paths":["broken"],"repair":{"kind":"argv","argv":["rm","broken"]}}' > "$TOLLGATE_DIAGNOSTICS_FILE"; exit 1; fi"#;
+        let command = r#"if test -f broken; then printf '%s\n' '{"code":"generated-output-drift","message":"generated state is stale","paths":["broken"],"repair":{"kind":"argv","argv":["rm","broken"]}}' > "$TOLLGATE_DIAGNOSTICS_FILE"; sleep 1; exit 1; fi"#;
         let initialized = service
             .initialize_repository_with_options(&repository, Some(command.into()), false)
             .await
@@ -15307,6 +15464,22 @@ run = "test -f feature.txt"
             attribution.steps[0].diagnostics[0].code,
             "generated-output-drift"
         );
+        let retained = service
+            .diagnose_failure(
+                initialized.state.id,
+                candidate.item_id,
+                false,
+                false,
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            retained.attribution.unwrap().origin,
+            FailureOrigin::CandidateIntroduced
+        );
+        assert!(retained.replay_item_ids.is_empty());
+        assert!(retained.scheduled_replay_item_ids.is_empty());
 
         let repair = service
             .diagnose_failure(
@@ -15348,7 +15521,27 @@ run = "test -f feature.txt"
             )
             .await
             .unwrap();
-        assert_eq!(matrix.replay_item_ids.len(), 3);
+        assert_eq!(matrix.replay_item_ids.len(), 1);
+        assert_eq!(matrix.scheduled_replay_item_ids.len(), 1);
+        assert!(
+            matrix
+                .replay_reasons
+                .iter()
+                .any(|reason| reason.contains("base replay omitted"))
+        );
+        let coalesced = service
+            .diagnose_failure(
+                initialized.state.id,
+                candidate.item_id,
+                true,
+                false,
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        assert!(coalesced.scheduled_replay_item_ids.is_empty());
+        assert_eq!(coalesced.replay_item_ids, matrix.replay_item_ids);
+        assert_eq!(coalesced.reused_replay_item_ids, matrix.replay_item_ids);
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
         for replay_id in &matrix.replay_item_ids {
             loop {
@@ -15510,7 +15703,8 @@ run = "test -f feature.txt"
             )
             .await
             .unwrap();
-        assert_eq!(matrix.replay_item_ids.len(), 3);
+        assert_eq!(matrix.replay_item_ids.len(), 1);
+        assert_eq!(matrix.scheduled_replay_item_ids.len(), 1);
         for replay_id in &matrix.replay_item_ids {
             loop {
                 let item = service

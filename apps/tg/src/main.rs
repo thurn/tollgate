@@ -143,7 +143,17 @@ struct GateRevisionArgs {
 #[derive(Args)]
 struct DiagnoseArgs {
     id: QueueItemId,
-    #[arg(long, help = "Use retained evidence without scheduling clean replays")]
+    #[arg(
+        long,
+        conflicts_with = "no_replay",
+        help = "Run the minimum clean checks needed to probe ambiguity or flakiness"
+    )]
+    replay: bool,
+    #[arg(
+        long,
+        hide = true,
+        help = "Deprecated compatibility alias; retained evidence is now the default"
+    )]
     no_replay: bool,
     #[arg(
         long,
@@ -511,24 +521,45 @@ async fn run(cli: Cli) -> anyhow::Result<u8> {
         }
         TopCommand::Diagnose(args) => {
             let repository = select_repository(&mut client, cli.repository).await?;
+            if args.replay && !cli.json {
+                println!(
+                    "Replay requested. Tollgate will reuse matching retained or in-flight evidence, schedule the exact base only if its successful evidence is missing, and run at most one candidate stability probe. Any new full-gate checks join the repository queue."
+                );
+            }
             let mut diagnosis: DiagnoseResult = serde_json::from_value(
                 client
                     .request(IpcCommand::Diagnose {
                         repository_id: repository.state.id,
                         item_id: args.id,
-                        replay: !args.no_replay,
+                        replay: args.replay,
                         verify_repair: args.verify_repair,
                         command_id: CommandId::new(),
                     })
                     .await?,
             )?;
-            if !diagnosis.replay_item_ids.is_empty() {
-                let repair_artifact = diagnosis.repair_artifact.clone();
-                if !cli.json {
+            if args.replay && !cli.json {
+                println!(
+                    "Diagnostic replay plan: {} new full-gate execution(s), {} matching in-flight check(s) reused.",
+                    diagnosis.scheduled_replay_item_ids.len(),
+                    diagnosis.reused_replay_item_ids.len(),
+                );
+                for reason in &diagnosis.replay_reasons {
+                    println!("  {reason}");
+                }
+                if diagnosis.scheduled_replay_item_ids.is_empty() {
+                    println!("  Queue impact: none; no new check was enqueued.");
+                } else {
                     println!(
-                        "Running clean diagnostic matrix for base and candidate (candidate twice)…"
+                        "  Queue impact: {} independent check(s) join existing repository work and may wait behind it.",
+                        diagnosis.scheduled_replay_item_ids.len()
                     );
                 }
+            }
+            if !diagnosis.replay_item_ids.is_empty() {
+                let repair_artifact = diagnosis.repair_artifact.clone();
+                let scheduled_replay_item_ids = diagnosis.scheduled_replay_item_ids.clone();
+                let reused_replay_item_ids = diagnosis.reused_replay_item_ids.clone();
+                let replay_reasons = diagnosis.replay_reasons.clone();
                 wait_for_terminal_checks(
                     &mut client,
                     repository.state.id,
@@ -547,6 +578,9 @@ async fn run(cli: Cli) -> anyhow::Result<u8> {
                         .await?,
                 )?;
                 diagnosis.repair_artifact = repair_artifact;
+                diagnosis.scheduled_replay_item_ids = scheduled_replay_item_ids;
+                diagnosis.reused_replay_item_ids = reused_replay_item_ids;
+                diagnosis.replay_reasons = replay_reasons;
             }
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&diagnosis)?);
@@ -1971,22 +2005,45 @@ fn print_diagnosis(diagnosis: &DiagnoseResult) {
         return;
     };
     println!(
-        "Failure origin: {:?}\n  candidate   {}\n  base        {}\n  config      {}\n  environment {}",
+        "Failure origin: {:?}\n  confidence  {}\n  executions  {} new full gate(s), {} in-flight gate(s) reused\n  queue       {}\n  candidate   {} (buildset {})\n  base        {}\n  config      {}\n  graph       {}\n  environment {}",
         attribution.origin,
+        match attribution.origin {
+            tollgate_service::FailureOrigin::FlakyOrNonHermetic =>
+                "contradictory exact candidate results observed",
+            tollgate_service::FailureOrigin::OriginUnknown =>
+                "insufficient comparable evidence; use --replay for another experiment",
+            _ if diagnosis.scheduled_replay_item_ids.is_empty()
+                && diagnosis.reused_replay_item_ids.is_empty() =>
+                "comparable retained evidence; candidate stability was not replayed",
+            _ => "replay-augmented comparable evidence",
+        },
+        diagnosis.scheduled_replay_item_ids.len(),
+        diagnosis.reused_replay_item_ids.len(),
+        if diagnosis.scheduled_replay_item_ids.is_empty() {
+            "no new work"
+        } else {
+            "new checks may wait behind existing repository work"
+        },
         attribution.candidate_tested_oid.short(),
+        attribution.candidate_buildset_id,
         attribution.base_oid.short(),
         &attribution.configuration_digest[..12],
+        &attribution.step_graph_digest[..12],
         &attribution.environment_fingerprint[..12],
     );
     for step in &attribution.steps {
         println!(
-            "  {}: {:?} (candidate {}, base {})",
+            "  {}: {:?} (candidate {}, base {}, base buildset {})",
             step.name,
             step.origin,
             step.candidate_result,
             step.baseline_result
                 .as_deref()
-                .unwrap_or("no comparable run")
+                .unwrap_or("no comparable run"),
+            step.baseline_buildset_id
+                .map(|id| id.to_string())
+                .as_deref()
+                .unwrap_or("none"),
         );
         for diagnostic in &step.diagnostics {
             println!("    [{}] {}", diagnostic.code, diagnostic.message);
@@ -2232,15 +2289,24 @@ mod tests {
     }
 
     #[test]
-    fn diagnose_replays_by_default_and_accepts_explicit_repair_verification() {
+    fn diagnose_uses_retained_evidence_by_default_and_accepts_explicit_replay() {
         let id = "019ffe40-a60d-7722-a369-2635222d1203";
         let parsed = Cli::try_parse_from(["tg", "diagnose", id, "--verify-repair"]).unwrap();
         let TopCommand::Diagnose(args) = parsed.command else {
             panic!("diagnose did not parse");
         };
         assert_eq!(args.id, id.parse().unwrap());
+        assert!(!args.replay);
         assert!(!args.no_replay);
         assert!(args.verify_repair);
+
+        let parsed = Cli::try_parse_from(["tg", "diagnose", id, "--replay"]).unwrap();
+        let TopCommand::Diagnose(args) = parsed.command else {
+            panic!("diagnose did not parse");
+        };
+        assert!(args.replay);
+        assert!(!args.no_replay);
+        assert!(Cli::try_parse_from(["tg", "diagnose", id, "--replay", "--no-replay"]).is_err());
     }
 
     #[test]
