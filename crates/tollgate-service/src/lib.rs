@@ -549,6 +549,7 @@ struct UserMasterSyncProjection<'a> {
     tested_oid: &'a GitOid,
     replace_tip: Option<&'a GitOid>,
     remote_oid: Option<&'a GitOid>,
+    rebase_unsubmitted: bool,
 }
 
 enum CheckMode {
@@ -1594,6 +1595,10 @@ impl TollgateService {
                     } else {
                         Some(tested_oid.clone())
                     };
+                    let rebase_unsubmitted = evidence
+                        .get("rebase_unsubmitted")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
                     self.complete_user_master_sync(
                         runtime,
                         command_id,
@@ -1603,6 +1608,7 @@ impl TollgateService {
                             tested_oid: &tested_oid,
                             replace_tip: replace_tip.as_ref(),
                             remote_oid: remote_oid.as_ref(),
+                            rebase_unsubmitted,
                         },
                         Actor::Recovery,
                     )
@@ -11053,13 +11059,13 @@ impl TollgateService {
         actor: Actor,
     ) -> Result<UserMasterSyncOutcome, ServiceError> {
         let projection = self.active_user_master_projection(runtime).await?;
-        let (tested_oid, replace_tip) =
+        let (tested_oid, replace_tip, rebase_unsubmitted) =
             if let Some((_, generation_id, target, current)) = projection {
                 runtime
                     .git
                     .retain_projected_object(&runtime.mirror, &generation_id.to_string(), &target)
                     .await?;
-                (target, Some(current))
+                (target, Some(current), false)
             } else {
                 let replace_tip = item_id.and_then(|id| {
                     runtime
@@ -11072,7 +11078,12 @@ impl TollgateService {
                         })
                         .map(|item| item.source_oid.clone())
                 });
-                (certified_oid.clone(), replace_tip)
+                let has_active_user_master = runtime.data.lock().items.iter().any(|item| {
+                    is_rebuildable_gate_state(item.state)
+                        && item.metadata.branch.as_deref() == Some(USER_BRANCH)
+                });
+                let rebase_unsubmitted = replace_tip.is_none() && !has_active_user_master;
+                (certified_oid.clone(), replace_tip, rebase_unsubmitted)
             };
         self.sync_user_master_operation(
             runtime,
@@ -11080,6 +11091,7 @@ impl TollgateService {
             &tested_oid,
             replace_tip.as_ref(),
             Some(certified_oid),
+            rebase_unsubmitted,
             actor,
         )
         .await
@@ -11112,6 +11124,7 @@ impl TollgateService {
                 &tested_oid,
                 Some(&replace_tip),
                 None,
+                false,
                 actor,
             )
             .await?;
@@ -11165,6 +11178,7 @@ impl TollgateService {
         tested_oid: &GitOid,
         replace_tip: Option<&GitOid>,
         remote_oid: Option<&GitOid>,
+        rebase_unsubmitted: bool,
         actor: Actor,
     ) -> Result<UserMasterSyncOutcome, ServiceError> {
         let command_id = CommandId::new();
@@ -11174,6 +11188,7 @@ impl TollgateService {
             "tested_oid": tested_oid,
             "replace_tip": replace_tip,
             "remote_oid": remote_oid,
+            "rebase_unsubmitted": rebase_unsubmitted,
         }))?;
         runtime.store.prepare_operation(
             runtime.data.lock().state.id,
@@ -11185,6 +11200,7 @@ impl TollgateService {
                 "tested_oid": tested_oid,
                 "replace_tip": replace_tip,
                 "remote_oid": remote_oid,
+                "rebase_unsubmitted": rebase_unsubmitted,
             }),
         )?;
         self.complete_user_master_sync(
@@ -11196,6 +11212,7 @@ impl TollgateService {
                 tested_oid,
                 replace_tip,
                 remote_oid,
+                rebase_unsubmitted,
             },
             actor,
         )
@@ -11215,6 +11232,7 @@ impl TollgateService {
             tested_oid,
             replace_tip,
             remote_oid,
+            rebase_unsubmitted,
         } = projection;
         let config = runtime.data.lock().config.clone();
         let remote_tracking = config
@@ -11232,7 +11250,7 @@ impl TollgateService {
             .flatten();
         let outcome = runtime
             .git
-            .sync_user_master(tested_oid, replace_tip, remote_tracking)
+            .sync_user_master(tested_oid, replace_tip, remote_tracking, rebase_unsubmitted)
             .await
             .unwrap_or_else(|error| UserMasterSyncOutcome::NeedsAttention {
                 path: None,
@@ -14863,6 +14881,97 @@ policy = "clone"
     }
 
     #[tokio::test]
+    async fn promotion_rebases_clean_unsubmitted_master_onto_certified_release() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        let feature_worktree = temporary.path().join("feature");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("base.txt"), "base\n").unwrap();
+        git(&repository, &["add", "base.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+
+        let service = TollgateService::open(temporary.path().join("support"))
+            .await
+            .unwrap();
+        let initialized = service
+            .initialize_repository(&repository, Some("true".into()))
+            .await
+            .unwrap();
+
+        std::fs::write(repository.join("local.txt"), "local\n").unwrap();
+        git(&repository, &["add", "local.txt"]);
+        git(&repository, &["commit", "-m", "unsubmitted local work"]);
+        let old_master = git(&repository, &["rev-parse", USER_BRANCH_REF]);
+
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                feature_worktree.to_str().unwrap(),
+                INTEGRATION_BRANCH,
+            ],
+        );
+        std::fs::write(feature_worktree.join("feature.txt"), "feature\n").unwrap();
+        git(&feature_worktree, &["add", "feature.txt"]);
+        git(&feature_worktree, &["commit", "-m", "certified feature"]);
+        service
+            .approve_from(
+                initialized.state.id,
+                "HEAD".into(),
+                Some(feature_worktree.to_string_lossy().into_owned()),
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let snapshot = loop {
+            let snapshot = service
+                .repository_snapshot(initialized.state.id)
+                .await
+                .unwrap();
+            if snapshot.queue.is_empty()
+                && snapshot
+                    .history
+                    .iter()
+                    .any(|event| event.kind == "user-master.synchronized")
+            {
+                break snapshot;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        };
+
+        let certified = snapshot.state.master_oid;
+        let rebased_master =
+            GitOid::from_hex(&git(&repository, &["rev-parse", USER_BRANCH_REF])).unwrap();
+        assert_ne!(rebased_master.to_hex(), old_master);
+        assert_eq!(
+            service
+                .runtime(initialized.state.id)
+                .await
+                .unwrap()
+                .git
+                .commit_parent_oid(&rebased_master)
+                .await
+                .unwrap(),
+            certified
+        );
+        assert_eq!(
+            std::fs::read_to_string(repository.join("feature.txt")).unwrap(),
+            "feature\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repository.join("local.txt")).unwrap(),
+            "local\n"
+        );
+    }
+
+    #[tokio::test]
     async fn promotion_syncs_clean_master_with_unignored_registered_source_worktree() {
         let temporary = tempfile::tempdir().unwrap();
         let repository = temporary.path().join("repository");
@@ -15764,7 +15873,13 @@ run = "test -f feature.txt"
         git(&repository, &["commit", "-m", "base"]);
         git(
             temporary.path(),
-            &["init", "--bare", remote.to_str().unwrap()],
+            &[
+                "init",
+                "--bare",
+                "-b",
+                USER_BRANCH,
+                remote.to_str().unwrap(),
+            ],
         );
         git(
             &repository,

@@ -1373,6 +1373,7 @@ impl GitRepository {
         tested_new: &GitOid,
         replace_source: Option<&GitOid>,
         remote_tracking: Option<(&str, &str, &GitOid)>,
+        rebase_unsubmitted: bool,
     ) -> Result<UserMasterSyncOutcome, GitError> {
         if let Some((remote, branch, remote_oid)) = remote_tracking {
             let tracking_ref = format!("refs/remotes/{remote}/{branch}");
@@ -1472,6 +1473,32 @@ impl GitRepository {
             return Ok(UserMasterSyncOutcome::UpdatedRef);
         }
         if !self.is_ancestor(&current, tested_new).await? {
+            if rebase_unsubmitted && let Some(path) = path.as_ref() {
+                let checkout = Self::discover(path).await?;
+                match checkout.rebase_user_master_onto_release(&current).await {
+                    Ok(rebased) => {
+                        if !self.is_ancestor(tested_new, &rebased).await? {
+                            return Err(GitError::InvalidOutput(
+                                "automatically rebased master does not descend from certified release"
+                                    .into(),
+                            ));
+                        }
+                        return Ok(UserMasterSyncOutcome::UpdatedCheckout { path: path.clone() });
+                    }
+                    Err(GitError::Unmergeable) => {
+                        return Ok(UserMasterSyncOutcome::NeedsAttention {
+                            path: Some(path.clone()),
+                            reason: format!(
+                                "local master {} could not be rebased automatically onto certified release {}",
+                                current.short(),
+                                tested_new.short()
+                            ),
+                            status_entries: Vec::new(),
+                        });
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
             return Ok(UserMasterSyncOutcome::NeedsAttention {
                 path,
                 reason: format!(
@@ -1724,10 +1751,20 @@ impl GitRepository {
         };
         if !operation.status.success() {
             if !commits.is_empty() {
-                let _ = internal_command(&self.profile.executable, &self.worktree_root)
-                    .args(["rebase", "--abort"])
-                    .status()
-                    .await;
+                run_internal(
+                    &self.profile.executable,
+                    &self.worktree_root,
+                    ["rebase", "--abort"],
+                )
+                .await?;
+                if self.resolve_oid("HEAD").await? != *expected_master
+                    || self.resolve_oid(USER_BRANCH_REF).await? != *expected_master
+                {
+                    return Err(GitError::InvalidOutput(
+                        "aborted master rebase did not restore the original tip".into(),
+                    ));
+                }
+                self.ensure_clean().await?;
             }
             return Err(GitError::Unmergeable);
         }
@@ -2516,7 +2553,7 @@ mod tests {
 
         let adapter = GitRepository::discover(&tested_worktree).await.unwrap();
         let outcome = adapter
-            .sync_user_master(&tested, Some(&source), None)
+            .sync_user_master(&tested, Some(&source), None, false)
             .await
             .unwrap();
 
@@ -2565,7 +2602,12 @@ mod tests {
             &["update-ref", "refs/remotes/origin/master", &base.to_hex()],
         );
         let outcome = adapter
-            .sync_user_master(&promoted, None, Some(("origin", "master", &promoted)))
+            .sync_user_master(
+                &promoted,
+                None,
+                Some(("origin", "master", &promoted)),
+                false,
+            )
             .await
             .unwrap();
 
@@ -2590,6 +2632,151 @@ mod tests {
                 .unwrap(),
             promoted
         );
+    }
+
+    #[tokio::test]
+    async fn rebases_clean_unsubmitted_master_onto_certified_release() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("base.txt"), "base\n").unwrap();
+        git(&repository, &["add", "base.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+
+        let adapter = GitRepository::discover(&repository).await.unwrap();
+        let base = adapter
+            .initialize_integration_ref_from_master()
+            .await
+            .unwrap();
+        std::fs::write(repository.join("local.txt"), "local\n").unwrap();
+        git(&repository, &["add", "local.txt"]);
+        git(&repository, &["commit", "-m", "local work"]);
+        let old_master = adapter.resolve_oid(USER_BRANCH_REF).await.unwrap();
+
+        let feature = temporary.path().join("feature");
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                feature.to_str().unwrap(),
+                &base.to_hex(),
+            ],
+        );
+        std::fs::write(feature.join("certified.txt"), "certified\n").unwrap();
+        git(&feature, &["add", "certified.txt"]);
+        git(&feature, &["commit", "-m", "certified"]);
+        let certified = GitOid::from_hex(&git(&feature, &["rev-parse", "HEAD"])).unwrap();
+        git(
+            &feature,
+            &[
+                "update-ref",
+                INTEGRATION_REF,
+                &certified.to_hex(),
+                &base.to_hex(),
+            ],
+        );
+
+        let outcome = adapter
+            .sync_user_master(&certified, None, None, true)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            UserMasterSyncOutcome::UpdatedCheckout {
+                path: std::fs::canonicalize(&repository).unwrap()
+            }
+        );
+        let new_master = adapter.resolve_oid(USER_BRANCH_REF).await.unwrap();
+        assert_ne!(new_master, old_master);
+        assert_eq!(
+            adapter.commit_parent_oid(&new_master).await.unwrap(),
+            certified
+        );
+        assert_eq!(
+            std::fs::read_to_string(repository.join("certified.txt")).unwrap(),
+            "certified\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repository.join("local.txt")).unwrap(),
+            "local\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn conflicting_unsubmitted_master_rebase_leaves_checkout_unchanged() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("file.txt"), "base\n").unwrap();
+        git(&repository, &["add", "file.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+
+        let adapter = GitRepository::discover(&repository).await.unwrap();
+        let base = adapter
+            .initialize_integration_ref_from_master()
+            .await
+            .unwrap();
+        std::fs::write(repository.join("file.txt"), "local\n").unwrap();
+        git(&repository, &["commit", "-am", "local work"]);
+        let old_master = adapter.resolve_oid(USER_BRANCH_REF).await.unwrap();
+
+        let feature = temporary.path().join("feature");
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                feature.to_str().unwrap(),
+                &base.to_hex(),
+            ],
+        );
+        std::fs::write(feature.join("file.txt"), "certified\n").unwrap();
+        git(&feature, &["commit", "-am", "certified"]);
+        let certified = GitOid::from_hex(&git(&feature, &["rev-parse", "HEAD"])).unwrap();
+        git(
+            &feature,
+            &[
+                "update-ref",
+                INTEGRATION_REF,
+                &certified.to_hex(),
+                &base.to_hex(),
+            ],
+        );
+
+        let outcome = adapter
+            .sync_user_master(&certified, None, None, true)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            UserMasterSyncOutcome::NeedsAttention {
+                path: Some(std::fs::canonicalize(&repository).unwrap()),
+                reason: format!(
+                    "local master {} could not be rebased automatically onto certified release {}",
+                    old_master.short(),
+                    certified.short()
+                ),
+                status_entries: Vec::new(),
+            }
+        );
+        assert_eq!(
+            adapter.resolve_oid(USER_BRANCH_REF).await.unwrap(),
+            old_master
+        );
+        assert_eq!(
+            std::fs::read_to_string(repository.join("file.txt")).unwrap(),
+            "local\n"
+        );
+        assert!(git(&repository, &["status", "--porcelain"]).is_empty());
     }
 
     #[tokio::test]
@@ -2625,7 +2812,7 @@ mod tests {
 
         let adapter = GitRepository::discover(&feature).await.unwrap();
         let outcome = adapter
-            .sync_user_master(&promoted, Some(&master_oid), None)
+            .sync_user_master(&promoted, Some(&master_oid), None, false)
             .await
             .unwrap();
 
@@ -2672,7 +2859,7 @@ mod tests {
 
         let adapter = GitRepository::discover(&repository).await.unwrap();
         let outcome = adapter
-            .sync_user_master(&promoted, None, None)
+            .sync_user_master(&promoted, None, None, false)
             .await
             .unwrap();
 
