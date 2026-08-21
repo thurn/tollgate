@@ -2054,6 +2054,18 @@ fn print_diagnosis(diagnosis: &DiagnoseResult) {
                 println!("    suggested repair: {}", argv.join(" "));
             }
         }
+        println!(
+            "    candidate log: tg logs {} --buildset {} --step {}",
+            diagnosis.item_id, attribution.candidate_buildset_id, step.name
+        );
+        if let (Some(item_id), Some(buildset_id)) =
+            (step.baseline_item_id, step.baseline_buildset_id)
+        {
+            println!(
+                "    baseline log:  tg logs {item_id} --buildset {buildset_id} --step {}",
+                step.name
+            );
+        }
     }
     if let Some(artifact) = &diagnosis.repair_artifact {
         println!(

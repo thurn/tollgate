@@ -217,6 +217,8 @@ pub struct StepFailureAttribution {
     pub candidate_result: String,
     pub baseline_result: Option<String>,
     pub baseline_buildset_id: Option<BuildsetId>,
+    #[serde(default)]
+    pub baseline_item_id: Option<QueueItemId>,
     pub diagnostics: Vec<StepDiagnostic>,
 }
 
@@ -738,6 +740,7 @@ fn failure_attribution(
             candidate_result: result.result_class.clone(),
             baseline_result: baseline.map(|(_, entry)| entry.result_class.clone()),
             baseline_buildset_id: baseline.map(|(candidate, _)| candidate.id),
+            baseline_item_id: baseline.map(|(candidate, _)| candidate.item_id),
             diagnostics: result.diagnostics.clone(),
         });
     }
@@ -1252,32 +1255,15 @@ impl TollgateService {
             }
         }
         git.initialize_integration_ref_from_master().await?;
-        let config_root = git.worktree_root.join(".tollgate");
-        tokio::fs::create_dir_all(&config_root).await?;
-        let exclude_path = git.common_dir.join("info/exclude");
-        let mut excludes = tokio::fs::read_to_string(&exclude_path)
-            .await
-            .unwrap_or_default();
-        if !excludes.lines().any(|line| line.trim() == ".tollgate/") {
-            if !excludes.is_empty() && !excludes.ends_with('\n') {
-                excludes.push('\n');
-            }
-            excludes.push_str(".tollgate/\n");
-            if let Some(parent) = exclude_path.parent() {
-                tokio::fs::create_dir_all(parent).await?;
-            }
-            tokio::fs::write(exclude_path, excludes).await?;
-        }
-        let config_path = config_root.join("config.toml");
-        if !config_path.exists() {
-            let command = command.unwrap_or_else(|| detect_command(&git.worktree_root));
-            let contents = format!(
-                "version = 1\n\n[[step]]\nname = \"ci\"\nrun = {}\n",
-                toml_string(&command)
-            );
-            tokio::fs::write(&config_path, contents).await?;
-        }
-        let config = EffectiveConfig::parse(&tokio::fs::read_to_string(&config_path).await?)?;
+        prepare_configuration_root(&git).await?;
+        let generated = command.unwrap_or_else(|| detect_command(&git.worktree_root));
+        let generated = format!(
+            "version = 1\n\n[[step]]\nname = \"ci\"\nrun = {}\n",
+            toml_string(&generated)
+        );
+        let config_text = read_or_migrate_configuration(&git, Some(&generated)).await?;
+        let config = EffectiveConfig::parse(&config_text)?;
+        mirror_legacy_configuration(&git, &config_text).await?;
         let master_oid = git.integration_oid().await?;
         let repository_id = RepositoryId::new();
         let name = git
@@ -1414,9 +1400,9 @@ impl TollgateService {
             }
             Err(error) => return Err(error.into()),
         }
-        let disk_config = EffectiveConfig::parse(
-            &tokio::fs::read_to_string(git.worktree_root.join(".tollgate/config.toml")).await?,
-        )?;
+        prepare_configuration_root(&git).await?;
+        let disk_config_text = read_or_migrate_configuration(&git, None).await?;
+        let disk_config = EffectiveConfig::parse(&disk_config_text)?;
         let config = if disk_config.digest == state.active_configuration_digest {
             if store
                 .configuration_snapshot(&state.active_configuration_digest)?
@@ -1428,6 +1414,7 @@ impl TollgateService {
                     &disk_config.step_graph_digest,
                 )?;
             }
+            mirror_legacy_configuration(&git, &disk_config_text).await?;
             disk_config
         } else {
             state.execution_state = RepositoryExecutionState::ConfigurationPending;
@@ -7491,7 +7478,8 @@ impl TollgateService {
         let runtime = self.runtime(repository_id).await?;
         let _mutation = runtime.mutation.lock().await;
         let path = runtime.git.worktree_root.join(".tollgate/config.toml");
-        let candidate = EffectiveConfig::parse(&tokio::fs::read_to_string(path).await?)?;
+        let config_text = tokio::fs::read_to_string(path).await?;
+        let candidate = EffectiveConfig::parse(&config_text)?;
         let active_digest = runtime.data.lock().config.digest.clone();
         let request_digest = command_digest(&serde_json::json!({
             "repository_id": repository_id,
@@ -7531,6 +7519,7 @@ impl TollgateService {
             })
         };
         if let Some(mut state) = unchanged_state {
+            mirror_legacy_configuration(&runtime.git, &config_text).await?;
             let result = MutationResult {
                 repository_id,
                 action: "config-apply".into(),
@@ -7714,6 +7703,7 @@ impl TollgateService {
             }
             self.spawn_eligible(repository_id, &runtime);
         }
+        mirror_legacy_configuration(&runtime.git, &config_text).await?;
         let mut completed_state = runtime.data.lock().state.clone();
         let event = runtime.store.complete_operation(
             &completed_state,
@@ -12332,6 +12322,75 @@ fn detect_command(root: &Path) -> String {
     }
 }
 
+async fn prepare_configuration_root(git: &GitRepository) -> Result<(), ServiceError> {
+    tokio::fs::create_dir_all(git.worktree_root.join(".tollgate")).await?;
+    let exclude_path = git.common_dir.join("info/exclude");
+    let mut excludes = tokio::fs::read_to_string(&exclude_path)
+        .await
+        .unwrap_or_default();
+    if !excludes.lines().any(|line| line.trim() == ".tollgate/") {
+        if !excludes.is_empty() && !excludes.ends_with('\n') {
+            excludes.push('\n');
+        }
+        excludes.push_str(".tollgate/\n");
+        if let Some(parent) = exclude_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        tokio::fs::write(exclude_path, excludes).await?;
+    }
+    Ok(())
+}
+
+async fn read_or_migrate_configuration(
+    git: &GitRepository,
+    generated: Option<&str>,
+) -> Result<String, ServiceError> {
+    let authoritative = git.worktree_root.join(".tollgate/config.toml");
+    match tokio::fs::read_to_string(&authoritative).await {
+        Ok(contents) => return Ok(contents),
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
+        Err(_) => {}
+    }
+    let legacy = git.common_dir.join("tollgate/config.toml");
+    let contents = match tokio::fs::read_to_string(&legacy).await {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => generated
+            .ok_or(ServiceError::MissingConfiguration)?
+            .to_owned(),
+        Err(error) => return Err(error.into()),
+    };
+    tokio::fs::write(authoritative, &contents).await?;
+    Ok(contents)
+}
+
+async fn mirror_legacy_configuration(
+    git: &GitRepository,
+    contents: &str,
+) -> Result<(), ServiceError> {
+    let legacy = git.common_dir.join("tollgate/config.toml");
+    if tokio::fs::read(&legacy)
+        .await
+        .is_ok_and(|current| current == contents.as_bytes())
+    {
+        return Ok(());
+    }
+    let parent = legacy
+        .parent()
+        .ok_or_else(|| ServiceError::Invariant("legacy configuration path has no parent".into()))?;
+    tokio::fs::create_dir_all(parent).await?;
+    let temporary = parent.join(format!(".config.{}.toml.tmp", uuid::Uuid::now_v7()));
+    let mut file = tokio::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)
+        .await?;
+    file.write_all(contents.as_bytes()).await?;
+    file.sync_all().await?;
+    tokio::fs::rename(&temporary, &legacy).await?;
+    std::fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
 fn resolve_executable(executable: &str, environment: &BTreeMap<String, String>) -> Option<PathBuf> {
     let path = Path::new(executable);
     if path.is_absolute() {
@@ -13282,6 +13341,77 @@ mod tests {
             &initialized.configuration.steps[0].command,
             tollgate_config::EffectiveCommand::Shell { script } if script == "false"
         ));
+    }
+
+    #[tokio::test]
+    async fn initialization_prefers_authoritative_policy_and_keeps_legacy_readers_compatible() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", "master"]);
+        std::fs::write(repository.join("base.txt"), "base\n").unwrap();
+        git(&repository, &["add", "base.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+        std::fs::create_dir(repository.join(".tollgate")).unwrap();
+        std::fs::create_dir_all(repository.join(".git/tollgate")).unwrap();
+        let authoritative = "version = 1\n\n[[step]]\nname = \"authoritative\"\nrun = \"true\"\n";
+        std::fs::write(repository.join(".tollgate/config.toml"), authoritative).unwrap();
+        std::fs::write(
+            repository.join(".git/tollgate/config.toml"),
+            "version = 1\n\n[[step]]\nname = \"stale\"\nrun = \"false\"\n",
+        )
+        .unwrap();
+
+        let service = TollgateService::open(temporary.path().join("support"))
+            .await
+            .unwrap();
+        let initialized = service
+            .initialize_repository_with_options(&repository, None, false)
+            .await
+            .unwrap();
+        assert_eq!(initialized.configuration.steps[0].name, "authoritative");
+        assert_eq!(
+            std::fs::read_to_string(repository.join(".git/tollgate/config.toml")).unwrap(),
+            authoritative
+        );
+
+        let replacement = "version = 1\n\n[[step]]\nname = \"replacement\"\nrun = \"true\"\n";
+        std::fs::write(repository.join(".tollgate/config.toml"), replacement).unwrap();
+        service
+            .apply_configuration(initialized.state.id, CommandId::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(repository.join(".git/tollgate/config.toml")).unwrap(),
+            replacement
+        );
+    }
+
+    #[tokio::test]
+    async fn initialization_migrates_a_legacy_policy_instead_of_auto_detecting_a_replacement() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", "master"]);
+        std::fs::write(repository.join("base.txt"), "base\n").unwrap();
+        git(&repository, &["add", "base.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+        std::fs::create_dir_all(repository.join(".git/tollgate")).unwrap();
+        let legacy = "version = 1\n\n[[step]]\nname = \"legacy\"\nrun = \"false\"\n";
+        std::fs::write(repository.join(".git/tollgate/config.toml"), legacy).unwrap();
+
+        let service = TollgateService::open(temporary.path().join("support"))
+            .await
+            .unwrap();
+        let initialized = service
+            .initialize_repository_with_options(&repository, Some("true".into()), false)
+            .await
+            .unwrap();
+        assert_eq!(initialized.configuration.steps[0].name, "legacy");
+        assert_eq!(
+            std::fs::read_to_string(repository.join(".tollgate/config.toml")).unwrap(),
+            legacy
+        );
     }
 
     #[tokio::test]
@@ -15740,9 +15870,20 @@ run = "test -f feature.txt"
             .item_details(initialized.state.id, candidate.item_id)
             .await
             .unwrap();
+        let attribution = details.failure_attribution.unwrap();
+        assert_eq!(attribution.origin, FailureOrigin::InheritedFromBase);
+        assert_eq!(attribution.steps[0].baseline_item_id, Some(base.item_id));
         assert_eq!(
-            details.failure_attribution.unwrap().origin,
-            FailureOrigin::InheritedFromBase
+            attribution.steps[0].baseline_buildset_id,
+            Some(
+                service
+                    .item_details(initialized.state.id, base.item_id)
+                    .await
+                    .unwrap()
+                    .buildset
+                    .unwrap()
+                    .id
+            )
         );
     }
 
