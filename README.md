@@ -21,6 +21,19 @@ The Tauri CLI is pinned as a development dependency. Produce the app with `npm -
 
 The browser development view (`npm --prefix ui run dev`) uses a representative typed fixture. A native Tauri build always calls the Rust service.
 
+### Install a local checkout
+
+After updating the checkout, build and install the app, bundled CLI, and worker with:
+
+```sh
+git pull --ff-only
+./scripts/install-local.sh
+```
+
+The script installs to `/Applications/Tollgate.app`, updates `~/.local/bin/tg`,
+restarts Tollgate, and verifies the service with `tg --no-launch doctor`. Set
+`TOLLGATE_INSTALL_DIR` to use a different Applications directory.
+
 ## First repository
 
 Launch the app and choose **Add repository**, or run:
