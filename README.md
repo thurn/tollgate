@@ -84,7 +84,7 @@ If a concurrent approval already granted authority to that candidate as an
 active dependency, repeating `tg approve <candidate-id>` succeeds without
 changing the queue revision; `--wait` then follows the already-authorized item.
 
-Tollgate may combine independent candidates in its disposable validation slots when their patches merge cleanly. Those synthesized prefixes are internal execution artifacts, never source-branch bases. If synthesis conflicts with an earlier candidate, keep the task commit based on promoted `release` and retry after the earlier candidate is promoted, canceled, or reordered. If `release` itself advanced incompatibly, rebase only onto the latest `release`, resolve and regenerate, then resubmit:
+Tollgate combines independent candidates in its disposable validation slots when their patches merge cleanly. When a new candidate conflicts with an earlier speculative item, Tollgate retains it in a separate release-anchored validation lane. Authorizing either contender may move it to the promotable head; after it promotes, incompatible contenders become merge-conflicted against the new `release`. These synthesized prefixes and lanes are internal execution artifacts, never source-branch bases. If promoted `release` itself advanced incompatibly, rebase only onto the latest `release`, resolve and regenerate, then resubmit:
 
 ```sh
 tg --no-launch --json status

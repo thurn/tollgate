@@ -426,7 +426,8 @@ The gate follows Zuul's dependent-pipeline behavior:
 - If later independent approvals make the authorized candidates a contiguous admission prefix, Tollgate restores admission order before promotion. It cancels replacement work and reactivates retained evidence only for byte-for-byte identical validation identities; unmatched items receive new generations normally.
 - Manual reorder (`tg reorder`) replaces the admission-order baseline, preserves the dependency DAG, and restarts every item whose prefix changed. Later authorization convergence respects that explicit order.
 - Each eligible item is tested with every active item ahead of it when their independent patches compose cleanly inside Tollgate's disposable builder.
-- A speculative composition conflict never instructs or permits a source worktree to adopt the internal prefix. The source remains based on promoted `release` and may be retried after the conflicting queue relationship changes.
+- An independent candidate that conflicts with the current speculative prefix is retained and validated in a separate lane anchored directly to promoted `release`. Authorization can prioritize a contender without changing either source commit; after promotion, incompatible lanes become merge-conflicted against the new base.
+- A speculative composition conflict never instructs or permits a source worktree to adopt an internal prefix.
 - A conclusive failure or merge conflict removes that item from the active queue.
 - Affected independent descendants discard their results and restart without the failed item.
 - Hard dependents are removed rather than rebuilt without their prerequisite.

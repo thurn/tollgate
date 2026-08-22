@@ -5185,17 +5185,30 @@ impl TollgateService {
             .await
         {
             Ok(synthetic) => synthetic,
-            Err(error) if error.is_synthetic_rejection() => {
+            Err(error) if error.is_synthetic_rejection() && item.dependencies.is_empty() => {
+                // A candidate that conflicts with an earlier speculative item is still a
+                // valid contender for promotion before that item. Retain it and validate
+                // its source directly on the promoted base. Authorization can then move
+                // either contender to the head without requiring the source worktree to
+                // adopt an internal speculative prefix.
+                ordered_ids = vec![item_id];
+                sources = vec![item.source_oid.clone()];
                 runtime
                     .git
-                    .delete_source_ref(&item.source_ref, &item.source_oid)
-                    .await?;
-                runtime.store.set_intent_state(
-                    command_id,
-                    IntentState::Canceled,
-                    &serde_json::json!({"approval": "unmergeable"}),
-                )?;
-                return Err(error.into());
+                    .construct_prefix(
+                        &runtime.mirror,
+                        &runtime.builder,
+                        &state.master_oid,
+                        &sources,
+                    )
+                    .await
+                    .map_err(|standalone_error| {
+                        if standalone_error.is_synthetic_rejection() {
+                            error
+                        } else {
+                            standalone_error
+                        }
+                    })?
             }
             Err(error) => return Err(error.into()),
         };
@@ -5627,18 +5640,32 @@ impl TollgateService {
                 .iter()
                 .map(|candidate| candidate.source_oid.clone())
                 .collect::<Vec<_>>();
-            let synthetic = runtime
-                .git
-                .construct_prefix(
-                    &runtime.mirror,
-                    &runtime.builder,
-                    &state.master_oid,
-                    &sources,
-                )
-                .await?;
+            // Conflicting candidates may hold release-anchored evidence in separate
+            // speculative lanes. Reordering only needs to construct the longest viable
+            // head prefix; candidates after its first conflict keep their existing lane
+            // and evidence until the promoted head advances `release`.
+            let mut composable_len = sources.len();
+            let synthetic = loop {
+                match runtime
+                    .git
+                    .construct_prefix(
+                        &runtime.mirror,
+                        &runtime.builder,
+                        &state.master_oid,
+                        &sources[..composable_len],
+                    )
+                    .await
+                {
+                    Ok(synthetic) => break synthetic,
+                    Err(error) if error.is_synthetic_rejection() && composable_len > 1 => {
+                        composable_len -= 1;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            };
             reuse_active_enqueue_sequences(&current, &mut ordered);
             for (index, candidate) in ordered.iter_mut().enumerate() {
-                if index < first_changed {
+                if index < first_changed || index >= composable_len {
                     continue;
                 }
                 let commit = &synthetic[index];
@@ -5661,17 +5688,15 @@ impl TollgateService {
                 if let Some(token) = runtime.cancellations.lock().get(&candidate.id) {
                     token.cancel();
                 }
-                if restored_admission_order.is_some()
-                    && let Some((generation, buildset, certificate)) = matching_retained_evidence(
-                        candidate,
-                        &desired_generation,
-                        &retained_generations,
-                        &retained_buildsets,
-                        &retained_certificates,
-                        &config,
-                        state.engine_epoch,
-                    )
-                {
+                if let Some((generation, buildset, certificate)) = matching_retained_evidence(
+                    candidate,
+                    &desired_generation,
+                    &retained_generations,
+                    &retained_buildsets,
+                    &retained_certificates,
+                    &config,
+                    state.engine_epoch,
+                ) {
                     candidate.state = QueueItemState::Ready;
                     candidate.current_generation_id = Some(generation.id);
                     candidate.buildset_id = Some(buildset.id);
@@ -10997,6 +11022,30 @@ impl TollgateService {
                 }
             }
             self.finish_source_cleanup(&runtime, item).await?;
+            let active_head_needs_rebuild = {
+                let data = runtime.data.lock();
+                data.items
+                    .iter()
+                    .filter(|candidate| {
+                        candidate.kind == QueueItemKind::Gate && !candidate.state.is_terminal()
+                    })
+                    .min_by_key(|candidate| candidate.enqueue_sequence)
+                    .and_then(|candidate| {
+                        candidate.current_generation_id.and_then(|generation_id| {
+                            data.generations
+                                .iter()
+                                .find(|generation| generation.id == generation_id)
+                        })
+                    })
+                    .is_some_and(|generation| {
+                        generation.expected_parent_oid != data.state.master_oid
+                    })
+            };
+            if active_head_needs_rebuild {
+                let promoted_base = runtime.data.lock().state.master_oid.clone();
+                self.rebuild_after_base_adoption(&runtime, &promoted_base)
+                    .await?;
+            }
             self.spawn_eligible(repository_id, &runtime);
         }
     }
@@ -17091,7 +17140,7 @@ run = "test -f feature.txt"
     }
 
     #[tokio::test]
-    async fn conflicted_candidate_is_not_told_to_adopt_the_internal_prefix() {
+    async fn conflicting_candidate_validates_in_its_own_lane_and_can_be_prioritized() {
         let temporary = tempfile::tempdir().unwrap();
         let repository = temporary.path().join("repository");
         let queued_worktree = temporary.path().join("queued");
@@ -17135,7 +17184,7 @@ run = "test -f feature.txt"
             .await
             .unwrap();
         let initialized = service
-            .initialize_repository(&repository, Some("sleep 30".into()))
+            .initialize_repository(&repository, Some("true".into()))
             .await
             .unwrap();
         let queued = service
@@ -17167,7 +17216,7 @@ run = "test -f feature.txt"
             queued.tested_oid.to_hex()
         );
 
-        let conflict = service
+        let contender = service
             .submit_candidate_from(
                 initialized.state.id,
                 "HEAD".into(),
@@ -17175,24 +17224,63 @@ run = "test -f feature.txt"
                 CommandId::new(),
             )
             .await
-            .unwrap_err();
-        assert!(matches!(
-            &conflict,
-            ServiceError::Git(GitError::SyntheticConflict { .. })
-        ));
-        let message = conflict.to_string();
-        assert!(message.contains("never rebase it onto a speculative prefix"));
-        assert!(message.contains("promoted, canceled, or reordered"));
+            .unwrap();
         assert_eq!(
             git(&task_worktree, &["show", "-s", "--format=%P", "HEAD"]),
             base
         );
+        let contender_view = service
+            .item_details(initialized.state.id, contender.item_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            contender_view.generation.unwrap().ordered_item_ids,
+            vec![contender.item_id],
+            "a conflicting contender must initially validate directly on release"
+        );
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let revision = loop {
+            let snapshot = service
+                .repository_snapshot(initialized.state.id)
+                .await
+                .unwrap();
+            if snapshot
+                .queue
+                .iter()
+                .all(|view| view.item.state == QueueItemState::Ready)
+            {
+                break snapshot.state.queue_revision;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "conflicting candidates did not finish their independent speculative lanes"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        };
+
+        let authorized = service
+            .authorize_candidate(
+                initialized.state.id,
+                contender.item_id,
+                revision,
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        assert!(authorized.evidence_reused);
+
         let snapshot = service
             .repository_snapshot(initialized.state.id)
             .await
             .unwrap();
-        assert_eq!(snapshot.queue.len(), 1);
-        assert_eq!(snapshot.queue[0].item.id, queued.item_id);
+        assert!(snapshot.history_items.iter().any(|view| {
+            view.item.id == contender.item_id && view.item.state == QueueItemState::Promoted
+        }));
+        assert!(snapshot.history_items.iter().any(|view| {
+            view.item.id == queued.item_id && view.item.state == QueueItemState::MergeConflict
+        }));
+        assert!(snapshot.queue.is_empty());
     }
 
     #[tokio::test]
