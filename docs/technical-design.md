@@ -609,7 +609,7 @@ When automatic user-master synchronization is disabled or needs attention, ordin
 ### 10.8 Gate-aware Git conveniences
 
 - `tg update`: rebase the current clean, unqueued feature branch onto current gated `release`, then verify it has one unique source commit and report its new OID.
-- `tg worktree create`: create a feature branch/worktree from the gated tip using configurable placement defaults.
+- `tg worktree create`: create a cold feature branch/worktree from the gated tip using configurable placement defaults. `--warm` additionally imports a compatible immutable APFS seed when one is available.
 - `tg worktree remove`: apply queued/landed/dirty safety checks before removal.
 
 General feature fetching, staging, committing, inspection, and pushing remain ordinary Git commands.
@@ -898,6 +898,8 @@ Creating a slot is a durable state machine rather than a directory copy:
 
 If no compatible seed exists, provision cold. If seeding fails, quarantine the partial path and retry cold rather than using a torn mixture. A new slot is never cloned from a live donor.
 
+Feature worktrees remain cold by default. With `tg worktree create --warm`, Tollgate may clone the same compatible immutable seed into a newly created user worktree. Every destination must be absent, ignored by that exact checkout, beneath a real non-symlink parent, and listed in the verified seed manifest. Tollgate removes every imported path if hydration fails and returns the usable cold worktree with a diagnostic; it never copies physically or imports from a live slot.
+
 Compatibility requires repository ID, Apple Silicon/macOS cache profile, cache epoch, and trusted cache-policy compatibility. Source/config proximity affects preference, not strict compatibility, because the chosen default trusts build-tool invalidation. Toolchain and shell fingerprints are recorded for diagnosis. Projects needing strict separation increment the epoch or define profiles.
 
 ### 14.4 Slot selection and affinity
@@ -999,7 +1001,7 @@ The initial CLI surface is:
 | `tg push` | Push only contiguous certified local `release` commits to the configured remote branch with a lease. |
 | `tg reconcile` | Guided external movement/divergence recovery. |
 | `tg update` | Safe one-commit feature rebase onto current gated `release`. |
-| `tg worktree create/remove` | Gate-aware feature worktree lifecycle. |
+| `tg worktree create [--warm]/remove` | Gate-aware feature worktree lifecycle with optional APFS cache hydration. |
 | `tg env reload/show` | Bootstrap and diagnose shell environment. |
 | `tg config validate/explain/regenerate/apply` | Validate, inspect, regenerate, preview, and explicitly activate the single local configuration. |
 | `tg slot list/reset` | Slot health and cold recreation. |

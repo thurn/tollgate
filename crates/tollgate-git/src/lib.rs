@@ -676,6 +676,28 @@ impl GitRepository {
         Ok(top_level)
     }
 
+    /// Reports whether a prospective directory is ignored in the selected worktree.
+    pub async fn directory_is_ignored(
+        &self,
+        worktree: &Path,
+        path: &Path,
+    ) -> Result<bool, GitError> {
+        let output = Command::new(&self.profile.executable)
+            .current_dir(worktree)
+            .args(["check-ignore", "--no-index", "--quiet", "--"])
+            .arg(path.join(".tollgate-cache-probe"))
+            .output()
+            .await?;
+        match output.status.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => Err(GitError::Command {
+                command: "git check-ignore --no-index --quiet".into(),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().into(),
+            }),
+        }
+    }
+
     pub async fn create_source_ref(
         &self,
         item_id: QueueItemId,

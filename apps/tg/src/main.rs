@@ -188,8 +188,17 @@ enum RepoCommand {
 }
 #[derive(Subcommand)]
 enum WorktreeCommand {
-    Create { name: String },
-    Remove { path: PathBuf },
+    Create {
+        #[arg(
+            long,
+            help = "Hydrate ignored build caches from a compatible APFS seed"
+        )]
+        warm: bool,
+        name: String,
+    },
+    Remove {
+        path: PathBuf,
+    },
 }
 #[derive(Subcommand)]
 enum EnvCommand {
@@ -863,13 +872,14 @@ async fn run(cli: Cli) -> anyhow::Result<u8> {
                 Ok(())
             })?;
         }
-        TopCommand::Worktree(WorktreeCommand::Create { name }) => {
+        TopCommand::Worktree(WorktreeCommand::Create { warm, name }) => {
             let repository = select_repository(&mut client, cli.repository).await?;
             let value = client
                 .request(IpcCommand::WorktreeCreate {
                     repository_id: repository.state.id,
                     branch: name,
                     destination: None,
+                    warm,
                     command_id: CommandId::new(),
                 })
                 .await?;
@@ -2271,6 +2281,24 @@ mod tests {
             assert!(args.retain_worktree);
             assert_eq!(args.revision, "HEAD");
         }
+    }
+
+    #[test]
+    fn worktree_creation_is_cold_by_default_and_accepts_warm_opt_in() {
+        let parsed = Cli::try_parse_from(["tg", "worktree", "create", "feature"]).unwrap();
+        let TopCommand::Worktree(WorktreeCommand::Create { warm, name }) = parsed.command else {
+            panic!("worktree create did not parse");
+        };
+        assert!(!warm);
+        assert_eq!(name, "feature");
+
+        let parsed =
+            Cli::try_parse_from(["tg", "worktree", "create", "--warm", "feature"]).unwrap();
+        let TopCommand::Worktree(WorktreeCommand::Create { warm, name }) = parsed.command else {
+            panic!("warm worktree create did not parse");
+        };
+        assert!(warm);
+        assert_eq!(name, "feature");
     }
 
     #[test]
