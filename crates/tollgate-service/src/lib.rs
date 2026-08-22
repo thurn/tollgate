@@ -62,7 +62,7 @@ pub enum ServiceError {
     #[error("queue revision conflict: expected {expected}, actual {actual}")]
     RevisionConflict { expected: u64, actual: u64 },
     #[error(
-        "candidate source parent {source_parent_oid} belongs to a stale speculative queue prefix; current release {release_oid}, queue revision {queue_revision}, current prefix {current_prefix_oid}. Refresh `tg --no-launch --json status`, rebase the single task commit onto the displayed current prefix (or release when the queue is empty), resolve and regenerate, then resubmit"
+        "candidate source parent {source_parent_oid} belongs to a stale speculative queue prefix; current promoted release {release_oid}, queue revision {queue_revision}, internal queue prefix {current_prefix_oid}. Rebase the single task commit onto promoted `release` {release_oid}, never onto the speculative prefix, resolve and regenerate, then resubmit"
     )]
     StaleQueuePrefix {
         source_parent_oid: GitOid,
@@ -71,13 +71,20 @@ pub enum ServiceError {
         current_prefix_oid: GitOid,
     },
     #[error(
-        "candidate source has unknown unmerged ancestor {ancestor}; current release {release_oid}, queue revision {queue_revision}, current prefix {current_prefix_oid}. Rebase the single task commit onto the displayed current prefix (or release when the queue is empty), then resubmit"
+        "candidate source has unknown unmerged ancestor {ancestor}; current promoted release {release_oid}, queue revision {queue_revision}, internal queue prefix {current_prefix_oid}. Rebase the single task commit onto promoted `release` {release_oid}, never onto the speculative prefix, then resubmit"
     )]
     UnknownSourceAncestor {
         ancestor: GitOid,
         release_oid: GitOid,
         queue_revision: u64,
         current_prefix_oid: GitOid,
+    },
+    #[error(
+        "candidate source includes unpromoted ancestor {ancestor}; current promoted release is {release_oid}. Ordinary candidates must contain exactly one task commit based only on promoted `release`; speculative queue prefixes are internal Tollgate state and must never be incorporated into a source branch. Rebase the single task commit onto `release` {release_oid}, then resubmit"
+    )]
+    UnpromotedSourceAncestor {
+        ancestor: GitOid,
+        release_oid: GitOid,
     },
     #[error("internal service invariant failed: {0}")]
     Invariant(String),
@@ -5028,8 +5035,32 @@ impl TollgateService {
             .git
             .unmerged_first_parent_ancestors(&probe.parent_oid, &state.master_oid)
             .await?;
+        let allow_unpromoted_source_ancestry = purpose.as_deref() == Some("push-master");
+        if !allow_unpromoted_source_ancestry {
+            for ancestor in &unmerged_ancestors {
+                let satisfied = if let Some(bytes) = runtime.store.promoted_oid_bytes(ancestor)? {
+                    let promoted = GitOid::new(ancestor.format, bytes)
+                        .map_err(|error| ServiceError::Invariant(error.to_string()))?;
+                    runtime
+                        .git
+                        .is_ancestor(&promoted, &state.master_oid)
+                        .await?
+                } else {
+                    false
+                };
+                if !satisfied {
+                    return Err(ServiceError::UnpromotedSourceAncestor {
+                        ancestor: ancestor.clone(),
+                        release_oid: state.master_oid.clone(),
+                    });
+                }
+            }
+        }
         let mut dependency_ids = HashSet::new();
-        for ancestor in &unmerged_ancestors {
+        for ancestor in unmerged_ancestors
+            .iter()
+            .filter(|_| allow_unpromoted_source_ancestry)
+        {
             if let Some(item) = active_items
                 .iter()
                 .find(|item| item.source_oid == *ancestor)
@@ -7051,7 +7082,7 @@ impl TollgateService {
         {
             return Ok(response);
         }
-        let (source, kind, promotion_authorized, cleanup_policy, worktree_path, branch) = {
+        let (source, kind, promotion_authorized, cleanup_policy, worktree_path, branch, purpose) = {
             let data = runtime.data.lock();
             let item = data
                 .items
@@ -7078,6 +7109,7 @@ impl TollgateService {
                 item.cleanup_policy,
                 item.metadata.worktree_path.clone(),
                 item.metadata.branch.clone(),
+                item.metadata.purpose.clone(),
             )
         };
         let source_oid = runtime.git.resolve_oid(&source).await?;
@@ -7141,7 +7173,7 @@ impl TollgateService {
                 repository_id,
                 source,
                 worktree_path,
-                None,
+                purpose.filter(|purpose| purpose == "push-master"),
                 cleanup_policy,
                 child_command_id,
             )
@@ -17048,7 +17080,8 @@ run = "test -f feature.txt"
         assert!(message.contains("messages.json"));
         assert!(message.contains(&source_base));
         assert!(message.contains(&release));
-        assert!(message.contains("rebase the single task commit onto the latest release"));
+        assert!(message.contains("based only on promoted `release`"));
+        assert!(message.contains("never rebase it onto a speculative prefix"));
         let snapshot = service
             .repository_snapshot(initialized.state.id)
             .await
@@ -17058,12 +17091,11 @@ run = "test -f feature.txt"
     }
 
     #[tokio::test]
-    async fn conflicted_candidate_rebased_onto_active_prefix_submits_after_queue_extension() {
+    async fn conflicted_candidate_is_not_told_to_adopt_the_internal_prefix() {
         let temporary = tempfile::tempdir().unwrap();
         let repository = temporary.path().join("repository");
         let queued_worktree = temporary.path().join("queued");
         let task_worktree = temporary.path().join("task");
-        let extension_worktree = temporary.path().join("extension");
         std::fs::create_dir(&repository).unwrap();
         git(&repository, &["init", "-b", USER_BRANCH]);
         std::fs::write(repository.join("messages.json"), "base\n").unwrap();
@@ -17145,76 +17177,107 @@ run = "test -f feature.txt"
             .await
             .unwrap_err();
         assert!(matches!(
-            conflict,
+            &conflict,
             ServiceError::Git(GitError::SyntheticConflict { .. })
         ));
-
-        let rebase = git_output(
-            &task_worktree,
-            &["rebase", "--onto", &queued.tested_oid.to_hex(), &base],
-        );
-        assert!(
-            !rebase.status.success(),
-            "rebase should require delete resolution"
-        );
-        git(&task_worktree, &["rm", "messages.json"]);
-        git(
-            &task_worktree,
-            &["-c", "core.editor=true", "rebase", "--continue"],
-        );
+        let message = conflict.to_string();
+        assert!(message.contains("never rebase it onto a speculative prefix"));
+        assert!(message.contains("promoted, canceled, or reordered"));
         assert_eq!(
             git(&task_worktree, &["show", "-s", "--format=%P", "HEAD"]),
-            queued.tested_oid.to_hex()
+            base
         );
+        let snapshot = service
+            .repository_snapshot(initialized.state.id)
+            .await
+            .unwrap();
+        assert_eq!(snapshot.queue.len(), 1);
+        assert_eq!(snapshot.queue[0].item.id, queued.item_id);
+    }
 
+    #[tokio::test]
+    async fn ordinary_candidate_rejects_an_active_candidate_as_its_source_parent() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        let prerequisite_worktree = temporary.path().join("prerequisite");
+        let dependent_worktree = temporary.path().join("dependent");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("base.txt"), "base\n").unwrap();
+        git(&repository, &["add", "base.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
         git(
             &repository,
             &[
                 "worktree",
                 "add",
                 "-b",
-                "extension",
-                extension_worktree.to_str().unwrap(),
-                INTEGRATION_REF,
+                "prerequisite",
+                prerequisite_worktree.to_str().unwrap(),
+                USER_BRANCH,
             ],
         );
-        std::fs::write(extension_worktree.join("extension.txt"), "extension\n").unwrap();
-        git(&extension_worktree, &["add", "extension.txt"]);
+        std::fs::write(prerequisite_worktree.join("a.txt"), "a\n").unwrap();
+        git(&prerequisite_worktree, &["add", "a.txt"]);
+        git(&prerequisite_worktree, &["commit", "-m", "prerequisite"]);
+        git(&repository, &["switch", "--detach", USER_BRANCH]);
+
+        let service = TollgateService::open(temporary.path().join("support"))
+            .await
+            .unwrap();
+        let initialized = service
+            .initialize_repository(&repository, Some("true".into()))
+            .await
+            .unwrap();
+        let prerequisite = service
+            .submit_candidate_from(
+                initialized.state.id,
+                "HEAD".into(),
+                Some(prerequisite_worktree.to_string_lossy().into_owned()),
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
         git(
-            &extension_worktree,
-            &["commit", "-m", "extend speculative queue"],
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "dependent",
+                dependent_worktree.to_str().unwrap(),
+                &prerequisite.source_oid.to_hex(),
+            ],
         );
-        let extension = service
+        std::fs::write(dependent_worktree.join("b.txt"), "b\n").unwrap();
+        git(&dependent_worktree, &["add", "b.txt"]);
+        git(&dependent_worktree, &["commit", "-m", "dependent"]);
+
+        let error = service
             .submit_candidate_from(
                 initialized.state.id,
                 "HEAD".into(),
-                Some(extension_worktree.to_string_lossy().into_owned()),
+                Some(dependent_worktree.to_string_lossy().into_owned()),
                 CommandId::new(),
             )
             .await
-            .unwrap();
-        let recovered = service
-            .submit_candidate_from(
-                initialized.state.id,
-                "HEAD".into(),
-                Some(task_worktree.to_string_lossy().into_owned()),
-                CommandId::new(),
-            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ServiceError::UnpromotedSourceAncestor { ancestor, release_oid }
+                if ancestor == prerequisite.source_oid
+                    && release_oid == initialized.state.master_oid
+        ));
+        let snapshot = service
+            .repository_snapshot(initialized.state.id)
             .await
             .unwrap();
-        let recovered_view = service
-            .item_details(initialized.state.id, recovered.item_id)
-            .await
-            .unwrap();
-        assert_eq!(recovered_view.item.dependencies, vec![queued.item_id]);
-        assert_eq!(
-            recovered_view.generation.unwrap().expected_parent_oid,
-            extension.tested_oid
-        );
+        assert_eq!(snapshot.queue.len(), 1);
+        assert_eq!(snapshot.queue[0].item.id, prerequisite.item_id);
     }
 
     #[tokio::test]
-    async fn candidate_prefix_promoted_immediately_before_submission_is_authoritative() {
+    async fn promoted_source_parent_is_accepted_as_authoritative_history() {
         let temporary = tempfile::tempdir().unwrap();
         let repository = temporary.path().join("repository");
         let queued_worktree = temporary.path().join("queued");
@@ -17267,7 +17330,7 @@ run = "test -f feature.txt"
                 "-b",
                 "task",
                 task_worktree.to_str().unwrap(),
-                &queued.tested_oid.to_hex(),
+                &queued.source_oid.to_hex(),
             ],
         );
         std::fs::write(task_worktree.join("task.txt"), "task\n").unwrap();
@@ -17327,11 +17390,15 @@ run = "test -f feature.txt"
             .await
             .unwrap();
         assert!(view.item.dependencies.is_empty());
-        assert_eq!(view.item.source_oid, submitted.tested_oid);
+        assert_ne!(view.item.source_oid, submitted.tested_oid);
+        assert_eq!(
+            view.generation.unwrap().expected_parent_oid,
+            queued.tested_oid
+        );
     }
 
     #[tokio::test]
-    async fn canceled_speculative_parent_returns_structured_stale_queue_context() {
+    async fn speculative_parent_is_rejected_in_favor_of_promoted_release() {
         let temporary = tempfile::tempdir().unwrap();
         let repository = temporary.path().join("repository");
         let queued_worktree = temporary.path().join("queued");
@@ -17454,18 +17521,14 @@ run = "test -f feature.txt"
             .await
             .unwrap_err();
         match error {
-            ServiceError::StaleQueuePrefix {
-                source_parent_oid,
+            ServiceError::UnpromotedSourceAncestor {
+                ancestor,
                 release_oid,
-                queue_revision,
-                current_prefix_oid,
             } => {
-                assert_eq!(source_parent_oid, queued.tested_oid);
+                assert_eq!(ancestor, queued.tested_oid);
                 assert_eq!(release_oid, after_cancel.state.master_oid);
-                assert_eq!(queue_revision, after_cancel.state.queue_revision);
-                assert_eq!(current_prefix_oid, after_cancel.state.master_oid);
             }
-            error => panic!("expected stale queue prefix, got {error}"),
+            error => panic!("expected unpromoted source ancestor, got {error}"),
         }
     }
 
@@ -17527,11 +17590,16 @@ run = "test -f feature.txt"
             .await
             .unwrap();
         let b = service
-            .submit_candidate_from(
+            .enqueue_gate_from(
                 initialized.state.id,
                 "HEAD".into(),
                 Some(b_worktree.to_string_lossy().into_owned()),
-                CommandId::new(),
+                GateSubmission {
+                    purpose: Some("push-master".into()),
+                    cleanup_policy: CleanupPolicy::Automatic,
+                    command_id: CommandId::new(),
+                    promotion_authorized: false,
+                },
             )
             .await
             .unwrap();
@@ -17664,11 +17732,16 @@ run = "test -f feature.txt"
             .await
             .unwrap();
         let b = service
-            .submit_candidate_from(
+            .enqueue_gate_from(
                 initialized.state.id,
                 "HEAD".into(),
                 Some(b_worktree.to_string_lossy().into_owned()),
-                CommandId::new(),
+                GateSubmission {
+                    purpose: Some("push-master".into()),
+                    cleanup_policy: CleanupPolicy::Automatic,
+                    command_id: CommandId::new(),
+                    promotion_authorized: false,
+                },
             )
             .await
             .unwrap();
@@ -18084,7 +18157,14 @@ run = "test -f feature.txt"
             .await
             .unwrap();
         let b = service
-            .approve(initialized.state.id, "feature-b".into(), CommandId::new())
+            .approve_from_with_cleanup_policy(
+                initialized.state.id,
+                "feature-b".into(),
+                None,
+                Some("push-master".into()),
+                CleanupPolicy::Automatic,
+                CommandId::new(),
+            )
             .await
             .unwrap();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);

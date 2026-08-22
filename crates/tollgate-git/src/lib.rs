@@ -37,7 +37,7 @@ pub enum GitError {
     #[error("Git could not rebase the requested commit")]
     Unmergeable,
     #[error(
-        "cannot synthesize source {source_oid}: merge conflicts in {conflicting_paths:?} (source base {source_parent_oid}; current queue prefix {prefix_oid}); rebase the single task commit onto the latest release, or onto the displayed current queue prefix when an earlier candidate is involved, resolve the listed paths, regenerate derived files, refresh `tg --no-launch --json status`, and resubmit. Tollgate accepts a still-current speculative prefix as the source parent; if it changed, submission returns structured stale-queue context"
+        "cannot speculatively combine source {source_oid} with the current internal queue prefix {prefix_oid}: merge conflicts in {conflicting_paths:?} (source base {source_parent_oid}). Keep the source commit based only on promoted `release`; never rebase it onto a speculative prefix. Retry after the conflicting earlier candidate is promoted, canceled, or reordered. If promoted `release` itself has advanced incompatibly, rebase onto the latest `release`, resolve and regenerate, then resubmit"
     )]
     SyntheticConflict {
         source_oid: GitOid,
@@ -3013,7 +3013,8 @@ mod tests {
         assert!(message.contains("messages.json"));
         assert!(message.contains(&source_base));
         assert!(message.contains(&prefix.to_hex()));
-        assert!(message.contains("rebase the single task commit onto the latest release"));
+        assert!(message.contains("based only on promoted `release`"));
+        assert!(message.contains("never rebase it onto a speculative prefix"));
     }
 
     #[tokio::test]

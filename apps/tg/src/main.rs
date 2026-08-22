@@ -2119,7 +2119,10 @@ fn classify_exit(error: &anyhow::Error) -> u8 {
     if let Some(error) = error.downcast_ref::<IpcRequestError>()
         && matches!(
             error.0.code.as_str(),
-            "stale-queue-prefix" | "unknown-source-ancestor" | "revision-conflict"
+            "stale-queue-prefix"
+                | "unknown-source-ancestor"
+                | "unpromoted-source-ancestor"
+                | "revision-conflict"
         )
     {
         return 4;

@@ -151,11 +151,11 @@ Initialization leaves the developer's checkout unchanged and creates local `rele
 
 ### 6.3 Normal workflow
 
-1. The user creates or opens a feature worktree based on the gated `release` tip or an appropriate queued dependency. The primary checkout may remain on user-owned `master`.
+1. The user creates or opens a feature worktree based on the gated `release` tip. The primary checkout may remain on user-owned `master`; queued speculative work is never a supported feature-worktree base.
 2. The worktree contains one source commit. Ignored build output is allowed; staged changes, tracked modifications, and non-ignored untracked files are not.
 3. `tg candidate` captures `HEAD`, validates its shape and dependencies, creates `refs/tollgate/sources/<item-id>`, durably enqueues a non-promotable item, and returns its ID. `--retain-worktree` captures an immutable retained cleanup policy for workflows that continue using the same source worktree after promotion. `tg approve HEAD` remains a combined submit-and-authorize convenience and accepts the same policy.
 4. The app constructs synthetic prefixes, assigns new validation generations to affected items, and schedules eligible buildsets.
-5. `tg approve <candidate-id>` durably grants promotion authority to that exact retained source and every active hard dependency in its retained ancestry as one queue-revision transaction. The authorized closure may temporarily bypass unrelated unauthorized items, while hard dependencies remain ahead of their dependents. Tollgate retains admission order independently from this temporary execution order. When distributed approvals make the authorized set a contiguous admission prefix before any conflicting promotion, Tollgate restores that order, cancels redundant bypass work, and reactivates only exact completed generations whose complete validation identity and certificate still match. A passing authorized head is promoted automatically, so an unrelated candidate awaiting human authority cannot indefinitely block approved work.
+5. `tg approve <candidate-id>` durably grants promotion authority to that exact retained source. Ordinary worktree candidates have no active source dependencies. For the explicit `push-master` workflow, authority covers the submitted local commit's active ancestor closure as one queue-revision transaction. The authorized candidate or closure may temporarily bypass unrelated unauthorized items. Tollgate retains admission order independently from this temporary execution order. When distributed approvals make the authorized candidates a contiguous admission prefix before any conflicting promotion, Tollgate restores that order, cancels redundant bypass work, and reactivates only exact completed generations whose complete validation identity and certificate still match. A passing authorized head is promoted automatically, so an unrelated candidate awaiting human authority cannot indefinitely block approved work.
 6. After local promotion, or after push succeeds when push is enabled, Tollgate synchronizes user-owned local `master` under the safe default-on policy, then automatically cleans up the source worktree and branch if all safety checks still pass.
 
 Automatic cleanup requires a non-primary linked worktree that is still at the captured source OID and has no tracked, staged, or non-ignored untracked changes. Branch deletion is an old-OID compare-and-swap. Ignored files in an eligible linked worktree are disposable by default. A retained-worktree candidate finishes promotion with cleanup `not-eligible`, preserving its recorded worktree and branch. Candidate authorization and retry preserve the captured cleanup policy. If any automatic cleanup check fails, cleanup becomes `needs-attention`; promotion is never rolled back. The hidden source ref retains the commit for audit.
@@ -322,7 +322,8 @@ All Tollgate-internal plumbing operations, including mirror fetches, synthetic c
 - the resolved source is one commit object with exactly one parent;
 - the source is not already an ancestor of `release`;
 - the source OID is not already active in the queue;
-- every unmerged source ancestor is either literal `release` history, an active known source item, a prefix OID from a current speculative generation, or a previously promoted source item whose promoted OID is still in `release` history;
+- an ordinary candidate has no unmerged source ancestor: its single task commit is based only on promoted `release` history;
+- the explicit `push-master` workflow may preserve unmerged ancestors from the user's already-authored linear local commit chain while submitting that chain oldest-first;
 - effective configuration is valid enough to construct a gate buildset.
 
 Root and merge commits are rejected in v1. Ignored files do not make a developer worktree dirty. Approval captures source subject, full message hash, author/committer metadata, signature verification state, branch/ref OID if present, worktree path/identity, and approval time for display and cleanup; only the OID defines content.
@@ -339,14 +340,14 @@ Re-approving a changed OID from the same source branch follows Zuul's new-patchs
 
 ### 9.3 Hard Git dependencies
 
-Queue order alone creates a speculative relationship, not a hard dependency. A hard dependency exists when a source commit is actually based on another unmerged source commit.
+Queue order alone creates a speculative relationship, not a hard dependency. Ordinary worktree candidates may not create hard dependencies: their source commit must remain based only on promoted `release`. Tollgate can still synthesize clean combinations internally for validation without exposing those speculative commits as supported source bases.
 
-For source B, Tollgate walks from B's parent through first-parent ancestry until it reaches a literal ancestor of current `release`. Every intervening commit is resolved by exact OID, never by branch name, patch ID, or content similarity:
+The explicit `push-master` workflow is the exception because it submits a user-owned linear sequence that already exists beyond `release`. For source B in that workflow, Tollgate walks from B's parent through first-parent ancestry until it reaches a literal ancestor of current `release`. Every intervening commit is resolved by exact OID, never by branch name, patch ID, or content similarity:
 
 - An OID matching an active queue item's source OID creates an active hard-dependency edge.
-- An OID matching a prefix in a current validation generation creates hard-dependency edges to the active items represented through that point in the prefix. A source commit rebased onto the displayed tested prefix is therefore a supported candidate input.
+- An OID matching a prefix in a current validation generation can recover the corresponding dependency chain only for the controlled `push-master` submission sequence; ordinary candidates reject it as unpromoted source ancestry.
 - An OID matching a promoted item's source OID is a satisfied dependency only when that item's recorded promoted synthetic OID is a literal ancestor of current `release`.
-- An OID matching only an invalidated, failed, canceled, superseded, or otherwise historical speculative generation returns a retryable `stale-queue-prefix` result containing the current release OID, queue revision, current prefix OID, and recovery procedure.
+- An OID matching only an invalidated, failed, canceled, superseded, or otherwise historical speculative generation returns a retryable result whose only supported recovery base is current promoted `release`.
 - An unknown OID returns an actionable source-ancestry rejection rather than silently approving additional code or escaping as an internal invariant failure.
 
 Tollgate retains the durable mapping from each promoted source OID to its exact promoted synthetic OID indefinitely with audit metadata. This allows B, whose original parent is source A, to recognize that dependency after A has landed as synthetic commit `S_A`. Satisfied dependencies remain historical provenance but no longer constrain active queue order; active edges do.
@@ -369,7 +370,7 @@ The execution mirror is initialized as a disposable bare repository and is never
 
 Mirror synchronization uses explicit local fetches/refspecs. Deleting or rebuilding the mirror invalidates no durable result by itself: a completed tested object retained in the authoritative repository can still be verified. Missing active synthetic objects are deterministically reconstructed only if the stored validation-generation inputs reproduce the same OIDs; otherwise those buildsets are invalidated and rerun.
 
-Every current speculative generation also has an authoritative retention ref under `refs/tollgate/speculative/<generation-id>`. This makes a displayed `generation.tested_oid` immediately usable as a rebase base from any repository worktree and keeps historical OIDs recognizable long enough to distinguish ordinary stale-prefix churn from unsupported ancestry.
+Every current speculative generation also has an authoritative retention ref under `refs/tollgate/speculative/<generation-id>`. This preserves exact validation and audit evidence and lets Tollgate reconstruct or reuse its own internal prefixes. Displayed `generation.tested_oid` values are diagnostic execution artifacts, not supported rebase bases for ordinary source worktrees.
 
 ### 9.5 Synthetic prefix construction
 
@@ -399,7 +400,7 @@ Builder commands use only the recorded Git-semantics profile. The test suite con
 
 Every queue mutation advances the repository's monotonic queue revision. Commands use that revision to reject stale reorder, cancellation, cleanup, and other impact-sensitive requests. A queue revision is not evidence that code must be retested.
 
-Candidate submission captures the revision used for ancestry classification and synthesis, then compares it again inside the same SQLite transaction that makes the queue item visible. A still-current prefix is accepted, a prefix already promoted into `release` is authoritative history, and any lost compare-and-swap returns structured stale-queue data. Queue promotion, extension, cancellation, supersession, or replacement must never surface as an internal service invariant failure.
+Candidate submission captures the revision used for ancestry classification and synthesis, then compares it again inside the same SQLite transaction that makes the queue item visible. Ordinary candidates accept only promoted `release` ancestry; a prefix already promoted into `release` is authoritative history, while an unpromoted prefix is rejected as internal speculative state. Any lost compare-and-swap returns structured stale-queue data whose recovery points only to promoted `release`. Queue promotion, extension, cancellation, supersession, or replacement must never surface as an internal service invariant failure.
 
 Each active item is instead assigned an immutable validation generation identified by a digest of:
 
@@ -424,7 +425,8 @@ The gate follows Zuul's dependent-pipeline behavior:
 - Granting authority to a retained candidate permits its closure to bypass unrelated unauthorized items. Admission order remains a separate durable baseline, so authorization timing is not permanent user-directed priority.
 - If later independent approvals make the authorized candidates a contiguous admission prefix, Tollgate restores admission order before promotion. It cancels replacement work and reactivates retained evidence only for byte-for-byte identical validation identities; unmatched items receive new generations normally.
 - Manual reorder (`tg reorder`) replaces the admission-order baseline, preserves the dependency DAG, and restarts every item whose prefix changed. Later authorization convergence respects that explicit order.
-- Each eligible item is tested with every active item ahead of it.
+- Each eligible item is tested with every active item ahead of it when their independent patches compose cleanly inside Tollgate's disposable builder.
+- A speculative composition conflict never instructs or permits a source worktree to adopt the internal prefix. The source remains based on promoted `release` and may be retried after the conflicting queue relationship changes.
 - A conclusive failure or merge conflict removes that item from the active queue.
 - Affected independent descendants discard their results and restart without the failed item.
 - Hard dependents are removed rather than rebuilt without their prerequisite.
@@ -1220,7 +1222,9 @@ Use temporary real Git repositories and the supported system Git. Cover:
 - A fails; B/C rebuild without A;
 - B fails after A promotes; C rebuilds on A;
 - conflicts at every position;
-- independent versus stacked hard dependencies;
+- independent worktree candidates rejecting active or historical speculative ancestry;
+- clean independent candidates combining only inside Tollgate's synthetic prefix;
+- `push-master` preserving an explicit stacked local commit chain as hard dependencies;
 - approval of B before and after source A lands as synthetic `S_A`, using the durable source-to-promoted mapping;
 - failed, canceled, superseded, and unknown dependency OIDs;
 - old-base sources and direct-parent OID reuse;

@@ -78,23 +78,23 @@ Tollgate emits an item wait-status record only when the item or repository block
 state changes. Waiting never streams periodic repository or detailed buildset
 snapshots; use `tg status <candidate-id>` for the full candidate evidence view.
 
-`--wait` returns when validation has produced promotion-grade evidence (or a conclusive failure), while `release` remains unchanged. A user later grants authority to the exact retained candidate with `tg approve <candidate-id>`; that authority atomically covers its active hard dependencies because they are part of the retained source history. Granting authority to a retained candidate lets it bypass unrelated candidates still awaiting authority, rebuilding only the affected suffix. Tollgate retains the admission order and all exact completed evidence: if independent later approvals close every authorization gap before promotion, it restores that order, cancels redundant bypass work, and reuses every certificate whose complete validation identity still matches. An explicit `tg reorder` replaces the retained admission order. `tg cancel <candidate-id>` cancels it. For the original one-phase user workflow, `tg approve HEAD` still submits and authorizes in one command.
+`--wait` returns when validation has produced promotion-grade evidence (or a conclusive failure), while `release` remains unchanged. A user later grants authority to the exact retained candidate with `tg approve <candidate-id>`. Ordinary worktree candidates have no active source dependencies; only the explicit `push-master` workflow authorizes an ancestor closure from the user's submitted local commit chain. Granting authority lets the candidate or that explicit closure bypass unrelated candidates still awaiting authority, rebuilding only the affected suffix. Tollgate retains the admission order and all exact completed evidence: if independent later approvals close every authorization gap before promotion, it restores that order, cancels redundant bypass work, and reuses every certificate whose complete validation identity still matches. An explicit `tg reorder` replaces the retained admission order. `tg cancel <candidate-id>` cancels it. For the original one-phase user workflow, `tg approve HEAD` still submits and authorizes in one command.
 
 If a concurrent approval already granted authority to that candidate as an
 active dependency, repeating `tg approve <candidate-id>` succeeds without
 changing the queue revision; `--wait` then follows the already-authorized item.
 
-If synthesis conflicts with an earlier candidate, the `generation.tested_oid` shown by `tg --json status` is a supported recovery base. Tollgate retains every displayed speculative generation under `refs/tollgate/speculative/`, so the OID is available in every worktree of the registered repository. For a single task commit, use this flow:
+Tollgate may combine independent candidates in its disposable validation slots when their patches merge cleanly. Those synthesized prefixes are internal execution artifacts, never source-branch bases. If synthesis conflicts with an earlier candidate, keep the task commit based on promoted `release` and retry after the earlier candidate is promoted, canceled, or reordered. If `release` itself advanced incompatibly, rebase only onto the latest `release`, resolve and regenerate, then resubmit:
 
 ```sh
 tg --no-launch --json status
-git rebase --onto <current-prefix-oid> HEAD^
+git rebase release
 # resolve the reported paths, regenerate derived files, and continue the rebase
 tg --no-launch --json status
 tg --no-launch --json candidate HEAD
 ```
 
-An extension after the selected prefix is safe: Tollgate recognizes the still-active prefix, records hard dependencies on the queue items represented by it, and synthesizes the task after the current queue tip. If that prefix was canceled, superseded, or otherwise replaced before submission, JSON mode returns `stale-queue-prefix` with `release_oid`, `queue_revision`, `current_prefix_oid`, and a retry procedure. Refresh status and repeat against the new prefix; expected queue churn is never an internal-invariant error.
+Ordinary `candidate` and `approve` submissions reject commits containing unpromoted source ancestry and return the promoted `release_oid` as the only supported rebase target. The explicit `push-master` workflow is the exception: it preserves the user's already-authored linear local commit chain and records dependencies between those commits while submitting them oldest-first.
 
 To submit every clean, linear commit on local `master` after the certified
 `release` tip and automatically push the resulting certified chain, run:

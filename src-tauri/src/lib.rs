@@ -1449,7 +1449,7 @@ fn encode_candidate_submission_error(error: ServiceError) -> String {
                 "release_oid": release_oid,
                 "queue_revision": queue_revision,
                 "current_prefix_oid": current_prefix_oid,
-                "retry": "Refresh status, rebase the single task commit onto current_prefix_oid (or release_oid when equal), resolve and regenerate, then resubmit."
+                "retry": "Rebase the single task commit onto release_oid only, never current_prefix_oid; resolve and regenerate, then resubmit."
             })),
         }),
         ServiceError::UnknownSourceAncestor {
@@ -1466,7 +1466,20 @@ fn encode_candidate_submission_error(error: ServiceError) -> String {
                 "release_oid": release_oid,
                 "queue_revision": queue_revision,
                 "current_prefix_oid": current_prefix_oid,
-                "retry": "Rebase the single task commit onto current_prefix_oid (or release_oid when equal), then resubmit."
+                "retry": "Rebase the single task commit onto release_oid only, never current_prefix_oid, then resubmit."
+            })),
+        }),
+        ServiceError::UnpromotedSourceAncestor {
+            ancestor,
+            release_oid,
+        } => Some(StructuredError {
+            code: "unpromoted-source-ancestor".into(),
+            message: message.clone(),
+            retryable: true,
+            details: Some(serde_json::json!({
+                "ancestor_oid": ancestor,
+                "release_oid": release_oid,
+                "retry": "Rebase the single task commit onto release_oid only, then resubmit."
             })),
         }),
         _ => None,
@@ -1529,6 +1542,44 @@ mod ipc_error_tests {
         assert_eq!(
             error.details.as_ref().unwrap()["current_prefix_oid"],
             serde_json::to_value(current_prefix_oid).unwrap()
+        );
+        assert!(
+            error.details.as_ref().unwrap()["retry"]
+                .as_str()
+                .unwrap()
+                .contains("release_oid only")
+        );
+    }
+
+    #[test]
+    fn unpromoted_source_error_never_exposes_the_speculative_prefix_as_a_base() {
+        let release_oid = GitOid::from_hex("1111111111111111111111111111111111111111").unwrap();
+        let ancestor = GitOid::from_hex("2222222222222222222222222222222222222222").unwrap();
+        let encoded = encode_candidate_submission_error(ServiceError::UnpromotedSourceAncestor {
+            ancestor: ancestor.clone(),
+            release_oid: release_oid.clone(),
+        });
+        let error: StructuredError = serde_json::from_str(
+            encoded
+                .strip_prefix(STRUCTURED_SERVICE_ERROR_PREFIX)
+                .expect("unpromoted ancestry must cross IPC as a structured error"),
+        )
+        .unwrap();
+        assert_eq!(error.code, "unpromoted-source-ancestor");
+        assert!(error.retryable);
+        assert_eq!(
+            error.details.as_ref().unwrap()["release_oid"],
+            serde_json::to_value(release_oid).unwrap()
+        );
+        assert_eq!(
+            error.details.as_ref().unwrap()["ancestor_oid"],
+            serde_json::to_value(ancestor).unwrap()
+        );
+        assert!(
+            !error.details.as_ref().unwrap()["retry"]
+                .as_str()
+                .unwrap()
+                .contains("prefix")
         );
     }
 }
