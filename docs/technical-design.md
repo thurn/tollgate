@@ -609,7 +609,7 @@ When automatic user-master synchronization is disabled or needs attention, ordin
 ### 10.8 Gate-aware Git conveniences
 
 - `tg update`: rebase the current clean, unqueued feature branch onto current gated `release`, then verify it has one unique source commit and report its new OID.
-- `tg worktree create`: create a feature branch/worktree from the gated tip using configurable placement defaults.
+- `tg worktree create`: create a feature branch/worktree from the gated tip under the repository's `.worktrees/` directory by default. The conventional `wt/` branch prefix is omitted from the directory name; explicit destinations remain supported by the service API.
 - `tg worktree remove`: apply queued/landed/dirty safety checks before removal.
 
 General feature fetching, staging, committing, inspection, and pushing remain ordinary Git commands.

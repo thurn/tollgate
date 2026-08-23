@@ -6837,14 +6837,8 @@ impl TollgateService {
             Some(path) => PathBuf::from(path),
             None => {
                 let repository = Path::new(&state.path);
-                let parent = repository.parent().ok_or_else(|| {
-                    ServiceError::Invariant("repository has no parent directory".into())
-                })?;
-                let base = repository
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("worktree");
-                parent.join(format!("{base}-{}", branch.replace('/', "-")))
+                let name = branch.strip_prefix("wt/").unwrap_or(&branch);
+                repository.join(".worktrees").join(name.replace('/', "-"))
             }
         };
         if !destination.is_absolute()
@@ -6880,6 +6874,9 @@ impl TollgateService {
                 "base": state.master_oid,
             }),
         )?;
+        if let Some(parent) = destination.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
         let oid = runtime
             .git
             .create_feature_worktree(&branch, &destination)
@@ -13691,6 +13688,48 @@ mod tests {
         assert_eq!(
             execution.recovery_action.as_deref(),
             Some("Move the replacement aside and restart Tollgate.")
+        );
+    }
+
+    #[tokio::test]
+    async fn worktree_create_defaults_to_the_repository_worktrees_directory() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("base.txt"), "base\n").unwrap();
+        git(&repository, &["add", "base.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+        let service = TollgateService::open(temporary.path().join("support"))
+            .await
+            .unwrap();
+        let initialized = service
+            .initialize_repository_with_options(&repository, Some("true".into()), false)
+            .await
+            .unwrap();
+
+        let created = service
+            .create_worktree(
+                initialized.state.id,
+                "wt/error-incidents".into(),
+                None,
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        let expected = repository.join(".worktrees/error-incidents");
+
+        assert_eq!(
+            std::fs::canonicalize(&created.path).unwrap(),
+            std::fs::canonicalize(&expected).unwrap()
+        );
+        assert_eq!(
+            git(&expected, &["branch", "--show-current"]),
+            "wt/error-incidents"
+        );
+        assert_eq!(
+            git(&expected, &["rev-parse", "HEAD"]),
+            git(&repository, &["rev-parse", INTEGRATION_REF])
         );
     }
 
