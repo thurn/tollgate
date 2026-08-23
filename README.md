@@ -86,6 +86,8 @@ changing the queue revision; `--wait` then follows the already-authorized item.
 
 Tollgate combines independent candidates in its disposable validation slots when their patches merge cleanly. When a new candidate conflicts with an earlier speculative item, Tollgate retains it in a separate release-anchored validation lane. Authorizing either contender may move it to the promotable head; after it promotes, incompatible contenders become merge-conflicted against the new `release`. These synthesized prefixes and lanes are internal execution artifacts, never source-branch bases. If promoted `release` itself advanced incompatibly, rebase only onto the latest `release`, resolve and regenerate, then resubmit:
 
+Candidate submission is durable even when Tollgate cannot construct a prospective tested commit. A conflict or empty application against promoted `release` creates a terminal `merge-conflict` candidate with no validation generation or tested OID; it never turns the submission command into a candidate rejection. `tg candidate` returns the retained candidate immediately, while `tg candidate --wait` returns the conclusive validation exit code.
+
 ```sh
 tg --no-launch --json status
 git rebase release

@@ -2105,7 +2105,10 @@ fn short_oid(value: &str) -> String {
     value.chars().take(10).collect()
 }
 fn oid_value(value: &serde_json::Value) -> String {
-    short_oid(value["bytes"].as_str().unwrap_or("?"))
+    value["bytes"]
+        .as_str()
+        .map(short_oid)
+        .unwrap_or_else(|| "—".into())
 }
 fn classify_exit(error: &anyhow::Error) -> u8 {
     if let Some(error) = error.downcast_ref::<IpcRequestError>()
@@ -2139,6 +2142,11 @@ fn classify_exit(error: &anyhow::Error) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_tested_oid_is_rendered_as_unavailable() {
+        assert_eq!(oid_value(&serde_json::Value::Null), "—");
+    }
 
     fn repository_with_candidate(candidate_id: &str) -> RepositorySnapshot {
         let repository_id = "019ffe40-a60d-7722-a369-2635222d1204";

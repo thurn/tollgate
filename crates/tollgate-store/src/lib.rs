@@ -380,7 +380,7 @@ impl RepositoryStore {
     pub fn complete_approval(
         &self,
         item: &QueueItem,
-        generation: &ValidationGeneration,
+        generation: Option<&ValidationGeneration>,
         expected_revision: u64,
         actor: Actor,
         command_id: CommandId,
@@ -404,8 +404,8 @@ impl RepositoryStore {
         let new_revision = revision + 1;
         let new_sequence = sequence + 1;
         transaction.execute(
-            "INSERT INTO queue_items (item_id, repository_id, source_format, source_oid, enqueue_sequence, state, remote_state, cleanup_state, current_generation_id, item_json, active) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1)",
-            params![item.id.to_string(), item.repository_id.to_string(), format!("{:?}", item.source_oid.format).to_lowercase(), item.source_oid.as_bytes(), item.enqueue_sequence as i64, enum_json(&item.state)?, enum_json(&item.remote_state)?, enum_json(&item.cleanup_state)?, generation.id.to_string(), encode(item)?],
+            "INSERT INTO queue_items (item_id, repository_id, source_format, source_oid, enqueue_sequence, state, remote_state, cleanup_state, current_generation_id, item_json, active) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![item.id.to_string(), item.repository_id.to_string(), format!("{:?}", item.source_oid.format).to_lowercase(), item.source_oid.as_bytes(), item.enqueue_sequence as i64, enum_json(&item.state)?, enum_json(&item.remote_state)?, enum_json(&item.cleanup_state)?, item.current_generation_id.map(|id| id.to_string()), encode(item)?, (!item.state.is_terminal()) as i64],
         )?;
         for dependency in &item.dependencies {
             transaction.execute(
@@ -413,10 +413,12 @@ impl RepositoryStore {
                 params![item.id.to_string(), dependency.to_string()],
             )?;
         }
-        transaction.execute(
-            "INSERT INTO validation_generations (generation_id, item_id, identity_digest, tested_format, tested_oid, expected_parent_format, expected_parent_oid, configuration_digest, step_graph_digest, engine_epoch, generation_json, current) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1)",
-            params![generation.id.to_string(), generation.item_id.to_string(), generation.identity_digest, format!("{:?}", generation.tested_oid.format).to_lowercase(), generation.tested_oid.as_bytes(), format!("{:?}", generation.expected_parent_oid.format).to_lowercase(), generation.expected_parent_oid.as_bytes(), generation.configuration_digest, generation.step_graph_digest, generation.engine_epoch as i64, encode(generation)?],
-        )?;
+        if let Some(generation) = generation {
+            transaction.execute(
+                "INSERT INTO validation_generations (generation_id, item_id, identity_digest, tested_format, tested_oid, expected_parent_format, expected_parent_oid, configuration_digest, step_graph_digest, engine_epoch, generation_json, current) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1)",
+                params![generation.id.to_string(), generation.item_id.to_string(), generation.identity_digest, format!("{:?}", generation.tested_oid.format).to_lowercase(), generation.tested_oid.as_bytes(), format!("{:?}", generation.expected_parent_oid.format).to_lowercase(), generation.expected_parent_oid.as_bytes(), generation.configuration_digest, generation.step_graph_digest, generation.engine_epoch as i64, encode(generation)?],
+            )?;
+        }
         let mut persisted_state: RepositoryState = decode(&state_json)?;
         persisted_state.queue_revision = new_revision as u64;
         persisted_state.event_sequence = new_sequence as u64;
@@ -2419,7 +2421,7 @@ mod tests {
         let error = store
             .complete_approval(
                 &item,
-                &generation,
+                Some(&generation),
                 0,
                 Actor::Cli,
                 command_id,

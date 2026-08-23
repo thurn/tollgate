@@ -420,7 +420,7 @@ pub struct ApproveResult {
     pub item_id: QueueItemId,
     pub queue_revision: u64,
     pub source_oid: GitOid,
-    pub tested_oid: GitOid,
+    pub tested_oid: Option<GitOid>,
 }
 
 struct GateSubmission {
@@ -3289,6 +3289,95 @@ impl TollgateService {
         Ok(())
     }
 
+    async fn construct_gate_generation(
+        &self,
+        runtime: &Arc<RepositoryRuntime>,
+        item: &mut QueueItem,
+        state: &RepositoryState,
+        config: &EffectiveConfig,
+        mut ordered_ids: Vec<QueueItemId>,
+        mut sources: Vec<GitOid>,
+    ) -> Result<Option<ValidationGeneration>, ServiceError> {
+        runtime.git.initialize_mirror(&runtime.mirror).await?;
+        let synthetic = match runtime
+            .git
+            .construct_prefix(
+                &runtime.mirror,
+                &runtime.builder,
+                &state.master_oid,
+                &sources,
+            )
+            .await
+        {
+            Ok(synthetic) => Some(synthetic),
+            Err(error) if error.is_synthetic_rejection() && item.dependencies.is_empty() => {
+                // An independent candidate that conflicts with the current speculative
+                // prefix still gets a release-anchored validation lane.
+                ordered_ids = vec![item.id];
+                sources = vec![item.source_oid.clone()];
+                match runtime
+                    .git
+                    .construct_prefix(
+                        &runtime.mirror,
+                        &runtime.builder,
+                        &state.master_oid,
+                        &sources,
+                    )
+                    .await
+                {
+                    Ok(synthetic) => Some(synthetic),
+                    Err(standalone_error) if standalone_error.is_synthetic_rejection() => {
+                        item.state = item
+                            .state
+                            .transition(ItemEvent::MergeConflict)
+                            .map_err(|error| ServiceError::Invariant(error.to_string()))?;
+                        item.terminal_reason = Some(format!(
+                            "candidate could not be constructed on promoted release: {standalone_error}"
+                        ));
+                        None
+                    }
+                    Err(standalone_error) => return Err(standalone_error.into()),
+                }
+            }
+            Err(error) if error.is_synthetic_rejection() => {
+                item.state = item
+                    .state
+                    .transition(ItemEvent::MergeConflict)
+                    .map_err(|error| ServiceError::Invariant(error.to_string()))?;
+                item.terminal_reason = Some(format!(
+                    "candidate could not be constructed with its required prefix: {error}"
+                ));
+                None
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let Some(synthetic) = synthetic else {
+            return Ok(None);
+        };
+        let tested = synthetic
+            .last()
+            .ok_or_else(|| ServiceError::Invariant("synthetic prefix is empty".into()))?;
+        let generation = ValidationGeneration::derive(
+            ValidationGenerationId::new(),
+            item.id,
+            state.master_oid.clone(),
+            ordered_ids,
+            sources,
+            synthetic.iter().map(|commit| commit.oid.clone()).collect(),
+            tested.parent_oid.clone(),
+            tested.oid.clone(),
+            config.digest.clone(),
+            config.step_graph_digest.clone(),
+            state.engine_epoch,
+        );
+        item.current_generation_id = Some(generation.id);
+        item.state = item
+            .state
+            .transition(ItemEvent::GenerationPrepared)
+            .map_err(|error| ServiceError::Invariant(error.to_string()))?;
+        Ok(Some(generation))
+    }
+
     async fn reconcile_approval_intents(
         &self,
         runtime: &Arc<RepositoryRuntime>,
@@ -3353,7 +3442,7 @@ impl TollgateService {
                     item_id: item.id,
                     queue_revision: state.queue_revision,
                     source_oid: item.source_oid.clone(),
-                    tested_oid: generation.tested_oid.clone(),
+                    tested_oid: Some(generation.tested_oid.clone()),
                 };
                 let event = runtime.store.complete_check(
                     &item,
@@ -3399,58 +3488,23 @@ impl TollgateService {
                 .iter()
                 .map(|candidate| candidate.source_oid.clone())
                 .collect::<Vec<_>>();
-            runtime.git.initialize_mirror(&runtime.mirror).await?;
-            let synthetic = match runtime
-                .git
-                .construct_prefix(
-                    &runtime.mirror,
-                    &runtime.builder,
-                    &state.master_oid,
-                    &sources,
+            let generation = self
+                .construct_gate_generation(
+                    runtime,
+                    &mut item,
+                    &state,
+                    &config,
+                    ordered_ids,
+                    sources,
                 )
-                .await
-            {
-                Ok(synthetic) => synthetic,
-                Err(error) if error.is_synthetic_rejection() => {
-                    runtime
-                        .git
-                        .delete_source_ref(&item.source_ref, &item.source_oid)
-                        .await?;
-                    runtime.store.set_intent_state(
-                        command_id,
-                        IntentState::Canceled,
-                        &serde_json::json!({"recovery": "prefix-unmergeable"}),
-                    )?;
-                    continue;
-                }
-                Err(error) => return Err(error.into()),
-            };
-            let tested = synthetic
-                .last()
-                .ok_or_else(|| ServiceError::Invariant("recovered prefix is empty".into()))?;
-            let generation = ValidationGeneration::derive(
-                ValidationGenerationId::new(),
-                item.id,
-                state.master_oid.clone(),
-                ordered_ids,
-                sources,
-                synthetic.iter().map(|commit| commit.oid.clone()).collect(),
-                tested.parent_oid.clone(),
-                tested.oid.clone(),
-                config.digest.clone(),
-                config.step_graph_digest.clone(),
-                state.engine_epoch,
-            );
-            item.current_generation_id = Some(generation.id);
-            item.state = item
-                .state
-                .transition(ItemEvent::GenerationPrepared)
-                .map_err(|error| ServiceError::Invariant(error.to_string()))?;
+                .await?;
             let result = ApproveResult {
                 item_id: item.id,
                 queue_revision: state.queue_revision + 1,
                 source_oid: item.source_oid.clone(),
-                tested_oid: generation.tested_oid.clone(),
+                tested_oid: generation
+                    .as_ref()
+                    .map(|generation| generation.tested_oid.clone()),
             };
             let command_kind = if item.kind == QueueItemKind::IndependentCheck {
                 "check"
@@ -3459,17 +3513,19 @@ impl TollgateService {
             } else {
                 "approve"
             };
-            runtime
-                .git
-                .retain_speculative_object(
-                    &runtime.mirror,
-                    &generation.id.to_string(),
-                    &generation.tested_oid,
-                )
-                .await?;
+            if let Some(generation) = &generation {
+                runtime
+                    .git
+                    .retain_speculative_object(
+                        &runtime.mirror,
+                        &generation.id.to_string(),
+                        &generation.tested_oid,
+                    )
+                    .await?;
+            }
             let event = runtime.store.complete_approval(
                 &item,
-                &generation,
+                generation.as_ref(),
                 state.queue_revision,
                 Actor::Recovery,
                 command_id,
@@ -3481,7 +3537,9 @@ impl TollgateService {
             data.state.queue_revision += 1;
             data.state.event_sequence = event.sequence;
             data.items.push(item);
-            data.push_generation(generation);
+            if let Some(generation) = generation {
+                data.push_generation(generation);
+            }
             let _ = runtime.events.send(event);
         }
         Ok(())
@@ -5182,83 +5240,41 @@ impl TollgateService {
             .git
             .create_source_ref(item_id, &item.source_oid)
             .await?;
-        runtime.git.initialize_mirror(&runtime.mirror).await?;
-        let synthetic = match runtime
-            .git
-            .construct_prefix(
-                &runtime.mirror,
-                &runtime.builder,
-                &state.master_oid,
-                &sources,
+        let generation = self
+            .construct_gate_generation(
+                &runtime,
+                &mut item,
+                &state,
+                &current_config,
+                ordered_ids,
+                sources,
             )
-            .await
-        {
-            Ok(synthetic) => synthetic,
-            Err(error) if error.is_synthetic_rejection() && item.dependencies.is_empty() => {
-                // A candidate that conflicts with an earlier speculative item is still a
-                // valid contender for promotion before that item. Retain it and validate
-                // its source directly on the promoted base. Authorization can then move
-                // either contender to the head without requiring the source worktree to
-                // adopt an internal speculative prefix.
-                ordered_ids = vec![item_id];
-                sources = vec![item.source_oid.clone()];
-                runtime
-                    .git
-                    .construct_prefix(
-                        &runtime.mirror,
-                        &runtime.builder,
-                        &state.master_oid,
-                        &sources,
-                    )
-                    .await
-                    .map_err(|standalone_error| {
-                        if standalone_error.is_synthetic_rejection() {
-                            error
-                        } else {
-                            standalone_error
-                        }
-                    })?
-            }
-            Err(error) => return Err(error.into()),
-        };
-        let tested = synthetic
-            .last()
-            .ok_or_else(|| ServiceError::Invariant("synthetic prefix is empty".into()))?;
-        let generation = ValidationGeneration::derive(
-            ValidationGenerationId::new(),
-            item_id,
-            state.master_oid.clone(),
-            ordered_ids,
-            sources,
-            synthetic.iter().map(|commit| commit.oid.clone()).collect(),
-            tested.parent_oid.clone(),
-            tested.oid.clone(),
-            current_config.digest.clone(),
-            current_config.step_graph_digest.clone(),
-            state.engine_epoch,
-        );
-        item.current_generation_id = Some(generation.id);
-        item.state = item
-            .state
-            .transition(ItemEvent::GenerationPrepared)
-            .map_err(|error| ServiceError::Invariant(error.to_string()))?;
+            .await?;
         let result = ApproveResult {
             item_id,
             queue_revision: state.queue_revision + 1,
             source_oid: item.source_oid.clone(),
-            tested_oid: generation.tested_oid.clone(),
+            tested_oid: generation
+                .as_ref()
+                .map(|generation| generation.tested_oid.clone()),
         };
-        let speculative_ref = runtime
-            .git
-            .retain_speculative_object(
-                &runtime.mirror,
-                &generation.id.to_string(),
-                &generation.tested_oid,
+        let speculative_ref = if let Some(generation) = &generation {
+            Some(
+                runtime
+                    .git
+                    .retain_speculative_object(
+                        &runtime.mirror,
+                        &generation.id.to_string(),
+                        &generation.tested_oid,
+                    )
+                    .await?,
             )
-            .await?;
+        } else {
+            None
+        };
         let event = match runtime.store.complete_approval(
             &item,
-            &generation,
+            generation.as_ref(),
             state.queue_revision,
             if promotion_authorized {
                 Actor::Ui
@@ -5272,10 +5288,14 @@ impl TollgateService {
         ) {
             Ok(event) => event,
             Err(StoreError::RevisionConflict { .. }) => {
-                runtime
-                    .git
-                    .delete_source_ref(&speculative_ref, &generation.tested_oid)
-                    .await?;
+                if let Some((speculative_ref, generation)) =
+                    speculative_ref.zip(generation.as_ref())
+                {
+                    runtime
+                        .git
+                        .delete_source_ref(&speculative_ref, &generation.tested_oid)
+                        .await?;
+                }
                 runtime
                     .git
                     .delete_source_ref(&item.source_ref, &item.source_oid)
@@ -5306,7 +5326,9 @@ impl TollgateService {
             data.state.queue_revision += 1;
             data.state.event_sequence = event.sequence;
             data.items.push(item);
-            data.push_generation(generation);
+            if let Some(generation) = generation {
+                data.push_generation(generation);
+            }
         }
         let _ = runtime.events.send(event);
         self.spawn_eligible(repository_id, &runtime);
@@ -5994,7 +6016,7 @@ impl TollgateService {
             item_id,
             queue_revision: state.queue_revision,
             source_oid: item.source_oid.clone(),
-            tested_oid: generation.tested_oid.clone(),
+            tested_oid: Some(generation.tested_oid.clone()),
         };
         let event = runtime.store.complete_check(
             &item,
@@ -15240,7 +15262,7 @@ policy = "clone"
         }
         let promoted = git(&repository, &["rev-parse", INTEGRATION_REF]);
         let parent = git(&repository, &["show", "-s", "--format=%P", INTEGRATION_REF]);
-        assert_eq!(promoted, result.tested_oid.to_hex());
+        assert_eq!(promoted, result.tested_oid.as_ref().unwrap().to_hex());
         assert_eq!(parent, old_master);
         assert_eq!(git(&repository, &["rev-parse", USER_BRANCH_REF]), promoted);
         assert!(
@@ -15704,7 +15726,7 @@ run = "test -f feature.txt"
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
 
-        let promoted = approved.tested_oid.to_hex();
+        let promoted = approved.tested_oid.as_ref().unwrap().to_hex();
         assert_eq!(git(&repository, &["rev-parse", INTEGRATION_REF]), promoted);
         assert_eq!(git(&repository, &["rev-parse", USER_BRANCH_REF]), promoted);
         assert_eq!(
@@ -15813,7 +15835,7 @@ run = "test -f feature.txt"
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         };
 
-        let promoted = approved.tested_oid.to_hex();
+        let promoted = approved.tested_oid.as_ref().unwrap().to_hex();
         assert_eq!(git(&repository, &["rev-parse", INTEGRATION_REF]), promoted);
         assert_eq!(
             git(&repository, &["rev-parse", USER_BRANCH_REF]),
@@ -16890,7 +16912,7 @@ run = "test -f feature.txt"
         );
         assert_eq!(
             git(&repository, &["rev-parse", INTEGRATION_REF]),
-            b.tested_oid.to_hex()
+            b.tested_oid.as_ref().unwrap().to_hex()
         );
     }
 
@@ -17270,7 +17292,7 @@ run = "test -f feature.txt"
             .await
             .unwrap();
         assert!(snapshot.queue.is_empty());
-        assert_eq!(snapshot.state.master_oid, c.tested_oid);
+        assert_eq!(snapshot.state.master_oid, *c.tested_oid.as_ref().unwrap());
         let a_view = snapshot
             .history_items
             .iter()
@@ -17477,7 +17499,7 @@ run = "test -f feature.txt"
         assert_eq!(b_authorized.validation_generation_id, b_generation);
         assert_eq!(
             git(&repository, &["rev-parse", INTEGRATION_REF]),
-            b.tested_oid.to_hex()
+            b.tested_oid.as_ref().unwrap().to_hex()
         );
         let history = service
             .repository_snapshot(initialized.state.id)
@@ -17501,7 +17523,7 @@ run = "test -f feature.txt"
     }
 
     #[tokio::test]
-    async fn candidate_conflict_reports_paths_and_stale_base_without_creating_an_item() {
+    async fn candidate_conflict_is_durably_recorded_as_a_terminal_item() {
         let temporary = tempfile::tempdir().unwrap();
         let repository = temporary.path().join("repository");
         let feature = temporary.path().join("feature");
@@ -17537,17 +17559,39 @@ run = "test -f feature.txt"
             .initialize_repository(&repository, Some("true".into()))
             .await
             .unwrap();
-        let error = service
+        let command_id = CommandId::new();
+        let result = service
             .submit_candidate_from(
                 initialized.state.id,
                 "HEAD".into(),
                 Some(feature.to_string_lossy().into_owned()),
-                CommandId::new(),
+                command_id,
             )
             .await
-            .unwrap_err();
+            .unwrap();
+        assert_eq!(
+            service
+                .submit_candidate_from(
+                    initialized.state.id,
+                    "HEAD".into(),
+                    Some(feature.to_string_lossy().into_owned()),
+                    command_id,
+                )
+                .await
+                .unwrap()
+                .item_id,
+            result.item_id
+        );
 
-        let message = error.to_string();
+        assert!(result.tested_oid.is_none());
+        let details = service
+            .item_details(initialized.state.id, result.item_id)
+            .await
+            .unwrap();
+        assert_eq!(details.item.state, QueueItemState::MergeConflict);
+        assert!(details.generation.is_none());
+        assert!(details.buildset.is_none());
+        let message = details.item.terminal_reason.as_deref().unwrap();
         assert!(message.contains("merge conflicts"));
         assert!(message.contains("messages.json"));
         assert!(message.contains(&source_base));
@@ -17559,7 +17603,106 @@ run = "test -f feature.txt"
             .await
             .unwrap();
         assert!(snapshot.queue.is_empty());
-        assert_eq!(snapshot.state.queue_revision, 0);
+        assert_eq!(snapshot.state.queue_revision, 1);
+        assert!(snapshot.history_items.iter().any(|view| {
+            view.item.id == result.item_id && view.item.state == QueueItemState::MergeConflict
+        }));
+        assert!(snapshot.history.iter().any(|event| {
+            event.kind == "candidate.created" && event.payload["id"] == result.item_id.to_string()
+        }));
+        assert_eq!(
+            git(
+                &repository,
+                &[
+                    "rev-parse",
+                    &format!("refs/tollgate/sources/{}", result.item_id)
+                ]
+            ),
+            result.source_oid.to_hex()
+        );
+    }
+
+    #[tokio::test]
+    async fn standalone_conflict_is_recorded_even_when_an_existing_lane_conflicts_first() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        let first = temporary.path().join("first");
+        let second = temporary.path().join("second");
+        let third = temporary.path().join("third");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("shared.txt"), "base\n").unwrap();
+        std::fs::write(repository.join("docs.txt"), "base\n").unwrap();
+        git(&repository, &["add", "."]);
+        git(&repository, &["commit", "-m", "base"]);
+        for (branch, path) in [("first", &first), ("second", &second), ("third", &third)] {
+            git(
+                &repository,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    branch,
+                    path.to_str().unwrap(),
+                    USER_BRANCH,
+                ],
+            );
+        }
+        std::fs::write(first.join("shared.txt"), "first\n").unwrap();
+        git(&first, &["commit", "-am", "first lane"]);
+        std::fs::write(second.join("shared.txt"), "second\n").unwrap();
+        git(&second, &["commit", "-am", "second lane"]);
+        std::fs::write(third.join("docs.txt"), "candidate docs\n").unwrap();
+        git(&third, &["commit", "-am", "candidate docs"]);
+
+        std::fs::write(repository.join("docs.txt"), "release docs\n").unwrap();
+        git(&repository, &["commit", "-am", "advance release docs"]);
+        git(&repository, &["switch", "--detach", USER_BRANCH]);
+
+        let service = TollgateService::open(temporary.path().join("support"))
+            .await
+            .unwrap();
+        let initialized = service
+            .initialize_repository(&repository, Some("true".into()))
+            .await
+            .unwrap();
+        service
+            .submit_candidate_from(
+                initialized.state.id,
+                "HEAD".into(),
+                Some(first.to_string_lossy().into_owned()),
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        service
+            .submit_candidate_from(
+                initialized.state.id,
+                "HEAD".into(),
+                Some(second.to_string_lossy().into_owned()),
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        let result = service
+            .submit_candidate_from(
+                initialized.state.id,
+                "HEAD".into(),
+                Some(third.to_string_lossy().into_owned()),
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.tested_oid.is_none());
+        let details = service
+            .item_details(initialized.state.id, result.item_id)
+            .await
+            .unwrap();
+        assert_eq!(details.item.state, QueueItemState::MergeConflict);
+        let reason = details.item.terminal_reason.as_deref().unwrap();
+        assert!(reason.contains("docs.txt"));
+        assert!(!reason.contains("shared.txt"));
     }
 
     #[tokio::test]
@@ -17620,7 +17763,8 @@ run = "test -f feature.txt"
             .await
             .unwrap();
         assert_ne!(
-            queued.source_oid, queued.tested_oid,
+            &queued.source_oid,
+            queued.tested_oid.as_ref().unwrap(),
             "fixture must exercise a synthetic prefix rather than an active source OID"
         );
         let queued_view = service
@@ -17636,7 +17780,7 @@ run = "test -f feature.txt"
                     &format!("refs/tollgate/speculative/{}", generation.id)
                 ],
             ),
-            queued.tested_oid.to_hex()
+            queued.tested_oid.as_ref().unwrap().to_hex()
         );
 
         let contender = service
@@ -17901,10 +18045,13 @@ run = "test -f feature.txt"
             .await
             .unwrap();
         assert!(view.item.dependencies.is_empty());
-        assert_ne!(view.item.source_oid, submitted.tested_oid);
+        assert_ne!(
+            &view.item.source_oid,
+            submitted.tested_oid.as_ref().unwrap()
+        );
         assert_eq!(
             view.generation.unwrap().expected_parent_oid,
-            queued.tested_oid
+            *queued.tested_oid.as_ref().unwrap()
         );
     }
 
@@ -17997,7 +18144,7 @@ run = "test -f feature.txt"
                 "-b",
                 "task",
                 task_worktree.to_str().unwrap(),
-                &queued.tested_oid.to_hex(),
+                &queued.tested_oid.as_ref().unwrap().to_hex(),
             ],
         );
         std::fs::write(task_worktree.join("task.txt"), "task\n").unwrap();
@@ -18036,7 +18183,7 @@ run = "test -f feature.txt"
                 ancestor,
                 release_oid,
             } => {
-                assert_eq!(ancestor, queued.tested_oid);
+                assert_eq!(ancestor, *queued.tested_oid.as_ref().unwrap());
                 assert_eq!(release_oid, after_cancel.state.master_oid);
             }
             error => panic!("expected unpromoted source ancestor, got {error}"),
@@ -18300,7 +18447,7 @@ run = "test -f feature.txt"
         assert!(authorized.evidence_reused);
         assert_eq!(
             git(&repository, &["rev-parse", INTEGRATION_REF]),
-            b.tested_oid.to_hex()
+            b.tested_oid.as_ref().unwrap().to_hex()
         );
         assert_ne!(
             git(&repository, &["rev-parse", INTEGRATION_REF]),
