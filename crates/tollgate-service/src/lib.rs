@@ -488,12 +488,6 @@ pub struct WorktreeOperationResult {
     pub message: String,
 }
 
-struct WorktreeHydrationResult {
-    logical_bytes: u64,
-    hydrated_entries: usize,
-    skipped_entries: usize,
-}
-
 struct RuntimeData {
     state: RepositoryState,
     items: Vec<QueueItem>,
@@ -2324,7 +2318,6 @@ impl TollgateService {
                 .ok_or_else(|| ServiceError::Invariant("worktree intent omitted path".into()))?,
         )?;
         if kind == "worktree-create" {
-            cleanup_worktree_hydration_staging(runtime, command_id)?;
             if !tokio::fs::try_exists(&path).await? {
                 runtime.store.set_intent_state(
                     command_id,
@@ -6835,7 +6828,6 @@ impl TollgateService {
         repository_id: RepositoryId,
         branch: String,
         destination: Option<String>,
-        warm: bool,
         command_id: CommandId,
     ) -> Result<WorktreeOperationResult, ServiceError> {
         let runtime = self.runtime(repository_id).await?;
@@ -6868,7 +6860,6 @@ impl TollgateService {
             "repository_id": repository_id,
             "branch": branch,
             "destination": destination,
-            "warm": warm,
         }))?;
         if let Some(response) = runtime.store.checked_command_response(
             command_id,
@@ -6876,10 +6867,6 @@ impl TollgateService {
             &request_digest,
         )? {
             return Ok(response);
-        }
-        if warm {
-            self.ensure_compatible_seed_locked(&runtime, "warm worktree preparation")
-                .await?;
         }
         let state = runtime.data.lock().state.clone();
         runtime.store.prepare_operation(
@@ -6891,66 +6878,12 @@ impl TollgateService {
                 "branch": branch,
                 "destination": destination,
                 "base": state.master_oid,
-                "warm": warm,
             }),
         )?;
         let oid = runtime
             .git
             .create_feature_worktree(&branch, &destination)
             .await?;
-        let hydration = if warm {
-            let seed = {
-                let data = runtime.data.lock();
-                compatible_seed(&data)?
-            };
-            match seed {
-                Some(seed) => match self
-                    .require_global_volume_warning(&runtime, &destination, "warm worktree creation")
-                    .await
-                {
-                    Ok(()) => match self
-                        .hydrate_feature_worktree(&runtime, &seed, &destination, command_id)
-                        .await
-                    {
-                        Ok(hydration) => {
-                            let hydrated_label = if hydration.hydrated_entries == 1 {
-                                "entry"
-                            } else {
-                                "entries"
-                            };
-                            let skipped = if hydration.skipped_entries == 0 {
-                                ".".into()
-                            } else {
-                                let skipped_label = if hydration.skipped_entries == 1 {
-                                    "entry"
-                                } else {
-                                    "entries"
-                                };
-                                format!(
-                                    "; skipped {} inapplicable cache {skipped_label}.",
-                                    hydration.skipped_entries
-                                )
-                            };
-                            format!(
-                                " Hydrated {} logical bytes across {} cache {hydrated_label} from APFS seed {}{skipped}",
-                                hydration.logical_bytes, hydration.hydrated_entries, seed.id
-                            )
-                        }
-                        Err(error) => format!(
-                            " Cache hydration was unavailable, so the worktree remains cold: {error}."
-                        ),
-                    },
-                    Err(error) => format!(
-                        " Cache hydration was unavailable, so the worktree remains cold: {error}."
-                    ),
-                },
-                None => {
-                    " No compatible cache seed is published, so the worktree remains cold.".into()
-                }
-            }
-        } else {
-            String::new()
-        };
         let result = WorktreeOperationResult {
             action: "created".into(),
             path: destination.to_string_lossy().into_owned(),
@@ -6958,8 +6891,8 @@ impl TollgateService {
             old_oid: None,
             new_oid: Some(oid.clone()),
             message: format!(
-                "Created a feature worktree from gated release {}.{hydration}",
-                oid.short(),
+                "Created a feature worktree from gated release {}.",
+                oid.short()
             ),
         };
         let event = runtime.store.complete_operation(
@@ -9977,167 +9910,6 @@ impl TollgateService {
         Ok(())
     }
 
-    async fn hydrate_feature_worktree(
-        &self,
-        runtime: &RepositoryRuntime,
-        seed: &SeedRecord,
-        worktree: &Path,
-        command_id: CommandId,
-    ) -> Result<WorktreeHydrationResult, ServiceError> {
-        verify_seed_record_at(Path::new(&seed.path), seed)?;
-        let seed_root = std::fs::canonicalize(&seed.path)?;
-        let worktree_root = std::fs::canonicalize(worktree)?;
-        let checkout = GitRepository::discover(&worktree_root).await?;
-        if checkout.common_dir != runtime.git.common_dir {
-            return Err(ServiceError::Invariant(
-                "warm cache destination belongs to another repository".into(),
-            ));
-        }
-        let entries = seed
-            .manifest
-            .get("entries")
-            .and_then(serde_json::Value::as_array)
-            .ok_or_else(|| ServiceError::Invariant("seed manifest omitted entries".into()))?;
-        let mut selected = Vec::with_capacity(entries.len());
-        let mut skipped_entries = 0usize;
-        for entry in entries {
-            let relative: PathBuf = serde_json::from_value(
-                entry
-                    .get("path")
-                    .cloned()
-                    .ok_or_else(|| ServiceError::Invariant("seed entry omitted path".into()))?,
-            )?;
-            if relative.is_absolute()
-                || relative
-                    .components()
-                    .any(|component| !matches!(component, std::path::Component::Normal(_)))
-            {
-                return Err(ServiceError::Invariant(
-                    "seed entry path is not normalized and relative".into(),
-                ));
-            }
-            let source = std::fs::canonicalize(seed_root.join(&relative)).map_err(|error| {
-                ServiceError::Invariant(format!(
-                    "worktree cache seed entry `{}` could not be resolved: {error}",
-                    relative.display()
-                ))
-            })?;
-            if !source.starts_with(&seed_root) || !source.is_dir() {
-                return Err(ServiceError::Invariant(
-                    "seed entry escaped its immutable generation".into(),
-                ));
-            }
-            let destination = worktree_root.join(&relative);
-            if destination.exists() {
-                skipped_entries += 1;
-                continue;
-            }
-            let parent = destination
-                .parent()
-                .ok_or_else(|| ServiceError::Invariant("cache destination has no parent".into()))?;
-            let metadata = match std::fs::symlink_metadata(parent) {
-                Ok(metadata) => metadata,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    skipped_entries += 1;
-                    continue;
-                }
-                Err(error) => {
-                    return Err(ServiceError::Invariant(format!(
-                        "cache path `{}` parent could not be inspected: {error}",
-                        relative.display()
-                    )));
-                }
-            };
-            if metadata.file_type().is_symlink()
-                || !metadata.is_dir()
-                || !std::fs::canonicalize(parent)
-                    .map_err(|error| {
-                        ServiceError::Invariant(format!(
-                            "cache path `{}` parent could not be resolved: {error}",
-                            relative.display()
-                        ))
-                    })?
-                    .starts_with(&worktree_root)
-            {
-                return Err(ServiceError::Invariant(format!(
-                    "cache path `{}` has an unsafe parent",
-                    relative.display()
-                )));
-            }
-            if !runtime
-                .git
-                .directory_is_ignored(&worktree_root, &relative)
-                .await?
-            {
-                skipped_entries += 1;
-                continue;
-            }
-            let logical_size = entry
-                .get("clone_manifest")
-                .and_then(|manifest| manifest.get("logical_size"))
-                .and_then(serde_json::Value::as_u64)
-                .ok_or_else(|| {
-                    ServiceError::Invariant("seed entry omitted its logical size".into())
-                })?;
-            selected.push((source, destination, logical_size));
-        }
-
-        let staging = worktree_hydration_staging(runtime, command_id).map_err(|error| {
-            ServiceError::Invariant(format!("cache hydration staging setup failed: {error}"))
-        })?;
-        if staging.exists() {
-            return Err(ServiceError::Invariant(
-                "cache hydration staging path already exists".into(),
-            ));
-        }
-        std::fs::create_dir(&staging).map_err(|error| {
-            ServiceError::Invariant(format!("cache hydration staging creation failed: {error}"))
-        })?;
-        let mut staged = Vec::with_capacity(selected.len());
-        for (index, (source, destination, logical_size)) in selected.into_iter().enumerate() {
-            let staged_path = staging.join(index.to_string());
-            if let Err(error) = force_clone_tree(&source, &staged_path) {
-                if staged_path.exists() {
-                    std::fs::remove_dir_all(&staged_path).map_err(|cleanup_error| {
-                        ServiceError::Invariant(format!(
-                            "cache entry clone failed ({error}) and its staging cleanup failed: {cleanup_error}"
-                        ))
-                    })?;
-                }
-                skipped_entries += 1;
-                continue;
-            }
-            staged.push((staged_path, destination, logical_size));
-        }
-        let mut imported = Vec::with_capacity(staged.len());
-        let mut logical_bytes = 0u64;
-        for (staged_path, destination, logical_size) in staged {
-            if let Err(error) = std::fs::rename(&staged_path, &destination) {
-                rollback_hydrated_paths(&worktree_root, &imported)?;
-                cleanup_worktree_hydration_staging(runtime, command_id)?;
-                return Err(ServiceError::Invariant(format!(
-                    "staged cache entry could not be installed at `{}`: {error}",
-                    destination.display()
-                )));
-            }
-            imported.push(destination);
-            logical_bytes = logical_bytes.saturating_add(logical_size);
-        }
-        if let Err(error) = checkout.ensure_clean().await {
-            rollback_hydrated_paths(&worktree_root, &imported)?;
-            cleanup_worktree_hydration_staging(runtime, command_id)?;
-            return Err(error.into());
-        }
-        cleanup_worktree_hydration_staging(runtime, command_id).map_err(|error| {
-            ServiceError::Invariant(format!("cache hydration staging cleanup failed: {error}"))
-        })?;
-        Ok(WorktreeHydrationResult {
-            logical_bytes,
-            hydrated_entries: imported.len(),
-            skipped_entries,
-        })
-    }
-
     async fn rebuild_after_base_adoption(
         &self,
         runtime: &Arc<RepositoryRuntime>,
@@ -12930,53 +12702,6 @@ fn compatible_seed(data: &RuntimeData) -> Result<Option<SeedRecord>, ServiceErro
         .cloned())
 }
 
-fn rollback_hydrated_paths(worktree: &Path, paths: &[PathBuf]) -> Result<(), ServiceError> {
-    for path in paths.iter().rev() {
-        if !path.starts_with(worktree) || path == worktree {
-            return Err(ServiceError::Invariant(
-                "cache hydration rollback escaped the new worktree".into(),
-            ));
-        }
-        let metadata = std::fs::symlink_metadata(path)?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err(ServiceError::Invariant(
-                "cache hydration rollback found an unsafe destination".into(),
-            ));
-        }
-        std::fs::remove_dir_all(path)?;
-    }
-    Ok(())
-}
-
-fn worktree_hydration_staging(
-    runtime: &RepositoryRuntime,
-    command_id: CommandId,
-) -> Result<PathBuf, ServiceError> {
-    let cache_root = runtime
-        .slots_root
-        .parent()
-        .ok_or_else(|| ServiceError::Invariant("cache root has no parent".into()))?;
-    let hydration_root = cache_root.join("worktree-hydration");
-    std::fs::create_dir_all(&hydration_root)?;
-    verify_owned_directory(cache_root, &hydration_root)?;
-    Ok(hydration_root.join(command_id.to_string()))
-}
-
-fn cleanup_worktree_hydration_staging(
-    runtime: &RepositoryRuntime,
-    command_id: CommandId,
-) -> Result<(), ServiceError> {
-    let staging = worktree_hydration_staging(runtime, command_id)?;
-    if staging.exists() {
-        let parent = staging
-            .parent()
-            .ok_or_else(|| ServiceError::Invariant("hydration staging has no parent".into()))?;
-        verify_owned_directory(parent, &staging)?;
-        std::fs::remove_dir_all(staging)?;
-    }
-    Ok(())
-}
-
 fn derived_command_id(parent: CommandId, label: &str) -> CommandId {
     let mut hasher = blake3::Hasher::new();
     hasher.update(parent.0.as_bytes());
@@ -15354,81 +15079,16 @@ policy = "clone"
                 initialized.state.id,
                 "cold-worktree".into(),
                 Some(cold_worktree.to_string_lossy().into_owned()),
-                false,
                 CommandId::new(),
             )
             .await
             .unwrap();
         assert!(!cold_worktree.join("target").exists());
         assert!(!cold.message.contains("Hydrated"));
-        let warm_worktree = temporary.path().join("warm-worktree");
-        let warm = service
-            .create_worktree(
-                initialized.state.id,
-                "warm-worktree".into(),
-                Some(warm_worktree.to_string_lossy().into_owned()),
-                true,
-                CommandId::new(),
-            )
-            .await
-            .unwrap();
-        assert!(
-            warm.message
-                .contains("Hydrated 5 logical bytes across 1 cache entry from APFS seed"),
-            "{}",
-            warm.message
-        );
-        assert!(
-            warm.message
-                .contains("skipped 2 inapplicable cache entries"),
-            "{}",
-            warm.message
-        );
-        assert_eq!(
-            std::fs::read_to_string(warm_worktree.join("target/cache")).unwrap(),
-            "cache"
-        );
-        assert!(!warm_worktree.join("scripts/__pycache__").exists());
-        assert!(!warm_worktree.join("orphan/cache").exists());
-        GitRepository::discover(&warm_worktree)
-            .await
-            .unwrap()
-            .ensure_clean()
-            .await
-            .unwrap();
         service
             .purge_cache(initialized.state.id, false, CommandId::new())
             .await
             .unwrap();
-        let repaired_worktree = temporary.path().join("repaired-warm-worktree");
-        let repaired = service
-            .create_worktree(
-                initialized.state.id,
-                "repaired-warm-worktree".into(),
-                Some(repaired_worktree.to_string_lossy().into_owned()),
-                true,
-                CommandId::new(),
-            )
-            .await
-            .unwrap();
-        assert!(
-            repaired
-                .message
-                .contains("Hydrated 5 logical bytes across 1 cache entry from APFS seed"),
-            "{}",
-            repaired.message
-        );
-        assert!(
-            repaired
-                .message
-                .contains("skipped 2 inapplicable cache entries"),
-            "{}",
-            repaired.message
-        );
-        assert_eq!(
-            std::fs::read_to_string(repaired_worktree.join("target/cache")).unwrap(),
-            "cache"
-        );
         drop(service);
         let reopened = TollgateService::open(temporary.path().join("support"))
             .await
@@ -15439,14 +15099,14 @@ policy = "clone"
             .unwrap();
         assert_eq!(recovered.state.master_oid.to_hex(), promoted);
         assert!(recovered.queue.is_empty());
-        assert_eq!(recovered.seeds.len(), 2);
+        assert_eq!(recovered.seeds.len(), 1);
         assert_eq!(
             recovered
                 .seeds
                 .iter()
                 .filter(|seed| seed.state == "published")
                 .count(),
-            1
+            0
         );
         assert!(recovered.seeds.iter().all(|seed| seed.logical_size == 19));
         reopened
@@ -15457,7 +15117,7 @@ policy = "clone"
             .repository_snapshot(initialized.state.id)
             .await
             .unwrap();
-        assert_eq!(after_purge.seeds.len(), 2);
+        assert_eq!(after_purge.seeds.len(), 1);
         assert!(after_purge.seeds.iter().all(|seed| seed.state == "pruned"));
     }
 

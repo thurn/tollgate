@@ -315,8 +315,6 @@ pub enum IpcCommand {
         repository_id: RepositoryId,
         branch: String,
         destination: Option<String>,
-        #[serde(default)]
-        warm: bool,
         command_id: CommandId,
     },
     WorktreeRemove {

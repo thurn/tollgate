@@ -609,7 +609,7 @@ When automatic user-master synchronization is disabled or needs attention, ordin
 ### 10.8 Gate-aware Git conveniences
 
 - `tg update`: rebase the current clean, unqueued feature branch onto current gated `release`, then verify it has one unique source commit and report its new OID.
-- `tg worktree create`: create a cold feature branch/worktree from the gated tip using configurable placement defaults. `--warm` additionally imports a compatible immutable APFS seed when one is available.
+- `tg worktree create`: create a feature branch/worktree from the gated tip using configurable placement defaults.
 - `tg worktree remove`: apply queued/landed/dirty safety checks before removal.
 
 General feature fetching, staging, committing, inspection, and pushing remain ordinary Git commands.
@@ -875,10 +875,6 @@ Automatic seed snapshots occur after:
 
 They do not occur after every passing speculative descendant. Seed publication is
 internal cache maintenance rather than a routine user command.
-When warm worktree creation finds no compatible seed, it first attempts the same
-publication from a healthy idle slot and then hydrates the new worktree. If cache
-publication is unavailable, worktree creation still degrades safely to cold.
-
 At a safe boundary, with the donor slot idle and all processes reaped:
 
 1. Enumerate eligible ignored paths with stable Git porcelain plus trusted cache overrides. Automatically discovered directories must remain ignored for an arbitrary child path; directories reported only because their current contents happen to be ignored are excluded.
@@ -902,8 +898,6 @@ Creating a slot is a durable state machine rather than a directory copy:
 7. Mark the slot `ready` only after every check succeeds.
 
 If no compatible seed exists, provision cold. If seeding fails, quarantine the partial path and retry cold rather than using a torn mixture. A new slot is never cloned from a live donor.
-
-Feature worktrees remain cold by default. With `tg worktree create --warm`, Tollgate may clone the same compatible immutable seed into a newly created user worktree. Each installed destination must be absent, ignored by that exact checkout, beneath a real non-symlink parent, and listed in the verified seed manifest. Entries that already exist, are no longer recursively ignored, lack an existing safe parent, or cannot be force-cloned are skipped while other applicable entries continue. Structural seed corruption, unsafe destination topology, an installation race, or a dirty final checkout still rejects hydration and rolls back every imported path. Tollgate returns the usable cold worktree with a diagnostic after a hard hydration failure; it never copies physically or imports from a live slot.
 
 Compatibility requires repository ID, Apple Silicon/macOS cache profile, cache epoch, and trusted cache-policy compatibility. Source/config proximity affects preference, not strict compatibility, because the chosen default trusts build-tool invalidation. Toolchain and shell fingerprints are recorded for diagnosis. Projects needing strict separation increment the epoch or define profiles.
 
@@ -1006,7 +1000,7 @@ The initial CLI surface is:
 | `tg push` | Push only contiguous certified local `release` commits to the configured remote branch with a lease. |
 | `tg reconcile` | Guided external movement/divergence recovery. |
 | `tg update` | Safe one-commit feature rebase onto current gated `release`. |
-| `tg worktree create [--warm]/remove` | Gate-aware feature worktree lifecycle with optional APFS cache hydration. |
+| `tg worktree create/remove` | Gate-aware feature worktree lifecycle. |
 | `tg env reload/show` | Bootstrap and diagnose shell environment. |
 | `tg config validate/explain/regenerate/apply` | Validate, inspect, regenerate, preview, and explicitly activate the single local configuration. |
 | `tg slot list/reset` | Slot health and cold recreation. |

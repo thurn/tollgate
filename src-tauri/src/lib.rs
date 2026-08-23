@@ -263,16 +263,9 @@ async fn create_worktree(
     repository_id: RepositoryId,
     branch: String,
     destination: Option<String>,
-    warm: Option<bool>,
 ) -> Result<WorktreeOperationResult, String> {
     let result = service
-        .create_worktree(
-            repository_id,
-            branch,
-            destination,
-            warm.unwrap_or(false),
-            CommandId::new(),
-        )
+        .create_worktree(repository_id, branch, destination, CommandId::new())
         .await
         .map_err(|error| error.to_string())?;
     let _ = app.emit("tollgate://snapshot-changed", ());
@@ -1246,11 +1239,10 @@ async fn execute_ipc_command(service: &Service, command: IpcCommand) -> IpcRespo
                 repository_id,
                 branch,
                 destination,
-                warm,
                 command_id,
             } => serde_json::to_value(
                 service
-                    .create_worktree(repository_id, branch, destination, warm, command_id)
+                    .create_worktree(repository_id, branch, destination, command_id)
                     .await
                     .map_err(|error| error.to_string())?,
             )
