@@ -673,7 +673,13 @@ impl GitRepository {
                 top_level.push(directory);
             }
         }
-        Ok(top_level)
+        let mut recursively_ignored = Vec::with_capacity(top_level.len());
+        for directory in top_level {
+            if self.directory_is_ignored(worktree, &directory).await? {
+                recursively_ignored.push(directory);
+            }
+        }
+        Ok(recursively_ignored)
     }
 
     /// Reports whether a prospective directory is ignored in the selected worktree.
@@ -2137,6 +2143,39 @@ mod tests {
             Some(USER_BRANCH)
         );
         adapter.ensure_integration_not_checked_out().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ignored_cache_directories_must_be_recursively_ignored() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join(".gitignore"), "cache/\n*.pyc\n").unwrap();
+        git(&repository, &["add", ".gitignore"]);
+        git(&repository, &["commit", "-m", "base"]);
+        std::fs::create_dir(repository.join("cache")).unwrap();
+        std::fs::write(repository.join("cache/value"), "cache").unwrap();
+        std::fs::create_dir_all(repository.join("scripts/__pycache__")).unwrap();
+        std::fs::write(repository.join("scripts/__pycache__/tool.pyc"), "bytecode").unwrap();
+
+        let adapter = GitRepository::discover(&repository).await.unwrap();
+        assert_eq!(
+            adapter.ignored_directories(&repository).await.unwrap(),
+            vec![PathBuf::from("cache")]
+        );
+        assert!(
+            adapter
+                .directory_is_ignored(&repository, Path::new("cache"))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !adapter
+                .directory_is_ignored(&repository, Path::new("scripts/__pycache__"))
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]

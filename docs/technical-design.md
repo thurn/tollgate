@@ -881,7 +881,7 @@ publication is unavailable, worktree creation still degrades safely to cold.
 
 At a safe boundary, with the donor slot idle and all processes reaped:
 
-1. Enumerate eligible ignored paths with stable Git porcelain plus trusted cache overrides.
+1. Enumerate eligible ignored paths with stable Git porcelain plus trusted cache overrides. Automatically discovered directories must remain ignored for an arbitrary child path; directories reported only because their current contents happen to be ignored are excluded.
 2. Reject paths with unsafe type/ownership/symlink behavior.
 3. Clone them through the clone adapter to a staging seed directory on the same volume; every regular file must report successful clone creation.
 4. Write a manifest containing repository/profile/cache epoch, source tested OID, queue-prefix ancestry, configuration/cache-policy digest, OS/architecture, path metadata, logical size, and hashes for small structural files.
@@ -903,7 +903,7 @@ Creating a slot is a durable state machine rather than a directory copy:
 
 If no compatible seed exists, provision cold. If seeding fails, quarantine the partial path and retry cold rather than using a torn mixture. A new slot is never cloned from a live donor.
 
-Feature worktrees remain cold by default. With `tg worktree create --warm`, Tollgate may clone the same compatible immutable seed into a newly created user worktree. Every destination must be absent, ignored by that exact checkout, beneath a real non-symlink parent, and listed in the verified seed manifest. Tollgate removes every imported path if hydration fails and returns the usable cold worktree with a diagnostic; it never copies physically or imports from a live slot.
+Feature worktrees remain cold by default. With `tg worktree create --warm`, Tollgate may clone the same compatible immutable seed into a newly created user worktree. Each installed destination must be absent, ignored by that exact checkout, beneath a real non-symlink parent, and listed in the verified seed manifest. Entries that already exist, are no longer recursively ignored, lack an existing safe parent, or cannot be force-cloned are skipped while other applicable entries continue. Structural seed corruption, unsafe destination topology, an installation race, or a dirty final checkout still rejects hydration and rolls back every imported path. Tollgate returns the usable cold worktree with a diagnostic after a hard hydration failure; it never copies physically or imports from a live slot.
 
 Compatibility requires repository ID, Apple Silicon/macOS cache profile, cache epoch, and trusted cache-policy compatibility. Source/config proximity affects preference, not strict compatibility, because the chosen default trusts build-tool invalidation. Toolchain and shell fingerprints are recorded for diagnosis. Projects needing strict separation increment the epoch or define profiles.
 

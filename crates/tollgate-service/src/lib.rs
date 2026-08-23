@@ -488,6 +488,12 @@ pub struct WorktreeOperationResult {
     pub message: String,
 }
 
+struct WorktreeHydrationResult {
+    logical_bytes: u64,
+    hydrated_entries: usize,
+    skipped_entries: usize,
+}
+
 struct RuntimeData {
     state: RepositoryState,
     items: Vec<QueueItem>,
@@ -6884,10 +6890,30 @@ impl TollgateService {
                         .hydrate_feature_worktree(&runtime, &seed, &destination, command_id)
                         .await
                     {
-                        Ok(()) => format!(
-                            " Hydrated {} logical bytes from APFS seed {}.",
-                            seed.logical_size, seed.id
-                        ),
+                        Ok(hydration) => {
+                            let hydrated_label = if hydration.hydrated_entries == 1 {
+                                "entry"
+                            } else {
+                                "entries"
+                            };
+                            let skipped = if hydration.skipped_entries == 0 {
+                                ".".into()
+                            } else {
+                                let skipped_label = if hydration.skipped_entries == 1 {
+                                    "entry"
+                                } else {
+                                    "entries"
+                                };
+                                format!(
+                                    "; skipped {} inapplicable cache {skipped_label}.",
+                                    hydration.skipped_entries
+                                )
+                            };
+                            format!(
+                                " Hydrated {} logical bytes across {} cache {hydrated_label} from APFS seed {}{skipped}",
+                                hydration.logical_bytes, hydration.hydrated_entries, seed.id
+                            )
+                        }
                         Err(error) => format!(
                             " Cache hydration was unavailable, so the worktree remains cold: {error}."
                         ),
@@ -9935,7 +9961,7 @@ impl TollgateService {
         seed: &SeedRecord,
         worktree: &Path,
         command_id: CommandId,
-    ) -> Result<(), ServiceError> {
+    ) -> Result<WorktreeHydrationResult, ServiceError> {
         verify_seed_record_at(Path::new(&seed.path), seed)?;
         let seed_root = std::fs::canonicalize(&seed.path)?;
         let worktree_root = std::fs::canonicalize(worktree)?;
@@ -9951,6 +9977,7 @@ impl TollgateService {
             .and_then(serde_json::Value::as_array)
             .ok_or_else(|| ServiceError::Invariant("seed manifest omitted entries".into()))?;
         let mut selected = Vec::with_capacity(entries.len());
+        let mut skipped_entries = 0usize;
         for entry in entries {
             let relative: PathBuf = serde_json::from_value(
                 entry
@@ -9967,7 +9994,12 @@ impl TollgateService {
                     "seed entry path is not normalized and relative".into(),
                 ));
             }
-            let source = std::fs::canonicalize(seed_root.join(&relative))?;
+            let source = std::fs::canonicalize(seed_root.join(&relative)).map_err(|error| {
+                ServiceError::Invariant(format!(
+                    "worktree cache seed entry `{}` could not be resolved: {error}",
+                    relative.display()
+                ))
+            })?;
             if !source.starts_with(&seed_root) || !source.is_dir() {
                 return Err(ServiceError::Invariant(
                     "seed entry escaped its immutable generation".into(),
@@ -9975,18 +10007,35 @@ impl TollgateService {
             }
             let destination = worktree_root.join(&relative);
             if destination.exists() {
-                return Err(ServiceError::Invariant(format!(
-                    "cache path `{}` already exists",
-                    relative.display()
-                )));
+                skipped_entries += 1;
+                continue;
             }
             let parent = destination
                 .parent()
                 .ok_or_else(|| ServiceError::Invariant("cache destination has no parent".into()))?;
-            let metadata = std::fs::symlink_metadata(parent)?;
+            let metadata = match std::fs::symlink_metadata(parent) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    skipped_entries += 1;
+                    continue;
+                }
+                Err(error) => {
+                    return Err(ServiceError::Invariant(format!(
+                        "cache path `{}` parent could not be inspected: {error}",
+                        relative.display()
+                    )));
+                }
+            };
             if metadata.file_type().is_symlink()
                 || !metadata.is_dir()
-                || !std::fs::canonicalize(parent)?.starts_with(&worktree_root)
+                || !std::fs::canonicalize(parent)
+                    .map_err(|error| {
+                        ServiceError::Invariant(format!(
+                            "cache path `{}` parent could not be resolved: {error}",
+                            relative.display()
+                        ))
+                    })?
+                    .starts_with(&worktree_root)
             {
                 return Err(ServiceError::Invariant(format!(
                     "cache path `{}` has an unsafe parent",
@@ -9998,46 +10047,73 @@ impl TollgateService {
                 .directory_is_ignored(&worktree_root, &relative)
                 .await?
             {
-                return Err(ServiceError::Invariant(format!(
-                    "cache path `{}` is not ignored in the new worktree",
-                    relative.display()
-                )));
+                skipped_entries += 1;
+                continue;
             }
-            selected.push((source, destination));
+            let logical_size = entry
+                .get("clone_manifest")
+                .and_then(|manifest| manifest.get("logical_size"))
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| {
+                    ServiceError::Invariant("seed entry omitted its logical size".into())
+                })?;
+            selected.push((source, destination, logical_size));
         }
 
-        let staging = worktree_hydration_staging(runtime, command_id)?;
+        let staging = worktree_hydration_staging(runtime, command_id).map_err(|error| {
+            ServiceError::Invariant(format!("cache hydration staging setup failed: {error}"))
+        })?;
         if staging.exists() {
             return Err(ServiceError::Invariant(
                 "cache hydration staging path already exists".into(),
             ));
         }
-        std::fs::create_dir(&staging)?;
+        std::fs::create_dir(&staging).map_err(|error| {
+            ServiceError::Invariant(format!("cache hydration staging creation failed: {error}"))
+        })?;
         let mut staged = Vec::with_capacity(selected.len());
-        for (index, (source, destination)) in selected.into_iter().enumerate() {
+        for (index, (source, destination, logical_size)) in selected.into_iter().enumerate() {
             let staged_path = staging.join(index.to_string());
             if let Err(error) = force_clone_tree(&source, &staged_path) {
-                cleanup_worktree_hydration_staging(runtime, command_id)?;
-                return Err(ServiceError::Invariant(error.to_string()));
+                if staged_path.exists() {
+                    std::fs::remove_dir_all(&staged_path).map_err(|cleanup_error| {
+                        ServiceError::Invariant(format!(
+                            "cache entry clone failed ({error}) and its staging cleanup failed: {cleanup_error}"
+                        ))
+                    })?;
+                }
+                skipped_entries += 1;
+                continue;
             }
-            staged.push((staged_path, destination));
+            staged.push((staged_path, destination, logical_size));
         }
         let mut imported = Vec::with_capacity(staged.len());
-        for (staged_path, destination) in staged {
+        let mut logical_bytes = 0u64;
+        for (staged_path, destination, logical_size) in staged {
             if let Err(error) = std::fs::rename(&staged_path, &destination) {
                 rollback_hydrated_paths(&worktree_root, &imported)?;
                 cleanup_worktree_hydration_staging(runtime, command_id)?;
-                return Err(error.into());
+                return Err(ServiceError::Invariant(format!(
+                    "staged cache entry could not be installed at `{}`: {error}",
+                    destination.display()
+                )));
             }
             imported.push(destination);
+            logical_bytes = logical_bytes.saturating_add(logical_size);
         }
         if let Err(error) = checkout.ensure_clean().await {
             rollback_hydrated_paths(&worktree_root, &imported)?;
             cleanup_worktree_hydration_staging(runtime, command_id)?;
             return Err(error.into());
         }
-        cleanup_worktree_hydration_staging(runtime, command_id)?;
-        Ok(())
+        cleanup_worktree_hydration_staging(runtime, command_id).map_err(|error| {
+            ServiceError::Invariant(format!("cache hydration staging cleanup failed: {error}"))
+        })?;
+        Ok(WorktreeHydrationResult {
+            logical_bytes,
+            hydrated_entries: imported.len(),
+            skipped_entries,
+        })
     }
 
     async fn rebuild_after_base_adoption(
@@ -15057,8 +15133,17 @@ mod tests {
         std::fs::create_dir(&repository).unwrap();
         git(&repository, &["init", "-b", "master"]);
         std::fs::write(repository.join("base.txt"), "base\n").unwrap();
-        std::fs::write(repository.join(".gitignore"), "target/\n").unwrap();
-        git(&repository, &["add", "base.txt", ".gitignore"]);
+        std::fs::write(
+            repository.join(".gitignore"),
+            "target/\norphan/cache/\n*.pyc\n",
+        )
+        .unwrap();
+        std::fs::create_dir(repository.join("scripts")).unwrap();
+        std::fs::write(repository.join("scripts/source.py"), "# tracked\n").unwrap();
+        git(
+            &repository,
+            &["add", "base.txt", ".gitignore", "scripts/source.py"],
+        );
         git(&repository, &["commit", "-m", "base"]);
         let old_master = git(&repository, &["rev-parse", "master"]);
         git(
@@ -15085,7 +15170,7 @@ mod tests {
             .initialize_repository(
                 &repository,
                 Some(
-                    "mkdir -p target; printf cache > target/cache; printf retained > result.txt; test -f feature.txt"
+                    "mkdir -p target scripts/__pycache__ orphan/cache; printf cache > target/cache; printf bytecode > scripts/__pycache__/ci.pyc; printf orphan > orphan/cache/value; printf retained > result.txt; test -f feature.txt"
                         .into(),
                 ),
             )
@@ -15101,7 +15186,7 @@ mod tests {
 
 [[step]]
 name = "ci"
-run = "mkdir -p target; printf cache > target/cache; printf retained > result.txt; test -f feature.txt"
+run = "mkdir -p target scripts/__pycache__ orphan/cache; printf cache > target/cache; printf bytecode > scripts/__pycache__/ci.pyc; printf orphan > orphan/cache/value; printf retained > result.txt; test -f feature.txt"
 
 [[step.artifact]]
 name = "result"
@@ -15110,6 +15195,14 @@ required = true
 
 [[cache.paths]]
 path = "target"
+policy = "clone"
+
+[[cache.paths]]
+path = "scripts/__pycache__"
+policy = "clone"
+
+[[cache.paths]]
+path = "orphan/cache"
 policy = "clone"
 "#,
         )
@@ -15232,7 +15325,7 @@ policy = "clone"
             .unwrap()
             .seeds;
         assert_eq!(seeds.len(), 1);
-        assert_eq!(seeds[0].logical_size, 5);
+        assert_eq!(seeds[0].logical_size, 19);
         let cold_worktree = temporary.path().join("cold-worktree");
         let cold = service
             .create_worktree(
@@ -15259,7 +15352,13 @@ policy = "clone"
             .unwrap();
         assert!(
             warm.message
-                .contains("Hydrated 5 logical bytes from APFS seed"),
+                .contains("Hydrated 5 logical bytes across 1 cache entry from APFS seed"),
+            "{}",
+            warm.message
+        );
+        assert!(
+            warm.message
+                .contains("skipped 2 inapplicable cache entries"),
             "{}",
             warm.message
         );
@@ -15267,6 +15366,8 @@ policy = "clone"
             std::fs::read_to_string(warm_worktree.join("target/cache")).unwrap(),
             "cache"
         );
+        assert!(!warm_worktree.join("scripts/__pycache__").exists());
+        assert!(!warm_worktree.join("orphan/cache").exists());
         GitRepository::discover(&warm_worktree)
             .await
             .unwrap()
@@ -15291,7 +15392,14 @@ policy = "clone"
         assert!(
             repaired
                 .message
-                .contains("Hydrated 5 logical bytes from APFS seed"),
+                .contains("Hydrated 5 logical bytes across 1 cache entry from APFS seed"),
+            "{}",
+            repaired.message
+        );
+        assert!(
+            repaired
+                .message
+                .contains("skipped 2 inapplicable cache entries"),
             "{}",
             repaired.message
         );
@@ -15318,7 +15426,7 @@ policy = "clone"
                 .count(),
             1
         );
-        assert!(recovered.seeds.iter().all(|seed| seed.logical_size == 5));
+        assert!(recovered.seeds.iter().all(|seed| seed.logical_size == 19));
         reopened
             .purge_cache(initialized.state.id, false, CommandId::new())
             .await
