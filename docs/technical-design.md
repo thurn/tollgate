@@ -870,9 +870,14 @@ An idle donor is one whose buildset is durably terminal, whose worker lifetime c
 Automatic seed snapshots occur after:
 
 - a successful bootstrap validation of `release`; and
-- a successful promoted-head validation when its cache profile materially improves the current seed.
+- the first successful promotion when no compatible seed exists, allowing a failed
+  bootstrap to repair itself without operator intervention.
 
-They do not occur after every passing speculative descendant. `tg cache snapshot` may capture an idle eligible slot manually.
+They do not occur after every passing speculative descendant. Seed publication is
+internal cache maintenance rather than a routine user command.
+When warm worktree creation finds no compatible seed, it first attempts the same
+publication from a healthy idle slot and then hydrates the new worktree. If cache
+publication is unavailable, worktree creation still degrades safely to cold.
 
 At a safe boundary, with the donor slot idle and all processes reaped:
 

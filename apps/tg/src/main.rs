@@ -220,7 +220,6 @@ enum SlotCommand {
 #[derive(Subcommand)]
 enum CacheCommand {
     Status,
-    Snapshot,
     Purge {
         #[arg(long)]
         all_slots: bool,
@@ -1058,23 +1057,6 @@ async fn run(cli: Cli) -> anyhow::Result<u8> {
                     "Cache\n  persistent slots  {}\n  policy            preserve ignored files\n  config digest     {}",
                     value["slots"],
                     value["config_digest"].as_str().unwrap_or("?")
-                );
-                Ok(())
-            })?;
-        }
-        TopCommand::Cache(CacheCommand::Snapshot) => {
-            let repository = select_repository(&mut client, cli.repository).await?;
-            let value = client
-                .request(IpcCommand::SnapshotCache {
-                    repository_id: repository.state.id,
-                    command_id: CommandId::new(),
-                })
-                .await?;
-            print_value(value, cli.json, |value| {
-                println!(
-                    "{}\n  logical bytes  {}",
-                    value["message"].as_str().unwrap_or("Cache seed published."),
-                    value["logical_bytes"]
                 );
                 Ok(())
             })?;
@@ -2299,6 +2281,11 @@ mod tests {
         };
         assert!(warm);
         assert_eq!(name, "feature");
+    }
+
+    #[test]
+    fn cache_snapshot_is_internal_maintenance() {
+        assert!(Cli::try_parse_from(["tg", "cache", "snapshot"]).is_err());
     }
 
     #[test]

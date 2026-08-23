@@ -3941,6 +3941,8 @@ impl TollgateService {
             if !remote_enabled {
                 self.finish_source_cleanup(runtime, item).await?;
             }
+            self.ensure_compatible_seed_locked(runtime, "promotion recovery")
+                .await?;
             return Ok(());
         }
         self.block_for_ambiguous_promotion(runtime, &observed_master, command_id)
@@ -6847,6 +6849,11 @@ impl TollgateService {
         )? {
             return Ok(response);
         }
+        if warm {
+            self.ensure_compatible_seed_locked(&runtime, "warm worktree preparation")
+                .await?;
+        }
+        let state = runtime.data.lock().state.clone();
         runtime.store.prepare_operation(
             repository_id,
             "worktree-create",
@@ -8430,10 +8437,20 @@ impl TollgateService {
         repository_id: RepositoryId,
         command_id: CommandId,
     ) -> Result<CacheOperationResult, ServiceError> {
-        use tokio::io::AsyncWriteExt;
-
         let runtime = self.runtime(repository_id).await?;
         let _mutation = runtime.mutation.lock().await;
+        self.snapshot_cache_locked(&runtime, repository_id, command_id)
+            .await
+    }
+
+    async fn snapshot_cache_locked(
+        &self,
+        runtime: &Arc<RepositoryRuntime>,
+        repository_id: RepositoryId,
+        command_id: CommandId,
+    ) -> Result<CacheOperationResult, ServiceError> {
+        use tokio::io::AsyncWriteExt;
+
         let (state, config, donor) = {
             let data = runtime.data.lock();
             let donor = data
@@ -8548,7 +8565,7 @@ impl TollgateService {
             .store
             .prepare_operation(repository_id, "cache-snapshot", command_id, &evidence)?;
         if let Err(error) = self
-            .reserve_runtime_volume(&runtime, command_id, cache_root, estimated_size)
+            .reserve_runtime_volume(runtime, command_id, cache_root, estimated_size)
             .await
         {
             runtime.store.set_intent_state(
@@ -8559,7 +8576,7 @@ impl TollgateService {
             return Err(error);
         }
         if let Err(error) = self
-            .require_global_volume_warning(&runtime, cache_root, "cache snapshot")
+            .require_global_volume_warning(runtime, cache_root, "cache snapshot")
             .await
         {
             runtime.store.set_intent_state(
@@ -8657,6 +8674,29 @@ impl TollgateService {
         }
         let _ = runtime.events.send(event);
         Ok(result)
+    }
+
+    async fn ensure_compatible_seed_locked(
+        &self,
+        runtime: &Arc<RepositoryRuntime>,
+        boundary: &str,
+    ) -> Result<(), ServiceError> {
+        let repository_id = {
+            let data = runtime.data.lock();
+            if compatible_seed(&data)?.is_some() {
+                return Ok(());
+            }
+            data.state.id
+        };
+        if let Err(error) = self
+            .snapshot_cache_locked(runtime, repository_id, CommandId::new())
+            .await
+        {
+            eprintln!(
+                "Tollgate completed {boundary} but could not publish a reusable cache seed: {error}"
+            );
+        }
+        Ok(())
     }
 
     pub async fn purge_cache(
@@ -11141,6 +11181,8 @@ impl TollgateService {
                 }
             }
             self.finish_source_cleanup(&runtime, item).await?;
+            self.ensure_compatible_seed_locked(&runtime, "promotion")
+                .await?;
             let active_head_needs_rebuild = {
                 let data = runtime.data.lock();
                 data.items
@@ -15088,17 +15130,18 @@ policy = "clone"
                 .repository_snapshot(initialized.state.id)
                 .await
                 .unwrap();
-            if snapshot.queue.is_empty() {
+            if snapshot.queue.is_empty() && snapshot.seeds.len() == 1 {
                 break;
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "queue did not promote: {:?}",
+                "queue did not promote and publish a cache seed: queue={:?}, seeds={}",
                 snapshot
                     .queue
                     .iter()
                     .map(|view| view.item.state)
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>(),
+                snapshot.seeds.len()
             );
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
@@ -15183,12 +15226,13 @@ policy = "clone"
                 .artifacts
                 .is_empty()
         );
-        let seed = service
-            .snapshot_cache(initialized.state.id, CommandId::new())
+        let seeds = service
+            .repository_snapshot(initialized.state.id)
             .await
-            .unwrap();
-        assert_eq!(seed.seed_ids.len(), 1);
-        assert_eq!(seed.logical_bytes, 5);
+            .unwrap()
+            .seeds;
+        assert_eq!(seeds.len(), 1);
+        assert_eq!(seeds[0].logical_size, 5);
         let cold_worktree = temporary.path().join("cold-worktree");
         let cold = service
             .create_worktree(
@@ -15229,6 +15273,32 @@ policy = "clone"
             .ensure_clean()
             .await
             .unwrap();
+        service
+            .purge_cache(initialized.state.id, false, CommandId::new())
+            .await
+            .unwrap();
+        let repaired_worktree = temporary.path().join("repaired-warm-worktree");
+        let repaired = service
+            .create_worktree(
+                initialized.state.id,
+                "repaired-warm-worktree".into(),
+                Some(repaired_worktree.to_string_lossy().into_owned()),
+                true,
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            repaired
+                .message
+                .contains("Hydrated 5 logical bytes from APFS seed"),
+            "{}",
+            repaired.message
+        );
+        assert_eq!(
+            std::fs::read_to_string(repaired_worktree.join("target/cache")).unwrap(),
+            "cache"
+        );
         drop(service);
         let reopened = TollgateService::open(temporary.path().join("support"))
             .await
@@ -15239,8 +15309,16 @@ policy = "clone"
             .unwrap();
         assert_eq!(recovered.state.master_oid.to_hex(), promoted);
         assert!(recovered.queue.is_empty());
-        assert_eq!(recovered.seeds.len(), 1);
-        assert_eq!(recovered.seeds[0].logical_size, 5);
+        assert_eq!(recovered.seeds.len(), 2);
+        assert_eq!(
+            recovered
+                .seeds
+                .iter()
+                .filter(|seed| seed.state == "published")
+                .count(),
+            1
+        );
+        assert!(recovered.seeds.iter().all(|seed| seed.logical_size == 5));
         reopened
             .purge_cache(initialized.state.id, false, CommandId::new())
             .await
@@ -15249,8 +15327,8 @@ policy = "clone"
             .repository_snapshot(initialized.state.id)
             .await
             .unwrap();
-        assert_eq!(after_purge.seeds.len(), 1);
-        assert_eq!(after_purge.seeds[0].state, "pruned");
+        assert_eq!(after_purge.seeds.len(), 2);
+        assert!(after_purge.seeds.iter().all(|seed| seed.state == "pruned"));
     }
 
     #[tokio::test]
