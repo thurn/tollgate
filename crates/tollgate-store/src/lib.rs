@@ -278,7 +278,7 @@ impl RepositoryStore {
         Ok(())
     }
 
-    pub fn record_initial_configuration(
+    pub fn record_configuration_snapshot(
         &self,
         digest: &str,
         canonical_bytes: &[u8],
@@ -535,7 +535,18 @@ impl RepositoryStore {
     ) -> Result<DomainEvent, StoreError> {
         let mut connection = self.connection.lock();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let sequence = state.event_sequence + 1;
+        let persisted_sequence: i64 = transaction.query_row(
+            "SELECT event_sequence FROM repository_state WHERE repository_id=?1",
+            [state.id.to_string()],
+            |row| row.get(0),
+        )?;
+        let sequence =
+            state
+                .event_sequence
+                .max(u64::try_from(persisted_sequence).map_err(|_| {
+                    StoreError::Integrity("repository event sequence is negative".into())
+                })?)
+                + 1;
         transaction.execute(
             "UPDATE queue_items SET state=?2, remote_state=?3, cleanup_state=?4, current_generation_id=?5, item_json=?6, active=?7, enqueue_sequence=?8 WHERE item_id=?1",
             params![item.id.to_string(), enum_json(&item.state)?, enum_json(&item.remote_state)?, enum_json(&item.cleanup_state)?, item.current_generation_id.map(|id| id.to_string()), encode(item)?, (!item.state.is_terminal()) as i64, item.enqueue_sequence as i64],
@@ -1685,6 +1696,30 @@ impl RepositoryStore {
         }
     }
 
+    pub fn replace_command_response(
+        &self,
+        command_id: CommandId,
+        command_kind: &str,
+        request_digest: &str,
+        response: &impl Serialize,
+    ) -> Result<(), StoreError> {
+        let changed = self.connection.lock().execute(
+            "UPDATE command_results SET response_json=?4 WHERE command_id=?1 AND command_kind=?2 AND request_digest=?3",
+            params![
+                command_id.to_string(),
+                command_kind,
+                request_digest,
+                encode(response)?
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::Integrity(
+                "command response replacement did not match exactly one result".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn set_intent_state(
         &self,
         command_id: CommandId,
@@ -2439,5 +2474,100 @@ mod tests {
         ));
         assert!(store.queue_items().unwrap().is_empty());
         assert_eq!(store.unfinished_approvals().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn stale_item_projections_allocate_event_sequences_from_durable_state() {
+        let store = RepositoryStore::open_in_memory().unwrap();
+        let state = RepositoryState {
+            id: RepositoryId::new(),
+            name: "projection-race".into(),
+            path: "/projection-race".into(),
+            integration_ref: "refs/heads/release".into(),
+            master_oid: oid(1),
+            queue_revision: 0,
+            event_sequence: 0,
+            engine_epoch: 1,
+            execution_state: RepositoryExecutionState::Active,
+            block_reasons: Vec::new(),
+            active_configuration_digest: "digest".into(),
+            active_window: 20,
+            active_window_floor: 3,
+            active_window_ceiling: 20,
+            remote_enabled: false,
+        };
+        store.initialize_repository(&state).unwrap();
+        let item_id = QueueItemId::new();
+        let source_oid = oid(2);
+        let generation = ValidationGeneration::derive(
+            ValidationGenerationId::new(),
+            item_id,
+            state.master_oid.clone(),
+            vec![item_id],
+            vec![source_oid.clone()],
+            vec![source_oid.clone()],
+            state.master_oid.clone(),
+            source_oid.clone(),
+            "digest".into(),
+            "steps".into(),
+            state.engine_epoch,
+        );
+        let mut item = QueueItem {
+            id: item_id,
+            repository_id: state.id,
+            kind: QueueItemKind::Gate,
+            admission_sequence: Some(1),
+            enqueue_sequence: 1,
+            source_oid,
+            source_ref: format!("refs/tollgate/sources/{item_id}"),
+            metadata: SourceMetadata {
+                subject: "candidate".into(),
+                message_hash: "message".into(),
+                author_name: "Tollgate Test".into(),
+                author_email: "test@example.com".into(),
+                branch: Some("task".into()),
+                worktree_path: Some("/projection-race/task".into()),
+                signature_state: SignatureState::Unknown,
+                approved_at: OffsetDateTime::now_utc(),
+                purpose: Some("candidate".into()),
+            },
+            state: QueueItemState::Queued,
+            terminal_reason: None,
+            remote_state: RemoteState::Disabled,
+            cleanup_state: CleanupState::NotEligible,
+            cleanup_policy: CleanupPolicy::Automatic,
+            dependencies: Vec::new(),
+            promotion_authorized: false,
+            promotion_authorized_at: None,
+            promotion_authorized_by: None,
+            current_generation_id: Some(generation.id),
+            buildset_id: None,
+            certificate_id: None,
+        };
+        let command_id = CommandId::new();
+        store
+            .prepare_approval(state.id, &item, command_id, "request")
+            .unwrap();
+        store
+            .complete_approval(
+                &item,
+                Some(&generation),
+                0,
+                Actor::Cli,
+                command_id,
+                "candidate",
+                "request",
+                &serde_json::json!({"item_id": item_id}),
+            )
+            .unwrap();
+
+        item.terminal_reason = Some("first".into());
+        let first = store.save_item_projection(&state, &item).unwrap();
+        item.terminal_reason = Some("second".into());
+        let second = store.save_item_projection(&state, &item).unwrap();
+
+        assert_eq!(first.sequence, 2);
+        assert_eq!(second.sequence, 3);
+        assert_eq!(store.repository_state().unwrap().event_sequence, 3);
     }
 }

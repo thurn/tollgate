@@ -208,6 +208,37 @@ impl GitRepository {
         GitOid::from_hex(parents[0]).map_err(Into::into)
     }
 
+    /// Reads a file from an exact commit in the supplied repository object database.
+    pub async fn file_at(
+        &self,
+        repository: &Path,
+        commit: &GitOid,
+        path: &str,
+    ) -> Result<Option<Vec<u8>>, GitError> {
+        let object = format!("{}:{path}", commit.to_hex());
+        let output = Command::new(&self.profile.executable)
+            .current_dir(repository)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .args(["--no-pager", "show", &object])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await?;
+        if output.status.success() {
+            return Ok(Some(output.stdout));
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("does not exist in") || stderr.contains("exists on disk, but not in") {
+            return Ok(None);
+        }
+        Err(GitError::Command {
+            command: format!("git show {object}"),
+            stderr: stderr.trim().into(),
+        })
+    }
+
     pub async fn mirror_tree_oid(
         &self,
         mirror: &Path,

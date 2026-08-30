@@ -1415,7 +1415,7 @@ impl TollgateService {
                 .configuration_snapshot(&state.active_configuration_digest)?
                 .is_none()
             {
-                store.record_initial_configuration(
+                store.record_configuration_snapshot(
                     &disk_config.digest,
                     &disk_config.canonical_bytes()?,
                     &disk_config.step_graph_digest,
@@ -1846,9 +1846,11 @@ impl TollgateService {
             })
             .cloned()
             .collect::<Vec<_>>();
-        let config = runtime.data.lock().config.clone();
         for mut item in independent {
             let parent = runtime.git.commit_parent_oid(&item.source_oid).await?;
+            let config = self
+                .configuration_for_tested_oid(runtime, &item.source_oid)
+                .await?;
             let generation = ValidationGeneration::derive(
                 ValidationGenerationId::new(),
                 item.id,
@@ -3286,7 +3288,6 @@ impl TollgateService {
         runtime: &Arc<RepositoryRuntime>,
         item: &mut QueueItem,
         state: &RepositoryState,
-        config: &EffectiveConfig,
         mut ordered_ids: Vec<QueueItemId>,
         mut sources: Vec<GitOid>,
     ) -> Result<Option<ValidationGeneration>, ServiceError> {
@@ -3349,6 +3350,9 @@ impl TollgateService {
         let tested = synthetic
             .last()
             .ok_or_else(|| ServiceError::Invariant("synthetic prefix is empty".into()))?;
+        let config = self
+            .configuration_for_tested_oid(runtime, &tested.oid)
+            .await?;
         let generation = ValidationGeneration::derive(
             ValidationGenerationId::new(),
             item.id,
@@ -3368,6 +3372,54 @@ impl TollgateService {
             .transition(ItemEvent::GenerationPrepared)
             .map_err(|error| ServiceError::Invariant(error.to_string()))?;
         Ok(Some(generation))
+    }
+
+    async fn configuration_for_tested_oid(
+        &self,
+        runtime: &Arc<RepositoryRuntime>,
+        tested_oid: &GitOid,
+    ) -> Result<EffectiveConfig, ServiceError> {
+        let config = match runtime
+            .git
+            .file_at(&runtime.mirror, tested_oid, ".tollgate/config.toml")
+            .await?
+        {
+            Some(bytes) => {
+                EffectiveConfig::parse(std::str::from_utf8(&bytes).map_err(|error| {
+                    ServiceError::Invariant(format!(
+                        "candidate configuration is not valid UTF-8: {error}"
+                    ))
+                })?)?
+            }
+            None => runtime.data.lock().config.clone(),
+        };
+        runtime.store.record_configuration_snapshot(
+            &config.digest,
+            &config.canonical_bytes()?,
+            &config.step_graph_digest,
+        )?;
+        Ok(config)
+    }
+
+    fn configuration_for_generation(
+        &self,
+        runtime: &RepositoryRuntime,
+        generation: &ValidationGeneration,
+    ) -> Result<EffectiveConfig, ServiceError> {
+        let (canonical, step_graph_digest) = runtime
+            .store
+            .configuration_snapshot(&generation.configuration_digest)?
+            .ok_or_else(|| {
+                ServiceError::Invariant(format!(
+                    "configuration snapshot {} is missing",
+                    generation.configuration_digest
+                ))
+            })?;
+        Ok(EffectiveConfig::restore_canonical(
+            &canonical,
+            generation.configuration_digest.clone(),
+            step_graph_digest,
+        )?)
     }
 
     async fn reconcile_approval_intents(
@@ -3410,8 +3462,10 @@ impl TollgateService {
             }
             if item.kind == QueueItemKind::IndependentCheck {
                 let state = runtime.data.lock().state.clone();
-                let config = runtime.data.lock().config.clone();
                 let parent = runtime.git.commit_parent_oid(&item.source_oid).await?;
+                let config = self
+                    .configuration_for_tested_oid(runtime, &item.source_oid)
+                    .await?;
                 let generation = ValidationGeneration::derive(
                     ValidationGenerationId::new(),
                     item.id,
@@ -3451,11 +3505,10 @@ impl TollgateService {
                 let _ = runtime.events.send(event);
                 continue;
             }
-            let (state, config, mut ordered_items) = {
+            let (state, mut ordered_items) = {
                 let data = runtime.data.lock();
                 (
                     data.state.clone(),
-                    data.config.clone(),
                     data.items
                         .iter()
                         .filter(|candidate| {
@@ -3481,14 +3534,7 @@ impl TollgateService {
                 .map(|candidate| candidate.source_oid.clone())
                 .collect::<Vec<_>>();
             let generation = self
-                .construct_gate_generation(
-                    runtime,
-                    &mut item,
-                    &state,
-                    &config,
-                    ordered_ids,
-                    sources,
-                )
+                .construct_gate_generation(runtime, &mut item, &state, ordered_ids, sources)
                 .await?;
             let result = ApproveResult {
                 item_id: item.id,
@@ -3950,7 +3996,19 @@ impl TollgateService {
             {
                 return self.block_for_ambiguous_promotion(runtime, &observed_master, command_id);
             }
-            let config = runtime.data.lock().config.clone();
+            let (generation, active_config) = {
+                let data = runtime.data.lock();
+                let generation = data
+                    .generations
+                    .iter()
+                    .find(|generation| generation.id == certificate.validation_generation_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        ServiceError::Invariant("promotion recovery generation is missing".into())
+                    })?;
+                (generation, data.config.clone())
+            };
+            let config = self.configuration_for_generation(runtime, &generation)?;
             let remote_enabled = config.remote.enabled;
             if config.sync_user_master && !remote_enabled {
                 self.sync_user_master_after_promotion(
@@ -3977,6 +4035,8 @@ impl TollgateService {
             state.master_oid = observed_master;
             state.queue_revision += 1;
             state.event_sequence += 1;
+            state.active_configuration_digest = config.digest.clone();
+            state.remote_enabled = remote_enabled;
             runtime.store.record_promotion(
                 &state,
                 &item,
@@ -3986,6 +4046,7 @@ impl TollgateService {
             {
                 let mut data = runtime.data.lock();
                 data.state = state;
+                data.config = config.clone();
                 if let Some(existing) = data
                     .items
                     .iter_mut()
@@ -3993,6 +4054,13 @@ impl TollgateService {
                 {
                     *existing = item.clone();
                 }
+            }
+            if config.digest != active_config.digest {
+                runtime.scheduler_epoch.fetch_add(1, Ordering::AcqRel);
+                *runtime.execution_permits.write().await = Arc::new(Semaphore::new(usize::from(
+                    config.resources.repository_concurrency,
+                )));
+                self.reconfigure_global_scheduler().await;
             }
             if !remote_enabled {
                 self.finish_source_cleanup(runtime, item).await?;
@@ -4955,7 +5023,7 @@ impl TollgateService {
             promotion_authorized,
         } = submission;
         let runtime = self.runtime(repository_id).await?;
-        let _mutation = runtime.mutation.lock().await;
+        let mutation = runtime.mutation.lock().await;
         let requested_revision = revision.clone();
         let requested_worktree = worktree_path.clone();
         {
@@ -5020,11 +5088,37 @@ impl TollgateService {
         } else {
             "candidate"
         };
-        if let Some(response) =
-            runtime
-                .store
-                .checked_command_response(command_id, command_kind, &request_digest)?
-        {
+        if let Some(mut response) = runtime.store.checked_command_response::<ApproveResult>(
+            command_id,
+            command_kind,
+            &request_digest,
+        )? {
+            let replayed_item_is_active = promotion_authorized
+                && runtime.data.lock().items.iter().any(|item| {
+                    item.id == response.item_id
+                        && item.kind == QueueItemKind::Gate
+                        && is_rebuildable_gate_state(item.state)
+                });
+            if replayed_item_is_active {
+                let expected_revision = runtime.data.lock().state.queue_revision;
+                drop(mutation);
+                let authorization = self
+                    .authorize_candidate(
+                        repository_id,
+                        response.item_id,
+                        expected_revision,
+                        CommandId::new(),
+                    )
+                    .await?;
+                response.queue_revision = authorization.queue_revision;
+                response.tested_oid = Some(authorization.tested_oid);
+                runtime.store.replace_command_response(
+                    command_id,
+                    command_kind,
+                    &request_digest,
+                    &response,
+                )?;
+            }
             return Ok(response);
         }
         let prepared = runtime.store.unfinished_approvals()?;
@@ -5233,16 +5327,9 @@ impl TollgateService {
             .create_source_ref(item_id, &item.source_oid)
             .await?;
         let generation = self
-            .construct_gate_generation(
-                &runtime,
-                &mut item,
-                &state,
-                &current_config,
-                ordered_ids,
-                sources,
-            )
+            .construct_gate_generation(&runtime, &mut item, &state, ordered_ids, sources)
             .await?;
-        let result = ApproveResult {
+        let mut result = ApproveResult {
             item_id,
             queue_revision: state.queue_revision + 1,
             source_oid: item.source_oid.clone(),
@@ -5323,7 +5410,29 @@ impl TollgateService {
             }
         }
         let _ = runtime.events.send(event);
-        self.spawn_eligible(repository_id, &runtime);
+        drop(mutation);
+        if promotion_authorized {
+            let authorization = self
+                .authorize_candidate(
+                    repository_id,
+                    item_id,
+                    result.queue_revision,
+                    CommandId::new(),
+                )
+                .await?;
+            result.queue_revision = authorization.queue_revision;
+            result.tested_oid = Some(authorization.tested_oid);
+            runtime.store.replace_command_response(
+                command_id,
+                command_kind,
+                &request_digest,
+                &result,
+            )?;
+            self.spawn_eligible(repository_id, &runtime);
+            self.promote_ready(repository_id).await?;
+        } else {
+            self.spawn_eligible(repository_id, &runtime);
+        }
         Ok(result)
     }
 
@@ -5391,7 +5500,7 @@ impl TollgateService {
             items_to_authorize,
             original_generation,
             mut state,
-            config,
+            needs_priority,
             retained_generations,
             retained_buildsets,
             retained_certificates,
@@ -5488,9 +5597,14 @@ impl TollgateService {
                 &mut HashSet::new(),
             )?;
             let items_to_authorize = authorization_closure
-                .into_iter()
+                .iter()
                 .filter(|candidate| !candidate.promotion_authorized)
+                .cloned()
                 .collect::<Vec<_>>();
+            let authorization_ids = authorization_closure
+                .iter()
+                .map(|candidate| candidate.id)
+                .collect::<HashSet<_>>();
             let generation = data
                 .generations
                 .iter()
@@ -5510,13 +5624,23 @@ impl TollgateService {
                 items_to_authorize,
                 generation,
                 data.state.clone(),
-                data.config.clone(),
+                data.items
+                    .iter()
+                    .filter(|candidate| {
+                        candidate.kind == QueueItemKind::Gate
+                            && is_rebuildable_gate_state(candidate.state)
+                    })
+                    .take_while(|candidate| candidate.id != item_id)
+                    .any(|candidate| {
+                        !candidate.promotion_authorized
+                            && !authorization_ids.contains(&candidate.id)
+                    }),
                 data.generations.clone(),
                 data.buildsets.clone(),
                 data.certificates.clone(),
             )
         };
-        if items_to_authorize.is_empty() {
+        if items_to_authorize.is_empty() && !needs_priority {
             let result = CandidateAuthorizationResult {
                 item_id,
                 already_authorized: true,
@@ -5563,7 +5687,16 @@ impl TollgateService {
                 )));
             }
         }
-        let authorized_at = OffsetDateTime::now_utc();
+        let already_authorized = items_to_authorize.is_empty();
+        let authorized_at = if already_authorized {
+            item.promotion_authorized_at.ok_or_else(|| {
+                ServiceError::Invariant(
+                    "authorized candidate is missing its authorization timestamp".into(),
+                )
+            })?
+        } else {
+            OffsetDateTime::now_utc()
+        };
         let authorized_item_ids = items_to_authorize
             .iter()
             .map(|candidate| candidate.id)
@@ -5692,6 +5825,9 @@ impl TollgateService {
                     continue;
                 }
                 let commit = &synthetic[index];
+                let desired_config = self
+                    .configuration_for_tested_oid(&runtime, &commit.oid)
+                    .await?;
                 let desired_generation = ValidationGeneration::derive(
                     ValidationGenerationId::new(),
                     candidate.id,
@@ -5704,8 +5840,8 @@ impl TollgateService {
                         .collect(),
                     commit.parent_oid.clone(),
                     commit.oid.clone(),
-                    config.digest.clone(),
-                    config.step_graph_digest.clone(),
+                    desired_config.digest.clone(),
+                    desired_config.step_graph_digest.clone(),
                     state.engine_epoch,
                 );
                 if let Some(token) = runtime.cancellations.lock().get(&candidate.id) {
@@ -5717,7 +5853,7 @@ impl TollgateService {
                     &retained_generations,
                     &retained_buildsets,
                     &retained_certificates,
-                    &config,
+                    &desired_config,
                     state.engine_epoch,
                 ) {
                     candidate.state = QueueItemState::Ready;
@@ -5761,7 +5897,7 @@ impl TollgateService {
         let evidence_reused = validation_complete && prioritized_item.certificate_id.is_some();
         let result = CandidateAuthorizationResult {
             item_id,
-            already_authorized: false,
+            already_authorized,
             authorized_item_ids,
             restarted_item_ids,
             restored_item_ids,
@@ -5986,6 +6122,9 @@ impl TollgateService {
             .create_source_ref(item_id, &item.source_oid)
             .await?;
         runtime.git.initialize_mirror(&runtime.mirror).await?;
+        let config = self
+            .configuration_for_tested_oid(&runtime, &item.source_oid)
+            .await?;
         let generation = ValidationGeneration::derive(
             ValidationGenerationId::new(),
             item_id,
@@ -7288,7 +7427,7 @@ impl TollgateService {
         {
             return Ok(response);
         }
-        let (mut state, current, config) = {
+        let (mut state, current) = {
             let data = runtime.data.lock();
             if data.state.execution_state != RepositoryExecutionState::Active {
                 return Err(ServiceError::RepositoryUnavailable(
@@ -7310,7 +7449,6 @@ impl TollgateService {
                     })
                     .cloned()
                     .collect::<Vec<_>>(),
-                data.config.clone(),
             )
         };
         if selected_ids.is_empty() {
@@ -7405,6 +7543,9 @@ impl TollgateService {
                 .transition(ItemEvent::InputsChanged)
                 .map_err(|error| ServiceError::Invariant(error.to_string()))?;
             let commit = &synthetic[index];
+            let generation_config = self
+                .configuration_for_tested_oid(&runtime, &commit.oid)
+                .await?;
             let generation = ValidationGeneration::derive(
                 ValidationGenerationId::new(),
                 item.id,
@@ -7417,8 +7558,8 @@ impl TollgateService {
                     .collect(),
                 commit.parent_oid.clone(),
                 commit.oid.clone(),
-                config.digest.clone(),
-                config.step_graph_digest.clone(),
+                generation_config.digest.clone(),
+                generation_config.step_graph_digest.clone(),
                 state.engine_epoch,
             );
             item.current_generation_id = Some(generation.id);
@@ -7714,6 +7855,9 @@ impl TollgateService {
             };
             for (position, mut item) in gate_items.into_iter().enumerate() {
                 let synthetic = &chain[position];
+                let generation_config = self
+                    .configuration_for_tested_oid(&runtime, &synthetic.oid)
+                    .await?;
                 let generation = ValidationGeneration::derive(
                     ValidationGenerationId::new(),
                     item.id,
@@ -7726,8 +7870,8 @@ impl TollgateService {
                         .collect(),
                     synthetic.parent_oid.clone(),
                     synthetic.oid.clone(),
-                    candidate.digest.clone(),
-                    candidate.step_graph_digest.clone(),
+                    generation_config.digest.clone(),
+                    generation_config.step_graph_digest.clone(),
                     state.engine_epoch,
                 );
                 item.state = item
@@ -7751,6 +7895,9 @@ impl TollgateService {
                 .filter(|item| item.kind == QueueItemKind::IndependentCheck)
             {
                 let parent = runtime.git.commit_parent_oid(&item.source_oid).await?;
+                let generation_config = self
+                    .configuration_for_tested_oid(&runtime, &item.source_oid)
+                    .await?;
                 let generation = ValidationGeneration::derive(
                     ValidationGenerationId::new(),
                     item.id,
@@ -7760,8 +7907,8 @@ impl TollgateService {
                     vec![item.source_oid.clone()],
                     parent,
                     item.source_oid.clone(),
-                    candidate.digest.clone(),
-                    candidate.step_graph_digest.clone(),
+                    generation_config.digest.clone(),
+                    generation_config.step_graph_digest.clone(),
                     state.engine_epoch,
                 );
                 item.state = item
@@ -8968,7 +9115,7 @@ impl TollgateService {
             runtime.store.update_repository_state(&state)?;
             return Ok(());
         }
-        let (mut item, generation, config, retry_of, attempt) = {
+        let (mut item, generation, retry_of, attempt) = {
             let data = runtime.data.lock();
             let item = data
                 .items
@@ -9012,11 +9159,11 @@ impl TollgateService {
             (
                 item,
                 generation,
-                data.config.clone(),
                 previous.map(|buildset| buildset.id),
                 previous.map_or(1, |buildset| buildset.attempt + 1),
             )
         };
+        let config = self.configuration_for_generation(&runtime, &generation)?;
         let environment = self.environment.read().await.clone();
         let cold_item = runtime.cold_items.lock().remove(&item.id);
         let cold_source = runtime.cold_sources.lock().remove(&item.source_oid);
@@ -9078,6 +9225,7 @@ impl TollgateService {
             .state
             .transition(ItemEvent::PreparationStarted)
             .map_err(|error| ServiceError::Invariant(error.to_string()))?;
+        item.terminal_reason = None;
         self.replace_item(&runtime, item.clone())?;
         drop(dispatch_guard);
         runtime
@@ -9639,27 +9787,8 @@ impl TollgateService {
         const MAX_RETAINED_FILES: usize = 10_000;
         const FILE_METADATA_ALLOWANCE: u64 = 8 * 1024;
         let retained_bytes = runtime.store.retained_artifact_bytes()?;
-        let mut files = Vec::new();
-        let mut directories = vec![slot_root.to_owned()];
-        while let Some(directory) = directories.pop() {
-            let mut entries = tokio::fs::read_dir(&directory).await?;
-            while let Some(entry) = entries.next_entry().await? {
-                let kind = entry.file_type().await?;
-                if entry.file_name() == ".git" || kind.is_symlink() {
-                    continue;
-                }
-                if kind.is_dir() {
-                    directories.push(entry.path());
-                } else if kind.is_file() {
-                    if files.len() >= MAX_DISCOVERED_FILES {
-                        return Err(ServiceError::Invariant(format!(
-                            "artifact discovery exceeded the {MAX_DISCOVERED_FILES}-file safety limit"
-                        )));
-                    }
-                    files.push(entry.path());
-                }
-            }
-        }
+        let files =
+            discover_artifact_files(slot_root, config, skipped_steps, MAX_DISCOVERED_FILES).await?;
         let artifacts_root = runtime.git.common_dir.join("tollgate/artifacts");
         tokio::fs::create_dir_all(&artifacts_root).await?;
         if tokio::fs::symlink_metadata(&artifacts_root)
@@ -9911,7 +10040,7 @@ impl TollgateService {
         runtime: &Arc<RepositoryRuntime>,
         new_base: &GitOid,
     ) -> Result<Vec<QueueItemId>, ServiceError> {
-        let (active, config, state) = {
+        let (active, state) = {
             let data = runtime.data.lock();
             (
                 data.items
@@ -9921,7 +10050,6 @@ impl TollgateService {
                     })
                     .cloned()
                     .collect::<Vec<_>>(),
-                data.config.clone(),
                 data.state.clone(),
             )
         };
@@ -10025,6 +10153,9 @@ impl TollgateService {
             .await?;
         for (position, mut item) in viable.into_iter().enumerate() {
             let synthetic = &chain[position];
+            let generation_config = self
+                .configuration_for_tested_oid(runtime, &synthetic.oid)
+                .await?;
             let generation = ValidationGeneration::derive(
                 ValidationGenerationId::new(),
                 item.id,
@@ -10037,8 +10168,8 @@ impl TollgateService {
                     .collect(),
                 synthetic.parent_oid.clone(),
                 synthetic.oid.clone(),
-                config.digest.clone(),
-                config.step_graph_digest.clone(),
+                generation_config.digest.clone(),
+                generation_config.step_graph_digest.clone(),
                 state.engine_epoch,
             );
             item.state = item
@@ -10068,7 +10199,7 @@ impl TollgateService {
     ) -> Result<(), ServiceError> {
         let runtime = self.runtime(repository_id).await?;
         let _mutation = runtime.mutation.lock().await;
-        let (all_items, failed_index, state, config) = {
+        let (all_items, failed_index, state) = {
             let mut data = runtime.data.lock();
             let failed_index = data
                 .items
@@ -10078,12 +10209,7 @@ impl TollgateService {
             data.state.queue_revision += 1;
             data.state.active_window =
                 (data.state.active_window / 2).max(data.state.active_window_floor);
-            (
-                data.items.clone(),
-                failed_index,
-                data.state.clone(),
-                data.config.clone(),
-            )
+            (data.items.clone(), failed_index, data.state.clone())
         };
         let mut removed = std::collections::HashSet::from([failed_id]);
         runtime.store.update_repository_state(&state)?;
@@ -10168,6 +10294,9 @@ impl TollgateService {
                     )
                 })?;
             let synthetic = &chain[position];
+            let generation_config = self
+                .configuration_for_tested_oid(&runtime, &synthetic.oid)
+                .await?;
             let generation = ValidationGeneration::derive(
                 ValidationGenerationId::new(),
                 id,
@@ -10183,8 +10312,8 @@ impl TollgateService {
                     .collect(),
                 synthetic.parent_oid.clone(),
                 synthetic.oid.clone(),
-                config.digest.clone(),
-                config.step_graph_digest.clone(),
+                generation_config.digest.clone(),
+                generation_config.step_graph_digest.clone(),
                 state.engine_epoch,
             );
             retain_speculative_generations(&runtime, std::slice::from_ref(&generation)).await?;
@@ -10617,7 +10746,7 @@ impl TollgateService {
         let runtime = self.runtime(repository_id).await?;
         let _mutation = runtime.mutation.lock().await;
         loop {
-            let (mut item, generation, certificate, config, state) = {
+            let (mut item, generation, certificate, active_config, state) = {
                 let data = runtime.data.lock();
                 if data.state.execution_state != RepositoryExecutionState::Active {
                     return Ok(());
@@ -10661,6 +10790,7 @@ impl TollgateService {
                     data.state.clone(),
                 )
             };
+            let config = self.configuration_for_generation(&runtime, &generation)?;
             for result in &certificate.voting_results {
                 let step = config
                     .steps
@@ -10696,7 +10826,7 @@ impl TollgateService {
                     .await?,
             )?;
             let observed_master = runtime.git.integration_oid().await?;
-            if disk_config.digest != config.digest
+            if disk_config.digest != active_config.digest
                 || !certificate.validates(
                     &item,
                     &generation,
@@ -11023,6 +11153,8 @@ impl TollgateService {
             new_state.master_oid = certificate.tested_oid.clone();
             new_state.queue_revision += 1;
             new_state.event_sequence += 1;
+            new_state.active_configuration_digest = config.digest.clone();
+            new_state.remote_enabled = config.remote.enabled;
             new_state.active_window =
                 (new_state.active_window + 1).min(new_state.active_window_ceiling);
             runtime.store.record_promotion(
@@ -11034,6 +11166,7 @@ impl TollgateService {
             {
                 let mut data = runtime.data.lock();
                 data.state = new_state;
+                data.config = config.clone();
                 if let Some(existing) = data
                     .items
                     .iter_mut()
@@ -11041,6 +11174,13 @@ impl TollgateService {
                 {
                     *existing = item.clone();
                 }
+            }
+            if config.digest != active_config.digest {
+                runtime.scheduler_epoch.fetch_add(1, Ordering::AcqRel);
+                *runtime.execution_permits.write().await = Arc::new(Semaphore::new(usize::from(
+                    config.resources.repository_concurrency,
+                )));
+                self.reconfigure_global_scheduler().await;
             }
             if let Err(error) = create_verified_backup(self, &runtime).await {
                 eprintln!("Tollgate could not create a post-promotion backup: {error}");
@@ -13336,6 +13476,81 @@ fn sync_tree_directories(root: &Path) -> Result<(), ServiceError> {
     Ok(())
 }
 
+async fn discover_artifact_files(
+    slot_root: &Path,
+    config: &EffectiveConfig,
+    skipped_steps: &[String],
+    limit: usize,
+) -> Result<Vec<PathBuf>, ServiceError> {
+    let mut roots = config
+        .steps
+        .iter()
+        .filter(|step| !skipped_steps.contains(&step.name))
+        .flat_map(|step| &step.artifacts)
+        .flat_map(|artifact| &artifact.patterns)
+        .map(|pattern| slot_root.join(artifact_pattern_root(pattern)))
+        .collect::<Vec<_>>();
+    roots.sort();
+    roots.dedup();
+    let mut selected_roots = Vec::<PathBuf>::new();
+    for root in roots {
+        if !selected_roots
+            .iter()
+            .any(|selected| root.starts_with(selected))
+        {
+            selected_roots.push(root);
+        }
+    }
+
+    let mut files = Vec::new();
+    let mut paths = selected_roots;
+    while let Some(path) = paths.pop() {
+        let metadata = match tokio::fs::symlink_metadata(&path).await {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let kind = metadata.file_type();
+        if kind.is_symlink() {
+            continue;
+        }
+        if kind.is_file() {
+            if files.len() >= limit {
+                return Err(ServiceError::Invariant(format!(
+                    "artifact discovery exceeded the {limit}-file safety limit"
+                )));
+            }
+            files.push(path);
+            continue;
+        }
+        if !kind.is_dir() {
+            continue;
+        }
+        let mut entries = tokio::fs::read_dir(path).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            if entry.file_name() != ".git" {
+                paths.push(entry.path());
+            }
+        }
+    }
+    Ok(files)
+}
+
+fn artifact_pattern_root(pattern: &str) -> PathBuf {
+    let mut root = PathBuf::new();
+    for component in Path::new(pattern).components() {
+        let value = component.as_os_str().to_string_lossy();
+        if value
+            .chars()
+            .any(|character| matches!(character, '*' | '?' | '[' | ']' | '{' | '}'))
+        {
+            break;
+        }
+        root.push(component);
+    }
+    root
+}
+
 fn tree_logical_size(root: &Path) -> Result<u64, ServiceError> {
     #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
@@ -13493,6 +13708,27 @@ mod tests {
     use super::*;
     use std::process::Command as StdCommand;
     use tollgate_git::USER_BRANCH;
+
+    #[tokio::test]
+    async fn artifact_discovery_does_not_walk_unrelated_generated_trees() {
+        let temporary = tempfile::tempdir().unwrap();
+        let slot = temporary.path();
+        std::fs::create_dir_all(slot.join("artifacts/results")).unwrap();
+        std::fs::write(slot.join("artifacts/results/report.json"), "{}\n").unwrap();
+        std::fs::create_dir_all(slot.join("Library/cache")).unwrap();
+        std::fs::write(slot.join("Library/cache/one"), "one\n").unwrap();
+        std::fs::write(slot.join("Library/cache/two"), "two\n").unwrap();
+        let config = EffectiveConfig::parse(
+            "version = 1\n\n[[step]]\nname = \"ci\"\nrun = \"true\"\nartifact = [{ name = \"report\", patterns = [\"artifacts/**/*.json\"] }]\n",
+        )
+        .unwrap();
+
+        let files = discover_artifact_files(slot, &config, &[], 1)
+            .await
+            .unwrap();
+
+        assert_eq!(files, vec![slot.join("artifacts/results/report.json")]);
+    }
 
     fn git_output(directory: &Path, args: &[&str]) -> std::process::Output {
         StdCommand::new("git")
@@ -14368,6 +14604,121 @@ mod tests {
             git(&repository, &["rev-parse", "refs/heads/feature"]),
             source
         );
+    }
+
+    #[tokio::test]
+    async fn retry_of_an_authorized_candidate_bypasses_unrelated_unauthorized_work() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        let older = temporary.path().join("older");
+        let target = temporary.path().join("target");
+        let retry_marker = temporary.path().join("retry-marker");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("base.txt"), "base\n").unwrap();
+        git(&repository, &["add", "base.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+        for (branch, path, file) in [
+            ("older", &older, "older.txt"),
+            ("target", &target, "target.txt"),
+        ] {
+            git(
+                &repository,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    branch,
+                    path.to_str().unwrap(),
+                    USER_BRANCH,
+                ],
+            );
+            std::fs::write(path.join(file), format!("{branch}\n")).unwrap();
+            git(path, &["add", file]);
+            git(path, &["commit", "-m", branch]);
+        }
+        git(&repository, &["switch", "--detach", USER_BRANCH]);
+        let command = format!(
+            "if test -f target.txt && ! test -f '{}'; then touch '{}'; false; else sleep 0.2; true; fi",
+            retry_marker.display(),
+            retry_marker.display()
+        );
+        let service = TollgateService::open(temporary.path().join("support"))
+            .await
+            .unwrap();
+        let initialized = service
+            .initialize_repository_with_options(&repository, Some(command), false)
+            .await
+            .unwrap();
+        service
+            .submit_candidate_from(
+                initialized.state.id,
+                "HEAD".into(),
+                Some(older.to_string_lossy().into_owned()),
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        let target_candidate = service
+            .approve_from(
+                initialized.state.id,
+                "HEAD".into(),
+                Some(target.to_string_lossy().into_owned()),
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if service
+                .item_status(initialized.state.id, target_candidate.item_id)
+                .await
+                .unwrap()
+                .state
+                == QueueItemState::Failed
+            {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        let retry_command = CommandId::new();
+        let retried = service
+            .retry(
+                initialized.state.id,
+                target_candidate.item_id,
+                false,
+                retry_command,
+            )
+            .await
+            .unwrap();
+        let details = service
+            .item_details(initialized.state.id, retried.item_id)
+            .await
+            .unwrap();
+
+        assert!(details.item.promotion_authorized);
+        assert_eq!(
+            details.generation.unwrap().ordered_item_ids,
+            vec![retried.item_id]
+        );
+        assert_eq!(retried.tested_oid, Some(retried.source_oid));
+        let runtime = service.runtime(initialized.state.id).await.unwrap();
+        let evidence = runtime
+            .store
+            .operation_evidence(retry_command, "retry")
+            .unwrap()
+            .unwrap();
+        let child_command: CommandId =
+            serde_json::from_value(evidence["child_command_id"].clone()).unwrap();
+        let replay: ApproveResult = runtime
+            .store
+            .stored_command_response(child_command)
+            .unwrap()
+            .unwrap();
+        assert_eq!(replay.queue_revision, retried.queue_revision);
+        assert_eq!(replay.tested_oid, retried.tested_oid);
     }
 
     #[tokio::test]
@@ -17340,6 +17691,115 @@ run = "test -f feature.txt"
     }
 
     #[tokio::test]
+    async fn candidate_configuration_drives_validation_and_becomes_active_on_promotion() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        let feature = temporary.path().join("feature");
+        std::fs::create_dir_all(repository.join(".tollgate")).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("base.txt"), "base\n").unwrap();
+        std::fs::write(
+            repository.join(".tollgate/config.toml"),
+            "version = 1\n\n[[step]]\nname = \"old-policy\"\nrun = \"false\"\n",
+        )
+        .unwrap();
+        git(&repository, &["add", "."]);
+        git(&repository, &["commit", "-m", "base"]);
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                feature.to_str().unwrap(),
+                USER_BRANCH,
+            ],
+        );
+        std::fs::write(feature.join("candidate-policy.txt"), "present\n").unwrap();
+        let candidate_config = "version = 1\n\n[[step]]\nname = \"candidate-policy\"\nrun = \"test -f candidate-policy.txt\"\n";
+        std::fs::write(feature.join(".tollgate/config.toml"), candidate_config).unwrap();
+        git(&feature, &["add", "."]);
+        git(&feature, &["commit", "-m", "candidate policy"]);
+        git(&repository, &["switch", "--detach", USER_BRANCH]);
+
+        let service = TollgateService::open(temporary.path().join("support"))
+            .await
+            .unwrap();
+        let initialized = service
+            .initialize_repository_with_options(&repository, None, false)
+            .await
+            .unwrap();
+        let candidate = service
+            .submit_candidate_from(
+                initialized.state.id,
+                "HEAD".into(),
+                Some(feature.to_string_lossy().into_owned()),
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let details = service
+                .item_details(initialized.state.id, candidate.item_id)
+                .await
+                .unwrap();
+            if details.item.state == QueueItemState::Ready {
+                assert_eq!(
+                    details
+                        .buildset
+                        .unwrap()
+                        .frozen_steps
+                        .iter()
+                        .map(|step| step.name.as_str())
+                        .collect::<Vec<_>>(),
+                    vec!["candidate-policy"]
+                );
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "candidate policy did not pass: {:?}",
+                details.item.state
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let snapshot = service
+            .repository_snapshot(initialized.state.id)
+            .await
+            .unwrap();
+        service
+            .authorize_candidate(
+                initialized.state.id,
+                candidate.item_id,
+                snapshot.state.queue_revision,
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        let expected = EffectiveConfig::parse(candidate_config).unwrap();
+        loop {
+            let snapshot = service
+                .repository_snapshot(initialized.state.id)
+                .await
+                .unwrap();
+            let promoted = snapshot
+                .history_items
+                .iter()
+                .find(|view| view.item.id == candidate.item_id)
+                .is_some_and(|view| view.item.state == QueueItemState::Promoted);
+            if promoted {
+                assert_eq!(snapshot.configuration.digest, expected.digest);
+                assert_eq!(snapshot.state.active_configuration_digest, expected.digest);
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
+    #[tokio::test]
     async fn candidates_validate_without_promotion_and_reuse_exact_predicted_prefixes() {
         let temporary = tempfile::tempdir().unwrap();
         let repository = temporary.path().join("repository");
@@ -18617,6 +19077,7 @@ run = "test -f feature.txt"
                 assert_eq!(view.attempts.len(), 2);
                 assert_eq!(view.attempts[0].state, BuildsetState::Interrupted);
                 assert_eq!(view.attempts[1].state, BuildsetState::Passed);
+                assert!(view.item.terminal_reason.is_none());
                 break;
             }
             assert!(tokio::time::Instant::now() < deadline);
