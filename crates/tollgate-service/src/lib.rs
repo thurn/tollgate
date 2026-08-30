@@ -3248,7 +3248,6 @@ impl TollgateService {
                 }
             }
             for slot in &evidence.slots {
-                verify_slot_checkout(runtime, &slot.slot.path, &slot.checkout).await?;
                 if slot.quarantine.exists() {
                     remove_owned_quarantine(&cache_root, &slot.quarantine)?;
                 }
@@ -10413,6 +10412,16 @@ impl TollgateService {
         let Some(mut item) = item else {
             return;
         };
+        if item.state == QueueItemState::Canceled {
+            if let Err(persist_error) = self.interrupt_canceled_buildset(&runtime, &item) {
+                self.block_background_persistence_failure(
+                    &runtime,
+                    item_id,
+                    &persist_error.to_string(),
+                );
+            }
+            return;
+        }
         if matches!(
             item.state,
             QueueItemState::Preparing | QueueItemState::Running
@@ -10529,6 +10538,51 @@ impl TollgateService {
                 "Tollgate could not persist a background-operation block for {item_id}: {persist_error}"
             );
         }
+    }
+
+    fn interrupt_canceled_buildset(
+        &self,
+        runtime: &Arc<RepositoryRuntime>,
+        item: &QueueItem,
+    ) -> Result<(), ServiceError> {
+        let Some(mut buildset) = item.buildset_id.and_then(|id| {
+            runtime
+                .data
+                .lock()
+                .buildsets
+                .iter()
+                .find(|buildset| buildset.id == id)
+                .cloned()
+        }) else {
+            return Ok(());
+        };
+        if !matches!(
+            buildset.state,
+            BuildsetState::Preparing | BuildsetState::Running
+        ) {
+            return Ok(());
+        }
+        buildset.state = buildset
+            .state
+            .transition(BuildsetEvent::Interrupted)
+            .map_err(|error| ServiceError::Invariant(error.to_string()))?;
+        buildset.finished_at = Some(OffsetDateTime::now_utc());
+        runtime.store.update_buildset(&buildset)?;
+        let mut data = runtime.data.lock();
+        if let Some(existing) = data
+            .buildsets
+            .iter_mut()
+            .find(|candidate| candidate.id == buildset.id)
+        {
+            *existing = buildset.clone();
+        }
+        if let Some(slot_id) = buildset.slot_id
+            && let Some(slot) = data.slots.get_mut(&slot_id)
+        {
+            slot.state = "quarantined".into();
+            slot.health = "canceled-owner-interrupted".into();
+        }
+        Ok(())
     }
 
     fn block_background_persistence_failure(
@@ -14612,6 +14666,175 @@ mod tests {
             assert!(tokio::time::Instant::now() < deadline);
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
+    }
+
+    #[tokio::test]
+    async fn canceling_a_running_check_interrupts_its_buildset_without_blocking_restart() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        let support = temporary.path().join("support");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("base.txt"), "base\n").unwrap();
+        git(&repository, &["add", "base.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+        let service = TollgateService::open(support.clone()).await.unwrap();
+        let initialized = service
+            .initialize_repository(&repository, Some("sleep 30".into()))
+            .await
+            .unwrap();
+        let check = service
+            .check_from(
+                initialized.state.id,
+                "HEAD".into(),
+                Some(repository.to_string_lossy().into_owned()),
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let details = service
+                .item_details(initialized.state.id, check.item_id)
+                .await
+                .unwrap();
+            if details.item.state == QueueItemState::Running {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let revision = service
+            .repository_snapshot(initialized.state.id)
+            .await
+            .unwrap()
+            .state
+            .queue_revision;
+        service
+            .cancel(initialized.state.id, check.item_id, revision)
+            .await
+            .unwrap();
+        service
+            .handle_background_error(
+                initialized.state.id,
+                check.item_id,
+                ServiceError::Invariant("step resource admission canceled".into()),
+            )
+            .await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let details = service
+                .item_details(initialized.state.id, check.item_id)
+                .await
+                .unwrap();
+            if details.buildset.as_ref().is_some_and(|buildset| {
+                !matches!(
+                    buildset.state,
+                    BuildsetState::Preparing | BuildsetState::Running
+                )
+            }) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let snapshot = service
+            .repository_snapshot(initialized.state.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot.state.execution_state,
+            RepositoryExecutionState::Active
+        );
+        assert!(snapshot.slots.iter().all(|slot| slot.state != "running"));
+        loop {
+            let runtime = service.runtime(initialized.state.id).await.unwrap();
+            if !runtime.dispatching.lock().contains(&check.item_id) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        drop(service);
+
+        let reopened = TollgateService::open(support).await.unwrap();
+        let snapshot = reopened
+            .repository_snapshot(initialized.state.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot.state.execution_state,
+            RepositoryExecutionState::Active
+        );
+        assert!(snapshot.slots.iter().all(|slot| slot.state != "running"));
+    }
+
+    #[tokio::test]
+    async fn restart_ignores_discarded_slots_from_completed_cache_purges() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        let support = temporary.path().join("support");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("base.txt"), "base\n").unwrap();
+        git(&repository, &["add", "base.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+        let service = TollgateService::open(support.clone()).await.unwrap();
+        let initialized = service
+            .initialize_repository(&repository, Some("true".into()))
+            .await
+            .unwrap();
+        let check = service
+            .check_from(
+                initialized.state.id,
+                "HEAD".into(),
+                Some(repository.to_string_lossy().into_owned()),
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if service
+                .item_details(initialized.state.id, check.item_id)
+                .await
+                .unwrap()
+                .item
+                .state
+                == QueueItemState::CheckPassed
+            {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        service
+            .purge_cache(initialized.state.id, true, CommandId::new())
+            .await
+            .unwrap();
+        let slot_paths = service
+            .repository_snapshot(initialized.state.id)
+            .await
+            .unwrap()
+            .slots
+            .into_iter()
+            .map(|slot| slot.path)
+            .collect::<Vec<_>>();
+        assert!(!slot_paths.is_empty());
+        drop(service);
+        for path in slot_paths {
+            std::fs::remove_dir_all(path).unwrap();
+        }
+
+        let reopened = TollgateService::open(support).await.unwrap();
+        let snapshot = reopened
+            .repository_snapshot(initialized.state.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot.state.execution_state,
+            RepositoryExecutionState::Active
+        );
     }
 
     #[tokio::test]
