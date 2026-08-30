@@ -6958,6 +6958,8 @@ impl TollgateService {
         let _ = runtime.events.send(event);
         self.reconcile_approval_intents(&runtime).await?;
         self.spawn_eligible(repository_id, &runtime);
+        drop(_mutation);
+        self.promote_ready(repository_id).await?;
         Ok(result)
     }
 
@@ -17797,6 +17799,191 @@ run = "test -f feature.txt"
             assert!(tokio::time::Instant::now() < deadline);
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
+    }
+
+    #[tokio::test]
+    async fn reconcile_resumes_authorized_candidate_after_remote_preflight_mismatch() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        let remote = temporary.path().join("remote.git");
+        let first = temporary.path().join("first");
+        let enable_remote = temporary.path().join("enable-remote");
+        std::fs::create_dir_all(repository.join(".tollgate")).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("base.txt"), "base\n").unwrap();
+        std::fs::write(
+            repository.join(".tollgate/config.toml"),
+            "version = 1\n\n[[step]]\nname = \"ci\"\nrun = \"true\"\n",
+        )
+        .unwrap();
+        git(&repository, &["add", "."]);
+        git(&repository, &["commit", "-m", "base"]);
+        let remote_base = git(&repository, &["rev-parse", "HEAD"]);
+        git(
+            temporary.path(),
+            &[
+                "init",
+                "--bare",
+                "-b",
+                USER_BRANCH,
+                remote.to_str().unwrap(),
+            ],
+        );
+        git(
+            &repository,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&repository, &["push", "-u", "origin", USER_BRANCH]);
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "first",
+                first.to_str().unwrap(),
+                USER_BRANCH,
+            ],
+        );
+        std::fs::write(first.join("first.txt"), "first\n").unwrap();
+        git(&first, &["add", "first.txt"]);
+        git(&first, &["commit", "-m", "first"]);
+
+        let service = TollgateService::open(temporary.path().join("support"))
+            .await
+            .unwrap();
+        let initialized = service
+            .initialize_repository_with_options(&repository, None, false)
+            .await
+            .unwrap();
+        let first_candidate = service
+            .approve_from(
+                initialized.state.id,
+                "HEAD".into(),
+                Some(first.to_string_lossy().into_owned()),
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if service
+                .item_status(initialized.state.id, first_candidate.item_id)
+                .await
+                .unwrap()
+                .state
+                == QueueItemState::Promoted
+            {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(
+            git(&repository, &["ls-remote", "origin", "refs/heads/master"])
+                .split_whitespace()
+                .next()
+                .unwrap(),
+            remote_base
+        );
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "enable-remote",
+                enable_remote.to_str().unwrap(),
+                INTEGRATION_REF,
+            ],
+        );
+        std::fs::write(enable_remote.join("second.txt"), "second\n").unwrap();
+        std::fs::write(
+            enable_remote.join(".tollgate/config.toml"),
+            r#"version = 1
+
+[remote]
+enabled = true
+
+[[step]]
+name = "ci"
+run = "true"
+"#,
+        )
+        .unwrap();
+        git(&enable_remote, &["add", "."]);
+        git(&enable_remote, &["commit", "-m", "enable remote"]);
+        let remote_candidate = service
+            .approve_from(
+                initialized.state.id,
+                "HEAD".into(),
+                Some(enable_remote.to_string_lossy().into_owned()),
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        let ready = loop {
+            let snapshot = service
+                .repository_snapshot(initialized.state.id)
+                .await
+                .unwrap();
+            if snapshot.state.execution_state == RepositoryExecutionState::Blocked {
+                assert!(
+                    snapshot
+                        .state
+                        .block_reasons
+                        .iter()
+                        .any(|reason| reason.code == "remote-preflight-mismatch")
+                );
+                break service
+                    .item_details(initialized.state.id, remote_candidate.item_id)
+                    .await
+                    .unwrap();
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        };
+        assert_eq!(ready.item.state, QueueItemState::Ready);
+
+        let pushed = service
+            .push(initialized.state.id, CommandId::new())
+            .await
+            .unwrap();
+        assert!(matches!(pushed.action, RemoteSyncAction::Pushed));
+        service
+            .reconcile(initialized.state.id, CommandId::new())
+            .await
+            .unwrap();
+
+        let promoted = service
+            .item_details(initialized.state.id, remote_candidate.item_id)
+            .await
+            .unwrap();
+        assert_eq!(promoted.item.state, QueueItemState::Promoted);
+        assert_eq!(
+            promoted.buildset.as_ref().unwrap().id,
+            ready.buildset.as_ref().unwrap().id
+        );
+        assert_eq!(
+            promoted.certificate.as_ref().unwrap().id,
+            ready.certificate.as_ref().unwrap().id
+        );
+        assert_eq!(
+            git(&repository, &["ls-remote", "origin", "refs/heads/master"])
+                .split_whitespace()
+                .next()
+                .unwrap(),
+            remote_candidate.tested_oid.as_ref().unwrap().to_hex()
+        );
+        let snapshot = service
+            .repository_snapshot(initialized.state.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot.state.execution_state,
+            RepositoryExecutionState::Active
+        );
+        assert!(snapshot.configuration.remote_enabled);
     }
 
     #[tokio::test]
