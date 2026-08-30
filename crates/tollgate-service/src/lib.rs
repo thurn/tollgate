@@ -11587,12 +11587,28 @@ impl TollgateService {
         )?;
         let state = {
             let mut data = runtime.data.lock();
-            if (paused && data.state.execution_state != RepositoryExecutionState::Active)
-                || (!paused && data.state.execution_state != RepositoryExecutionState::Paused)
-            {
+            let resumes_background_failure = !paused
+                && data.state.execution_state == RepositoryExecutionState::Blocked
+                && !data.state.block_reasons.is_empty()
+                && data
+                    .state
+                    .block_reasons
+                    .iter()
+                    .all(|reason| reason.code == "background-operation-failed");
+            let can_pause =
+                paused && data.state.execution_state == RepositoryExecutionState::Active;
+            let can_resume = !paused
+                && (data.state.execution_state == RepositoryExecutionState::Paused
+                    || resumes_background_failure);
+            if !can_pause && !can_resume {
                 return Err(ServiceError::RepositoryUnavailable(
                     data.state.execution_state,
                 ));
+            }
+            if resumes_background_failure {
+                data.state
+                    .block_reasons
+                    .retain(|reason| reason.code != "background-operation-failed");
             }
             data.state.execution_state = if paused {
                 RepositoryExecutionState::Paused
@@ -13743,6 +13759,57 @@ mod tests {
             execution.recovery_action.as_deref(),
             Some("Move the replacement aside and restart Tollgate.")
         );
+        assert!(matches!(
+            service.set_paused(initialized.state.id, false).await,
+            Err(ServiceError::RepositoryUnavailable(
+                RepositoryExecutionState::Blocked
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn resume_recovers_from_a_background_operation_failure() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("base.txt"), "base\n").unwrap();
+        git(&repository, &["add", "base.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+        let service = TollgateService::open(temporary.path().join("support"))
+            .await
+            .unwrap();
+        let initialized = service
+            .initialize_repository_with_options(&repository, Some("true".into()), false)
+            .await
+            .unwrap();
+        let runtime = service.runtime(initialized.state.id).await.unwrap();
+        let blocked = {
+            let mut data = runtime.data.lock();
+            data.state.execution_state = RepositoryExecutionState::Blocked;
+            data.state.block_reasons.push(BlockReason {
+                code: "background-operation-failed".into(),
+                message: "Queue processing stopped".into(),
+                recovery_action: "Resolve the underlying problem, then resume the gate.".into(),
+            });
+            data.state.clone()
+        };
+        runtime.store.update_repository_state(&blocked).unwrap();
+
+        service
+            .set_paused(initialized.state.id, false)
+            .await
+            .unwrap();
+
+        let snapshot = service
+            .repository_snapshot(initialized.state.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot.state.execution_state,
+            RepositoryExecutionState::Active
+        );
+        assert!(snapshot.state.block_reasons.is_empty());
     }
 
     #[tokio::test]
