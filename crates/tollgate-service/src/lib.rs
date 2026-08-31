@@ -17,7 +17,7 @@ use thiserror::Error;
 use time::{Duration, OffsetDateTime};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    sync::{RwLock, Semaphore, broadcast},
+    sync::{Notify, RwLock, Semaphore, broadcast},
 };
 use tokio_util::sync::CancellationToken;
 use tollgate_config::{CachePolicy, EffectiveConfig, EffectiveStep};
@@ -28,7 +28,7 @@ use tollgate_git::{
 };
 use tollgate_runner::apfs::{CloneManifest, force_clone_file, force_clone_tree, verify_clone_tree};
 use tollgate_runner::{
-    BuildsetExecution, EnvironmentSnapshot, RenderedLogFrame, StepResultClass,
+    BuildsetExecution, EnvironmentSnapshot, RenderedLogFrame, RunnerError, StepResultClass,
     durable_log_tail_start, read_durable_log, run_buildset, run_buildset_scheduled,
     verify_durable_log,
 };
@@ -549,8 +549,88 @@ struct RepositoryRuntime {
     execution_permits: RwLock<Arc<Semaphore>>,
     scheduler_epoch: AtomicU64,
     dispatching: Mutex<HashSet<QueueItemId>>,
+    execution_changed: Notify,
     cold_sources: Mutex<HashSet<GitOid>>,
     cold_items: Mutex<HashSet<QueueItemId>>,
+}
+
+struct BuildsetOwnership {
+    runtime: Arc<RepositoryRuntime>,
+    buildset_id: BuildsetId,
+    slot_id: SlotId,
+    armed: bool,
+}
+
+impl BuildsetOwnership {
+    fn new(runtime: Arc<RepositoryRuntime>, buildset_id: BuildsetId, slot_id: SlotId) -> Self {
+        Self {
+            runtime,
+            buildset_id,
+            slot_id,
+            armed: true,
+        }
+    }
+
+    fn settle(
+        &mut self,
+        event: BuildsetEvent,
+        slot_state: &str,
+        slot_health: &str,
+    ) -> Result<(), ServiceError> {
+        let mut buildset = {
+            let data = self.runtime.data.lock();
+            data.buildsets
+                .iter()
+                .find(|buildset| buildset.id == self.buildset_id)
+                .cloned()
+                .ok_or_else(|| ServiceError::Invariant("owned buildset is missing".into()))?
+        };
+        if !buildset.state.is_terminal() {
+            buildset.state = buildset
+                .state
+                .transition(event)
+                .map_err(|error| ServiceError::Invariant(error.to_string()))?;
+            buildset.finished_at = Some(OffsetDateTime::now_utc());
+            self.runtime.store.update_buildset(&buildset)?;
+        }
+        let mut data = self.runtime.data.lock();
+        if let Some(existing) = data
+            .buildsets
+            .iter_mut()
+            .find(|candidate| candidate.id == self.buildset_id)
+        {
+            *existing = buildset;
+        }
+        if let Some(slot) = data.slots.get_mut(&self.slot_id) {
+            slot.state = slot_state.into();
+            slot.health = slot_health.into();
+            slot.last_used = Some(OffsetDateTime::now_utc());
+        }
+        self.armed = false;
+        Ok(())
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for BuildsetOwnership {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Err(error) = self.settle(
+            BuildsetEvent::Interrupted,
+            "quarantined",
+            "execution-ended-without-terminal-persistence",
+        ) {
+            eprintln!(
+                "Tollgate could not terminalize abandoned buildset {}: {error}",
+                self.buildset_id
+            );
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -880,33 +960,6 @@ fn reuse_active_enqueue_sequences(current: &[QueueItem], ordered: &mut [QueueIte
     for (item, sequence) in ordered.iter_mut().zip(sequences) {
         item.enqueue_sequence = sequence;
     }
-}
-
-fn admission_sequence(item: &QueueItem) -> u64 {
-    item.admission_sequence.unwrap_or(item.enqueue_sequence)
-}
-
-fn restorable_admission_order(current: &[QueueItem]) -> Option<Vec<QueueItemId>> {
-    let mut admission_order = current.iter().collect::<Vec<_>>();
-    admission_order.sort_by_key(|item| (admission_sequence(item), item.id));
-
-    let mut unauthorized_seen = false;
-    for item in &admission_order {
-        if item.promotion_authorized {
-            if unauthorized_seen {
-                return None;
-            }
-        } else {
-            unauthorized_seen = true;
-        }
-    }
-
-    let admission_ids = admission_order
-        .into_iter()
-        .map(|item| item.id)
-        .collect::<Vec<_>>();
-    let current_ids = current.iter().map(|item| item.id).collect::<Vec<_>>();
-    (admission_ids != current_ids).then_some(admission_ids)
 }
 
 fn matching_retained_evidence(
@@ -4067,9 +4120,40 @@ impl TollgateService {
             }
             self.ensure_compatible_seed_locked(runtime, "promotion recovery")
                 .await?;
+            self.rebuild_active_head_after_promotion(runtime).await?;
             return Ok(());
         }
         self.block_for_ambiguous_promotion(runtime, &observed_master, command_id)
+    }
+
+    async fn rebuild_active_head_after_promotion(
+        &self,
+        runtime: &Arc<RepositoryRuntime>,
+    ) -> Result<(), ServiceError> {
+        let promoted_base = {
+            let data = runtime.data.lock();
+            let active_head_is_stale = data
+                .items
+                .iter()
+                .filter(|candidate| {
+                    candidate.kind == QueueItemKind::Gate && !candidate.state.is_terminal()
+                })
+                .min_by_key(|candidate| candidate.enqueue_sequence)
+                .and_then(|candidate| {
+                    candidate.current_generation_id.and_then(|generation_id| {
+                        data.generations
+                            .iter()
+                            .find(|generation| generation.id == generation_id)
+                    })
+                })
+                .is_some_and(|generation| generation.expected_parent_oid != data.state.master_oid);
+            active_head_is_stale.then(|| data.state.master_oid.clone())
+        };
+        if let Some(promoted_base) = promoted_base {
+            self.rebuild_after_base_adoption(runtime, &promoted_base)
+                .await?;
+        }
+        Ok(())
     }
 
     fn block_for_ambiguous_promotion(
@@ -4163,6 +4247,7 @@ impl TollgateService {
             execution_permits: RwLock::new(Arc::new(Semaphore::new(repository_limit))),
             scheduler_epoch: AtomicU64::new(0),
             dispatching: Mutex::new(HashSet::new()),
+            execution_changed: Notify::new(),
             cold_sources: Mutex::new(HashSet::new()),
             cold_items: Mutex::new(HashSet::new()),
         }))
@@ -5461,12 +5546,6 @@ impl TollgateService {
             let data = runtime.data.lock();
             (data.state.master_oid.clone(), data.state.queue_revision)
         };
-        if current_revision != expected_revision {
-            return Err(ServiceError::RevisionConflict {
-                expected: expected_revision,
-                actual: current_revision,
-            });
-        }
         if observed_before_lock != persisted_master {
             let refreshed = self
                 .reconcile_expected(
@@ -5510,12 +5589,6 @@ impl TollgateService {
                 return Err(ServiceError::RepositoryUnavailable(
                     data.state.execution_state,
                 ));
-            }
-            if data.state.queue_revision != expected_revision {
-                return Err(ServiceError::RevisionConflict {
-                    expected: expected_revision,
-                    actual: data.state.queue_revision,
-                });
             }
             if observed_master != data.state.master_oid {
                 return Err(ServiceError::Invariant(
@@ -5750,27 +5823,6 @@ impl TollgateService {
         for candidate in &current {
             append_with_active_dependencies(candidate.id, &by_id, &mut ordered_ids, &mut visiting)?;
         }
-        let restored_admission_order = restorable_admission_order(&current);
-        if let Some(admission_order) = &restored_admission_order {
-            let positions = admission_order
-                .iter()
-                .enumerate()
-                .map(|(position, id)| (*id, position))
-                .collect::<HashMap<_, _>>();
-            if current.iter().any(|candidate| {
-                candidate.dependencies.iter().any(|dependency| {
-                    positions
-                        .get(dependency)
-                        .zip(positions.get(&candidate.id))
-                        .is_some_and(|(dependency, candidate)| dependency >= candidate)
-                })
-            }) {
-                return Err(ServiceError::Invariant(
-                    "retained admission order violates an active dependency".into(),
-                ));
-            }
-            ordered_ids.clone_from(admission_order);
-        }
         let first_changed = current
             .iter()
             .map(|candidate| candidate.id)
@@ -5901,7 +5953,7 @@ impl TollgateService {
             authorized_item_ids,
             restarted_item_ids,
             restored_item_ids,
-            queue_revision: expected_revision + 1,
+            queue_revision: state.queue_revision + 1,
             source_oid: prioritized_item.source_oid.clone(),
             validation_generation_id: generation.id,
             tested_oid: generation.tested_oid.clone(),
@@ -5915,7 +5967,7 @@ impl TollgateService {
             &ordered,
             &generations,
             &restored_generations,
-            expected_revision,
+            state.queue_revision,
             command_id,
             &request_digest,
             &result,
@@ -9229,6 +9281,7 @@ impl TollgateService {
             .map_err(|error| ServiceError::Invariant(error.to_string()))?;
         item.terminal_reason = None;
         self.replace_item(&runtime, item.clone())?;
+        let mut ownership = BuildsetOwnership::new(Arc::clone(&runtime), buildset_id, slot_id);
         drop(dispatch_guard);
         runtime
             .git
@@ -9273,23 +9326,7 @@ impl TollgateService {
                 && !cancellation.is_cancelled()
         };
         if !can_start {
-            buildset.state = BuildsetState::Invalidated;
-            buildset.finished_at = Some(OffsetDateTime::now_utc());
-            runtime.store.update_buildset(&buildset)?;
-            {
-                let mut data = runtime.data.lock();
-                if let Some(existing) = data
-                    .buildsets
-                    .iter_mut()
-                    .find(|candidate| candidate.id == buildset.id)
-                {
-                    *existing = buildset;
-                }
-                if let Some(slot) = data.slots.get_mut(&slot_id) {
-                    slot.state = "idle".into();
-                    slot.last_used = Some(OffsetDateTime::now_utc());
-                }
-            }
+            ownership.settle(BuildsetEvent::Invalidated, "idle", "healthy")?;
             if fresh_item.state == QueueItemState::Preparing {
                 let mut queued = fresh_item;
                 queued.state = queued
@@ -9395,7 +9432,49 @@ impl TollgateService {
                     .into(),
             ));
         }
-        let mut outcome = outcome?;
+        let mut outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(RunnerError::Canceled) => {
+                let finalization_guard = runtime.mutation.lock().await;
+                let current_item = {
+                    let data = runtime.data.lock();
+                    data.items
+                        .iter()
+                        .find(|candidate| candidate.id == item_id)
+                        .cloned()
+                };
+                let event = if current_item
+                    .as_ref()
+                    .is_some_and(|candidate| candidate.state == QueueItemState::Canceled)
+                {
+                    BuildsetEvent::Canceled
+                } else if current_item.as_ref().is_some_and(|candidate| {
+                    candidate.current_generation_id == Some(generation.id)
+                        && candidate.state == QueueItemState::Running
+                }) {
+                    BuildsetEvent::Interrupted
+                } else {
+                    BuildsetEvent::Invalidated
+                };
+                ownership.settle(event, "idle", "healthy")?;
+                if let Some(mut current_item) = current_item
+                    && current_item.current_generation_id == Some(generation.id)
+                    && current_item.state == QueueItemState::Running
+                {
+                    current_item.state = current_item
+                        .state
+                        .transition(ItemEvent::InfrastructureRetry)
+                        .map_err(|error| ServiceError::Invariant(error.to_string()))?;
+                    current_item.buildset_id = None;
+                    current_item.terminal_reason =
+                        Some("execution-canceled-before-completion".into());
+                    self.replace_item(&runtime, current_item)?;
+                }
+                drop(finalization_guard);
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
         let missing_artifact_steps = self
             .retain_artifacts(
                 &runtime,
@@ -9516,6 +9595,7 @@ impl TollgateService {
                 slot.state = "idle".into();
                 slot.last_used = Some(OffsetDateTime::now_utc());
             }
+            ownership.disarm();
             return Ok(());
         }
         item = current_item.ok_or(ServiceError::ItemNotFound(item_id))?;
@@ -9577,6 +9657,7 @@ impl TollgateService {
                     slot.last_used = Some(OffsetDateTime::now_utc());
                 }
             }
+            ownership.disarm();
             self.replace_item(&runtime, item.clone())?;
             drop(finalization_guard);
             if let Err(error) = runtime
@@ -9695,6 +9776,7 @@ impl TollgateService {
                 slot.last_used = Some(OffsetDateTime::now_utc());
             }
         }
+        ownership.disarm();
         self.replace_item(&runtime, item)?;
         drop(finalization_guard);
         if conclusive_failure {
@@ -10445,6 +10527,7 @@ impl TollgateService {
                 }
                 runtime.cancellations.lock().remove(&item_id);
                 runtime.dispatching.lock().remove(&item_id);
+                runtime.execution_changed.notify_waiters();
                 if runtime.data.lock().state.execution_state == RepositoryExecutionState::Active {
                     service.spawn_eligible(repository_id, &runtime);
                 }
@@ -10747,6 +10830,7 @@ impl TollgateService {
     ) -> Result<(), ServiceError> {
         let runtime = self.runtime(repository_id).await?;
         let _mutation = runtime.mutation.lock().await;
+        self.reconcile_promotion_intent(&runtime).await?;
         loop {
             let (mut item, generation, certificate, active_config, state) = {
                 let data = runtime.data.lock();
@@ -11246,30 +11330,7 @@ impl TollgateService {
             self.finish_source_cleanup(&runtime, item).await?;
             self.ensure_compatible_seed_locked(&runtime, "promotion")
                 .await?;
-            let active_head_needs_rebuild = {
-                let data = runtime.data.lock();
-                data.items
-                    .iter()
-                    .filter(|candidate| {
-                        candidate.kind == QueueItemKind::Gate && !candidate.state.is_terminal()
-                    })
-                    .min_by_key(|candidate| candidate.enqueue_sequence)
-                    .and_then(|candidate| {
-                        candidate.current_generation_id.and_then(|generation_id| {
-                            data.generations
-                                .iter()
-                                .find(|generation| generation.id == generation_id)
-                        })
-                    })
-                    .is_some_and(|generation| {
-                        generation.expected_parent_oid != data.state.master_oid
-                    })
-            };
-            if active_head_needs_rebuild {
-                let promoted_base = runtime.data.lock().state.master_oid.clone();
-                self.rebuild_after_base_adoption(&runtime, &promoted_base)
-                    .await?;
-            }
+            self.rebuild_active_head_after_promotion(&runtime).await?;
             self.spawn_eligible(repository_id, &runtime);
         }
     }
@@ -11660,6 +11721,13 @@ impl TollgateService {
                 .await?;
         } else {
             self.rebuild_after_failure(repository_id, item_id).await?;
+        }
+        loop {
+            let completion = runtime.execution_changed.notified();
+            if !runtime.dispatching.lock().contains(&item_id) {
+                break;
+            }
+            completion.await;
         }
         let mut state = runtime.data.lock().state.clone();
         let result = MutationResult {
@@ -15134,30 +15202,11 @@ mod tests {
             .cancel(initialized.state.id, check.item_id, revision)
             .await
             .unwrap();
-        service
-            .handle_background_error(
-                initialized.state.id,
-                check.item_id,
-                ServiceError::Invariant("step resource admission canceled".into()),
-            )
-            .await;
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            let details = service
-                .item_details(initialized.state.id, check.item_id)
-                .await
-                .unwrap();
-            if details.buildset.as_ref().is_some_and(|buildset| {
-                !matches!(
-                    buildset.state,
-                    BuildsetState::Preparing | BuildsetState::Running
-                )
-            }) {
-                break;
-            }
-            assert!(tokio::time::Instant::now() < deadline);
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
+        let details = service
+            .item_details(initialized.state.id, check.item_id)
+            .await
+            .unwrap();
+        assert_eq!(details.buildset.unwrap().state, BuildsetState::Canceled);
         let snapshot = service
             .repository_snapshot(initialized.state.id)
             .await
@@ -15167,14 +15216,9 @@ mod tests {
             RepositoryExecutionState::Active
         );
         assert!(snapshot.slots.iter().all(|slot| slot.state != "running"));
-        loop {
-            let runtime = service.runtime(initialized.state.id).await.unwrap();
-            if !runtime.dispatching.lock().contains(&check.item_id) {
-                break;
-            }
-            assert!(tokio::time::Instant::now() < deadline);
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
+        let runtime = service.runtime(initialized.state.id).await.unwrap();
+        assert!(!runtime.dispatching.lock().contains(&check.item_id));
+        drop(runtime);
         drop(service);
 
         let reopened = TollgateService::open(support).await.unwrap();
@@ -15187,6 +15231,116 @@ mod tests {
             RepositoryExecutionState::Active
         );
         assert!(snapshot.slots.iter().all(|slot| slot.state != "running"));
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_child_exit_before_terminal_persistence_invalidates_the_owner() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("base.txt"), "base\n").unwrap();
+        git(&repository, &["add", "base.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+        let service = TollgateService::open(temporary.path().join("support"))
+            .await
+            .unwrap();
+        let initialized = service
+            .initialize_repository(
+                &repository,
+                Some(
+                    "touch child-started; while test ! -f release-child; do sleep 0.01; done; touch child-exited"
+                        .into(),
+                ),
+            )
+            .await
+            .unwrap();
+        let check = service
+            .check_from(
+                initialized.state.id,
+                "HEAD".into(),
+                Some(repository.to_string_lossy().into_owned()),
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let (buildset_id, slot_id, slot_path) = loop {
+            let details = service
+                .item_details(initialized.state.id, check.item_id)
+                .await
+                .unwrap();
+            if details.item.state == QueueItemState::Running {
+                let buildset = details.buildset.unwrap();
+                let slot_id = buildset.slot_id.unwrap();
+                let slot_path = service
+                    .repository_snapshot(initialized.state.id)
+                    .await
+                    .unwrap()
+                    .slots
+                    .into_iter()
+                    .find(|slot| slot.id == slot_id)
+                    .unwrap()
+                    .path;
+                if slot_path.join("child-started").exists() {
+                    break (buildset.id, slot_id, slot_path);
+                }
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::task::yield_now().await;
+        };
+        let runtime = service.runtime(initialized.state.id).await.unwrap();
+        let mutation = runtime.mutation.lock().await;
+        std::fs::write(slot_path.join("release-child"), "release\n").unwrap();
+        while !slot_path.join("child-exited").exists()
+            || runtime.cancellations.lock().contains_key(&check.item_id)
+        {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::task::yield_now().await;
+        }
+        let mut canceled = service
+            .item_status(initialized.state.id, check.item_id)
+            .await
+            .unwrap();
+        canceled.state = canceled.state.transition(ItemEvent::Canceled).unwrap();
+        canceled.terminal_reason = Some("canceled-at-terminal-persistence-boundary".into());
+        service.replace_item(&runtime, canceled).unwrap();
+        drop(mutation);
+
+        loop {
+            let completion = runtime.execution_changed.notified();
+            if !runtime.dispatching.lock().contains(&check.item_id) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            completion.await;
+        }
+        let buildset = runtime
+            .data
+            .lock()
+            .buildsets
+            .iter()
+            .find(|buildset| buildset.id == buildset_id)
+            .cloned()
+            .unwrap();
+        assert_eq!(buildset.state, BuildsetState::Invalidated);
+        let snapshot = service
+            .repository_snapshot(initialized.state.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot.state.execution_state,
+            RepositoryExecutionState::Active
+        );
+        assert_eq!(
+            snapshot
+                .slots
+                .iter()
+                .find(|slot| slot.id == slot_id)
+                .unwrap()
+                .state,
+            "idle"
+        );
     }
 
     #[tokio::test]
@@ -16322,6 +16476,205 @@ run = "test -f feature.txt"
     }
 
     #[tokio::test]
+    async fn externally_applied_promotion_recovery_rebuilds_a_stale_successor_lane() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        let a_worktree = temporary.path().join("candidate-a");
+        let b_worktree = temporary.path().join("candidate-b");
+        let release_validation = temporary.path().join("release-validation");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("shared.txt"), "base\n").unwrap();
+        git(&repository, &["add", "shared.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+        for (branch, path) in [("candidate-a", &a_worktree), ("candidate-b", &b_worktree)] {
+            git(
+                &repository,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    branch,
+                    path.to_str().unwrap(),
+                    USER_BRANCH,
+                ],
+            );
+            std::fs::write(path.join("shared.txt"), format!("{branch}\n")).unwrap();
+            git(path, &["commit", "-am", branch]);
+        }
+        git(&repository, &["switch", "--detach", USER_BRANCH]);
+
+        let service = TollgateService::open(temporary.path().join("support"))
+            .await
+            .unwrap();
+        let initialized = service
+            .initialize_repository(
+                &repository,
+                Some(format!(
+                    "while test ! -f '{}'; do sleep 0.01; done",
+                    release_validation.display()
+                )),
+            )
+            .await
+            .unwrap();
+        let a = service
+            .approve_from(
+                initialized.state.id,
+                "HEAD".into(),
+                Some(a_worktree.to_string_lossy().into_owned()),
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        let b = service
+            .approve_from(
+                initialized.state.id,
+                "HEAD".into(),
+                Some(b_worktree.to_string_lossy().into_owned()),
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let snapshot = service
+                .repository_snapshot(initialized.state.id)
+                .await
+                .unwrap();
+            if snapshot.queue.iter().all(|view| {
+                matches!(
+                    view.item.state,
+                    QueueItemState::Running | QueueItemState::Ready
+                )
+            }) && snapshot
+                .queue
+                .iter()
+                .any(|view| view.item.state == QueueItemState::Running)
+            {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::task::yield_now().await;
+        }
+        service
+            .set_paused(initialized.state.id, true)
+            .await
+            .unwrap();
+        std::fs::write(&release_validation, "release\n").unwrap();
+        let (mut a_item, a_certificate, old_master) = loop {
+            let snapshot = service
+                .repository_snapshot(initialized.state.id)
+                .await
+                .unwrap();
+            if snapshot
+                .queue
+                .iter()
+                .all(|view| view.item.state == QueueItemState::Ready)
+            {
+                let runtime = service.runtime(initialized.state.id).await.unwrap();
+                let data = runtime.data.lock();
+                let a_item = data
+                    .items
+                    .iter()
+                    .find(|item| item.id == a.item_id)
+                    .cloned()
+                    .unwrap();
+                let a_certificate = data
+                    .certificates
+                    .iter()
+                    .find(|certificate| Some(certificate.id) == a_item.certificate_id)
+                    .cloned()
+                    .unwrap();
+                let b_generation = data
+                    .generations
+                    .iter()
+                    .find(|generation| {
+                        Some(generation.id)
+                            == data
+                                .items
+                                .iter()
+                                .find(|item| item.id == b.item_id)
+                                .unwrap()
+                                .current_generation_id
+                    })
+                    .unwrap();
+                assert_eq!(b_generation.expected_parent_oid, data.state.master_oid);
+                break (a_item, a_certificate, data.state.master_oid.clone());
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::task::yield_now().await;
+        };
+
+        let runtime = service.runtime(initialized.state.id).await.unwrap();
+        let mutation = runtime.mutation.lock().await;
+        a_item.state = a_item
+            .state
+            .transition(ItemEvent::PromotionStarted)
+            .unwrap();
+        service.replace_item(&runtime, a_item).unwrap();
+        let command_id = CommandId::new();
+        runtime
+            .store
+            .prepare_promotion(initialized.state.id, command_id, &a_certificate)
+            .unwrap();
+        runtime
+            .git
+            .retain_tested_object(
+                &runtime.mirror,
+                &a_certificate.buildset_id.to_string(),
+                &a_certificate.tested_oid,
+            )
+            .await
+            .unwrap();
+        runtime
+            .git
+            .compare_and_swap_integration(&old_master, &a_certificate.tested_oid)
+            .await
+            .unwrap();
+        runtime
+            .store
+            .set_intent_state(
+                command_id,
+                IntentState::ExternalApplied,
+                &serde_json::json!({"master": a_certificate.tested_oid}),
+            )
+            .unwrap();
+        service.reconcile_promotion_intent(&runtime).await.unwrap();
+        drop(mutation);
+        service
+            .set_paused(initialized.state.id, false)
+            .await
+            .unwrap();
+
+        let snapshot = service
+            .repository_snapshot(initialized.state.id)
+            .await
+            .unwrap();
+        assert_eq!(snapshot.state.master_oid, a_certificate.tested_oid);
+        assert_eq!(
+            snapshot.state.execution_state,
+            RepositoryExecutionState::Active
+        );
+        assert_eq!(
+            service
+                .item_status(initialized.state.id, a.item_id)
+                .await
+                .unwrap()
+                .state,
+            QueueItemState::Promoted
+        );
+        assert_eq!(
+            service
+                .item_status(initialized.state.id, b.item_id)
+                .await
+                .unwrap()
+                .state,
+            QueueItemState::MergeConflict
+        );
+        assert!(runtime.store.unfinished_promotion().unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn reorder_moves_independent_items_and_replays_idempotently() {
         let temporary = tempfile::tempdir().unwrap();
         let repository = temporary.path().join("repository");
@@ -17449,7 +17802,7 @@ run = "test -f feature.txt"
     }
 
     #[tokio::test]
-    async fn distributed_authorizations_restore_admission_order_and_exact_evidence() {
+    async fn distributed_authorizations_preserve_authorization_order() {
         let temporary = tempfile::tempdir().unwrap();
         let repository = temporary.path().join("repository");
         let a_worktree = temporary.path().join("candidate-a");
@@ -17516,16 +17869,7 @@ run = "test -f feature.txt"
             .await
             .unwrap();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-        let (
-            revision,
-            a_generation,
-            a_buildset,
-            a_certificate,
-            b_generation,
-            b_certificate,
-            c_generation,
-            c_certificate,
-        ) = loop {
+        let revision = loop {
             let snapshot = service
                 .repository_snapshot(initialized.state.id)
                 .await
@@ -17533,31 +17877,7 @@ run = "test -f feature.txt"
             if snapshot.queue.iter().all(|view| {
                 view.item.state == QueueItemState::Ready && !view.item.promotion_authorized
             }) {
-                let a_view = snapshot
-                    .queue
-                    .iter()
-                    .find(|view| view.item.id == a.item_id)
-                    .unwrap();
-                let b_view = snapshot
-                    .queue
-                    .iter()
-                    .find(|view| view.item.id == b.item_id)
-                    .unwrap();
-                let c_view = snapshot
-                    .queue
-                    .iter()
-                    .find(|view| view.item.id == c.item_id)
-                    .unwrap();
-                break (
-                    snapshot.state.queue_revision,
-                    a_view.generation.as_ref().unwrap().id,
-                    a_view.buildset.as_ref().unwrap().id,
-                    a_view.certificate.as_ref().unwrap().id,
-                    b_view.generation.as_ref().unwrap().id,
-                    b_view.certificate.as_ref().unwrap().id,
-                    c_view.generation.as_ref().unwrap().id,
-                    c_view.certificate.as_ref().unwrap().id,
-                );
+                break snapshot.state.queue_revision;
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
@@ -17621,20 +17941,30 @@ run = "test -f feature.txt"
             .await
             .unwrap();
         assert!(b_authorized.restarted_item_ids.is_empty());
-        assert_eq!(
-            b_authorized.restored_item_ids,
-            vec![a.item_id, b.item_id, c.item_id]
-        );
-        assert!(b_authorized.validation_complete);
-        assert!(b_authorized.evidence_reused);
-        assert_eq!(b_authorized.validation_generation_id, b_generation);
+        assert!(b_authorized.restored_item_ids.is_empty());
 
-        let snapshot = service
-            .repository_snapshot(initialized.state.id)
-            .await
-            .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        let snapshot = loop {
+            let snapshot = service
+                .repository_snapshot(initialized.state.id)
+                .await
+                .unwrap();
+            if snapshot.queue.is_empty() {
+                break snapshot;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "authorization-ordered queue stalled: {:?}",
+                snapshot
+                    .queue
+                    .iter()
+                    .map(|view| (view.item.id, view.item.state))
+                    .collect::<Vec<_>>()
+            );
+            tokio::task::yield_now().await;
+        };
         assert!(snapshot.queue.is_empty());
-        assert_eq!(snapshot.state.master_oid, *c.tested_oid.as_ref().unwrap());
+        assert_eq!(snapshot.state.master_oid, b_authorized.tested_oid);
         let a_view = snapshot
             .history_items
             .iter()
@@ -17650,13 +17980,9 @@ run = "test -f feature.txt"
             .iter()
             .find(|view| view.item.id == c.item_id)
             .unwrap();
-        assert_eq!(a_view.generation.as_ref().unwrap().id, a_generation);
-        assert_eq!(a_view.buildset.as_ref().unwrap().id, a_buildset);
-        assert_eq!(a_view.certificate.as_ref().unwrap().id, a_certificate);
-        assert_eq!(b_view.generation.as_ref().unwrap().id, b_generation);
-        assert_eq!(b_view.certificate.as_ref().unwrap().id, b_certificate);
-        assert_eq!(c_view.generation.as_ref().unwrap().id, c_generation);
-        assert_eq!(c_view.certificate.as_ref().unwrap().id, c_certificate);
+        assert_eq!(c_view.item.state, QueueItemState::Promoted);
+        assert_eq!(a_view.item.state, QueueItemState::Promoted);
+        assert_eq!(b_view.item.state, QueueItemState::Promoted);
         assert_eq!(
             service
                 .runtime(initialized.state.id)
@@ -17666,8 +17992,8 @@ run = "test -f feature.txt"
                 .lock()
                 .certificates
                 .len(),
-            3,
-            "bypass work must not mint replacement certificates after exact evidence restoration"
+            6,
+            "the authorization-ordered prefix needs one replacement certificate per item"
         );
         service.shutdown().await.unwrap();
         drop(service);
@@ -17684,12 +18010,401 @@ run = "test -f feature.txt"
             .item_details(initialized.state.id, c.item_id)
             .await
             .unwrap();
-        assert_eq!(reopened_a.generation.as_ref().unwrap().id, a_generation);
-        assert_eq!(reopened_a.certificate.as_ref().unwrap().id, a_certificate);
-        assert_eq!(reopened_b.generation.as_ref().unwrap().id, b_generation);
-        assert_eq!(reopened_b.certificate.as_ref().unwrap().id, b_certificate);
-        assert_eq!(reopened_c.generation.as_ref().unwrap().id, c_generation);
-        assert_eq!(reopened_c.certificate.as_ref().unwrap().id, c_certificate);
+        assert_eq!(reopened_a.item.state, QueueItemState::Promoted);
+        assert_eq!(reopened_b.item.state, QueueItemState::Promoted);
+        assert_eq!(reopened_c.item.state, QueueItemState::Promoted);
+    }
+
+    #[tokio::test]
+    async fn same_revision_concurrent_authorizations_serialize_in_commit_order() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        let a_worktree = temporary.path().join("candidate-a");
+        let b_worktree = temporary.path().join("candidate-b");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("base.txt"), "base\n").unwrap();
+        git(&repository, &["add", "base.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+        for (branch, path, file) in [
+            ("candidate-a", &a_worktree, "a.txt"),
+            ("candidate-b", &b_worktree, "b.txt"),
+        ] {
+            git(
+                &repository,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    branch,
+                    path.to_str().unwrap(),
+                    USER_BRANCH,
+                ],
+            );
+            std::fs::write(path.join(file), format!("{branch}\n")).unwrap();
+            git(path, &["add", file]);
+            git(path, &["commit", "-m", branch]);
+        }
+        git(&repository, &["switch", "--detach", USER_BRANCH]);
+
+        let service = TollgateService::open(temporary.path().join("support"))
+            .await
+            .unwrap();
+        let initialized = service
+            .initialize_repository(&repository, Some("true".into()))
+            .await
+            .unwrap();
+        let a = service
+            .submit_candidate_from(
+                initialized.state.id,
+                "HEAD".into(),
+                Some(a_worktree.to_string_lossy().into_owned()),
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        let b = service
+            .submit_candidate_from(
+                initialized.state.id,
+                "HEAD".into(),
+                Some(b_worktree.to_string_lossy().into_owned()),
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let revision = loop {
+            let snapshot = service
+                .repository_snapshot(initialized.state.id)
+                .await
+                .unwrap();
+            if snapshot.queue.iter().all(|view| {
+                view.item.state == QueueItemState::Ready && !view.item.promotion_authorized
+            }) {
+                break snapshot.state.queue_revision;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::task::yield_now().await;
+        };
+
+        let (a_authorized, b_authorized) = tokio::join!(
+            service.authorize_candidate(
+                initialized.state.id,
+                a.item_id,
+                revision,
+                CommandId::new(),
+            ),
+            service.authorize_candidate(
+                initialized.state.id,
+                b.item_id,
+                revision,
+                CommandId::new(),
+            ),
+        );
+        let a_authorized = a_authorized.unwrap();
+        let b_authorized = b_authorized.unwrap();
+        assert_ne!(a_authorized.queue_revision, b_authorized.queue_revision);
+        let authorization_order = if a_authorized.queue_revision < b_authorized.queue_revision {
+            vec![a.item_id, b.item_id]
+        } else {
+            vec![b.item_id, a.item_id]
+        };
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let snapshot = loop {
+            let snapshot = service
+                .repository_snapshot(initialized.state.id)
+                .await
+                .unwrap();
+            if snapshot.queue.is_empty() {
+                break snapshot;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::task::yield_now().await;
+        };
+        let promotion_order = snapshot
+            .history
+            .iter()
+            .filter(|event| event.kind == "promotion.completed")
+            .map(|event| {
+                event.payload["id"]
+                    .as_str()
+                    .unwrap()
+                    .parse::<QueueItemId>()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(promotion_order, authorization_order);
+        assert!(snapshot.history_items.iter().any(|view| {
+            view.item.id == a.item_id && view.item.state == QueueItemState::Promoted
+        }));
+        assert!(snapshot.history_items.iter().any(|view| {
+            view.item.id == b.item_id && view.item.state == QueueItemState::Promoted
+        }));
+    }
+
+    #[tokio::test]
+    async fn invalidating_authorized_replacements_waiting_for_a_semaphore_releases_their_slots() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        let a_worktree = temporary.path().join("candidate-a");
+        let b_worktree = temporary.path().join("candidate-b");
+        std::fs::create_dir_all(repository.join(".tollgate")).unwrap();
+        git(&repository, &["init", "-b", "master"]);
+        std::fs::write(repository.join("base.txt"), "base\n").unwrap();
+        std::fs::write(
+            repository.join(".tollgate/config.toml"),
+            "version = 1\n\n[[step]]\nname = \"ci\"\nrun = \"true\"\nsemaphores = [\"unity\"]\n",
+        )
+        .unwrap();
+        git(&repository, &["add", "."]);
+        git(&repository, &["commit", "-m", "base"]);
+        for (branch, path, file) in [
+            ("candidate-a", &a_worktree, "a.txt"),
+            ("candidate-b", &b_worktree, "b.txt"),
+        ] {
+            git(
+                &repository,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    branch,
+                    path.to_str().unwrap(),
+                    "master",
+                ],
+            );
+            std::fs::write(path.join(file), format!("{branch}\n")).unwrap();
+            git(path, &["add", file]);
+            git(path, &["commit", "-m", branch]);
+        }
+        git(&repository, &["switch", "--detach", "master"]);
+
+        let service = TollgateService::open(temporary.path().join("support"))
+            .await
+            .unwrap();
+        let initialized = service
+            .initialize_repository_with_options(&repository, None, false)
+            .await
+            .unwrap();
+        let a = service
+            .submit_candidate_from(
+                initialized.state.id,
+                "HEAD".into(),
+                Some(a_worktree.to_string_lossy().into_owned()),
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        let b = service
+            .submit_candidate_from(
+                initialized.state.id,
+                "HEAD".into(),
+                Some(b_worktree.to_string_lossy().into_owned()),
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let revision = loop {
+            let snapshot = service
+                .repository_snapshot(initialized.state.id)
+                .await
+                .unwrap();
+            if snapshot
+                .queue
+                .iter()
+                .all(|view| view.item.state == QueueItemState::Ready)
+            {
+                break snapshot.state.queue_revision;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::task::yield_now().await;
+        };
+
+        let blocker_id = StepId::new();
+        assert!(
+            service
+                .global_scheduler
+                .try_acquire_step(
+                    blocker_id,
+                    tollgate_scheduler::StepResources {
+                        cpu_tokens: 0,
+                        memory_bytes: 0,
+                        semaphores: BTreeMap::from([("unity".into(), 1)]),
+                    },
+                )
+                .unwrap()
+        );
+        let authorized_b = service
+            .authorize_candidate(initialized.state.id, b.item_id, revision, CommandId::new())
+            .await
+            .unwrap();
+        assert_eq!(authorized_b.restarted_item_ids, vec![b.item_id, a.item_id]);
+
+        let replacement_buildsets = loop {
+            let snapshot = service
+                .repository_snapshot(initialized.state.id)
+                .await
+                .unwrap();
+            if snapshot
+                .queue
+                .iter()
+                .all(|view| view.item.state == QueueItemState::Running)
+            {
+                break snapshot
+                    .queue
+                    .iter()
+                    .map(|view| view.buildset.as_ref().unwrap().id)
+                    .collect::<Vec<_>>();
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::task::yield_now().await;
+        };
+        let snapshot = service
+            .repository_snapshot(initialized.state.id)
+            .await
+            .unwrap();
+        service
+            .authorize_candidate(
+                initialized.state.id,
+                a.item_id,
+                snapshot.state.queue_revision,
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        let snapshot = service
+            .repository_snapshot(initialized.state.id)
+            .await
+            .unwrap();
+        service
+            .reorder_queue(
+                initialized.state.id,
+                vec![a.item_id],
+                snapshot.state.queue_revision,
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        service.global_scheduler.release_step(blocker_id).unwrap();
+
+        let runtime = service.runtime(initialized.state.id).await.unwrap();
+        loop {
+            let completion = runtime.execution_changed.notified();
+            if replacement_buildsets.iter().all(|buildset_id| {
+                runtime
+                    .data
+                    .lock()
+                    .buildsets
+                    .iter()
+                    .find(|buildset| buildset.id == *buildset_id)
+                    .is_some_and(|buildset| buildset.state.is_terminal())
+            }) && !runtime.dispatching.lock().contains(&a.item_id)
+                && !runtime.dispatching.lock().contains(&b.item_id)
+            {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            completion.await;
+        }
+        let snapshot = service
+            .repository_snapshot(initialized.state.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot.state.execution_state,
+            RepositoryExecutionState::Active
+        );
+        assert!(snapshot.state.block_reasons.is_empty());
+        assert!(snapshot.slots.iter().all(|slot| slot.state == "idle"));
+        assert!(snapshot.queue.is_empty());
+        assert!(snapshot.history_items.iter().any(|view| {
+            view.item.id == a.item_id && view.item.state == QueueItemState::Promoted
+        }));
+        assert!(snapshot.history_items.iter().any(|view| {
+            view.item.id == b.item_id && view.item.state == QueueItemState::Promoted
+        }));
+    }
+
+    #[tokio::test]
+    async fn concurrent_reconcile_recovers_an_unfinished_promotion_intent_idempotently() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        let feature = temporary.path().join("feature");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("base.txt"), "base\n").unwrap();
+        git(&repository, &["add", "base.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                feature.to_str().unwrap(),
+                USER_BRANCH,
+            ],
+        );
+        std::fs::write(feature.join("feature.txt"), "feature\n").unwrap();
+        git(&feature, &["add", "feature.txt"]);
+        git(&feature, &["commit", "-m", "feature"]);
+        git(&repository, &["switch", "--detach", USER_BRANCH]);
+
+        let service = TollgateService::open(temporary.path().join("support"))
+            .await
+            .unwrap();
+        let initialized = service
+            .initialize_repository(&repository, Some("true".into()))
+            .await
+            .unwrap();
+        let candidate = service
+            .submit_candidate_from(
+                initialized.state.id,
+                "HEAD".into(),
+                Some(feature.to_string_lossy().into_owned()),
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let certificate = loop {
+            let details = service
+                .item_details(initialized.state.id, candidate.item_id)
+                .await
+                .unwrap();
+            if let Some(certificate) = details.certificate {
+                break certificate;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::task::yield_now().await;
+        };
+        let runtime = service.runtime(initialized.state.id).await.unwrap();
+        runtime
+            .store
+            .prepare_promotion(initialized.state.id, CommandId::new(), &certificate)
+            .unwrap();
+
+        let (first, second, third) = tokio::join!(
+            service.reconcile(initialized.state.id, CommandId::new()),
+            service.reconcile(initialized.state.id, CommandId::new()),
+            service.reconcile(initialized.state.id, CommandId::new()),
+        );
+        first.unwrap();
+        second.unwrap();
+        third.unwrap();
+        assert!(runtime.store.unfinished_promotion().unwrap().is_none());
+        assert_eq!(
+            service
+                .repository_snapshot(initialized.state.id)
+                .await
+                .unwrap()
+                .state
+                .execution_state,
+            RepositoryExecutionState::Active
+        );
     }
 
     #[tokio::test]

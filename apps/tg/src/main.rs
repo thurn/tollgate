@@ -422,7 +422,7 @@ async fn run(cli: Cli) -> anyhow::Result<u8> {
                     && !items.is_empty()
                 {
                     println!(
-                        "  plan      restored admission order; {} exact completed validation{} reused; redundant replacement work canceled",
+                        "  plan      reused {} exact completed validation{} for the authorization order; redundant replacement work canceled",
                         items.len(),
                         if items.len() == 1 { "" } else { "s" }
                     );

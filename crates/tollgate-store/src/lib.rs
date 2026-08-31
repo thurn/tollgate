@@ -54,6 +54,8 @@ pub enum StoreError {
     ArtifactTooLarge(u64),
     #[error("command UUID was replayed with a different kind or payload")]
     CommandReplayMismatch,
+    #[error("another {kind} operation is already in progress")]
+    OperationInProgress { kind: String },
     #[error("database schema version {actual} is newer than this Tollgate supports ({supported})")]
     SchemaTooNew { actual: i64, supported: i64 },
     #[error("I/O error: {0}")]
@@ -1259,7 +1261,25 @@ impl RepositoryStore {
         command_id: CommandId,
         evidence: &impl Serialize,
     ) -> Result<(), StoreError> {
-        self.connection.lock().execute("INSERT INTO operation_intents (intent_id, repository_id, kind, state, command_id, expected_json, created_at, updated_at) VALUES (?1, ?2, 'promotion', 'prepared', ?3, ?4, ?5, ?5)", params![uuid::Uuid::now_v7().to_string(), repository_id.to_string(), command_id.to_string(), encode(evidence)?, now()])?;
+        let expected = encode(evidence)?;
+        let connection = self.connection.lock();
+        let existing: Option<(String, String)> = connection
+            .query_row(
+                "SELECT command_id, expected_json FROM operation_intents WHERE repository_id=?1 AND kind='promotion' AND state IN ('prepared','external-applied') LIMIT 1",
+                [repository_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((existing_command, existing_expected)) = existing {
+            return if existing_command == command_id.to_string() && existing_expected == expected {
+                Ok(())
+            } else {
+                Err(StoreError::OperationInProgress {
+                    kind: "promotion".into(),
+                })
+            };
+        }
+        connection.execute("INSERT INTO operation_intents (intent_id, repository_id, kind, state, command_id, expected_json, created_at, updated_at) VALUES (?1, ?2, 'promotion', 'prepared', ?3, ?4, ?5, ?5)", params![uuid::Uuid::now_v7().to_string(), repository_id.to_string(), command_id.to_string(), expected, now()])?;
         Ok(())
     }
 
@@ -2262,6 +2282,61 @@ mod tests {
         store.initialize_repository(&state).unwrap();
         assert_eq!(store.repository_state().unwrap(), state);
         store.quick_integrity_check().unwrap();
+    }
+
+    #[test]
+    fn promotion_intent_uniqueness_is_idempotent_and_never_exposes_sqlite() {
+        let store = RepositoryStore::open_in_memory().unwrap();
+        let state = RepositoryState {
+            id: RepositoryId::new(),
+            name: "promotion-intent".into(),
+            path: "/promotion-intent".into(),
+            integration_ref: "refs/heads/release".into(),
+            master_oid: oid(1),
+            queue_revision: 0,
+            event_sequence: 0,
+            engine_epoch: 1,
+            execution_state: RepositoryExecutionState::Active,
+            block_reasons: Vec::new(),
+            active_configuration_digest: "digest".into(),
+            active_window: 20,
+            active_window_floor: 3,
+            active_window_ceiling: 20,
+            remote_enabled: false,
+        };
+        store.initialize_repository(&state).unwrap();
+        let first = CommandId::new();
+        let evidence = serde_json::json!({"certificate": "first"});
+        store.prepare_promotion(state.id, first, &evidence).unwrap();
+        store.prepare_promotion(state.id, first, &evidence).unwrap();
+
+        let error = store
+            .prepare_promotion(
+                state.id,
+                CommandId::new(),
+                &serde_json::json!({"certificate": "second"}),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            &error,
+            StoreError::OperationInProgress { kind } if kind == "promotion"
+        ));
+        assert!(!error.to_string().contains("UNIQUE constraint"));
+
+        store
+            .set_intent_state(
+                first,
+                IntentState::Canceled,
+                &serde_json::json!({"reason": "retry"}),
+            )
+            .unwrap();
+        store
+            .prepare_promotion(
+                state.id,
+                CommandId::new(),
+                &serde_json::json!({"certificate": "second"}),
+            )
+            .unwrap();
     }
 
     #[test]

@@ -136,6 +136,9 @@ impl GlobalScheduler {
         request: DispatchRequest,
         cancellation: &CancellationToken,
     ) -> Result<BuildsetAllocation, SchedulerError> {
+        if cancellation.is_cancelled() {
+            return Err(SchedulerError::Canceled);
+        }
         let buildset_id = request.buildset_id;
         {
             let mut state = self.state.lock();
@@ -150,6 +153,18 @@ impl GlobalScheduler {
         }
         self.changed.notify_waiters();
         loop {
+            if cancellation.is_cancelled() {
+                let mut state = self.state.lock();
+                state
+                    .pending
+                    .retain(|entry| entry.buildset_id != buildset_id);
+                if state.granted.remove(&buildset_id) {
+                    state.admitted_buildsets = state.admitted_buildsets.saturating_sub(1);
+                }
+                drop(state);
+                self.changed.notify_waiters();
+                return Err(SchedulerError::Canceled);
+            }
             let notified = self.changed.notified();
             {
                 let mut state = self.state.lock();
@@ -259,6 +274,9 @@ impl GlobalScheduler {
         cancellation: &CancellationToken,
     ) -> Result<StepAllocation, SchedulerError> {
         loop {
+            if cancellation.is_cancelled() {
+                return Err(SchedulerError::Canceled);
+            }
             let notified = self.changed.notified();
             if self.try_acquire_step(step_id, request.clone())? {
                 return Ok(StepAllocation {
@@ -463,6 +481,73 @@ mod tests {
         assert_eq!(scheduler.usage().pending_buildsets, 0);
         drop(first);
         assert_eq!(scheduler.usage().admitted_buildsets, 0);
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_enqueue_never_acquires_buildset_or_step_capacity() {
+        let scheduler = Arc::new(scheduler());
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let buildset = scheduler
+            .acquire_buildset(
+                DispatchRequest {
+                    repository_id: RepositoryId::new(),
+                    buildset_id: BuildsetId::new(),
+                    priority: PriorityClass::Speculative,
+                    queue_position: 0,
+                    repository_weight: 1,
+                    affinity_score: 0,
+                },
+                &cancellation,
+            )
+            .await;
+        assert!(matches!(buildset, Err(SchedulerError::Canceled)));
+        let step = scheduler
+            .acquire_step(
+                StepId::new(),
+                StepResources {
+                    cpu_tokens: 1,
+                    memory_bytes: 1,
+                    semaphores: BTreeMap::from([("unity".into(), 1)]),
+                },
+                &cancellation,
+            )
+            .await;
+        assert!(matches!(step, Err(SchedulerError::Canceled)));
+        assert_eq!(
+            scheduler.usage(),
+            ResourceUsage {
+                admitted_buildsets: 0,
+                cpu_reserved: 0,
+                memory_reserved: 0,
+                semaphore_reserved: BTreeMap::new(),
+                pending_buildsets: 0,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_immediately_after_admission_releases_every_resource() {
+        let scheduler = Arc::new(scheduler());
+        let cancellation = CancellationToken::new();
+        let allocation = scheduler
+            .acquire_step(
+                StepId::new(),
+                StepResources {
+                    cpu_tokens: 2,
+                    memory_bytes: 40,
+                    semaphores: BTreeMap::from([("unity".into(), 1)]),
+                },
+                &cancellation,
+            )
+            .await
+            .unwrap();
+        cancellation.cancel();
+        drop(allocation);
+        let usage = scheduler.usage();
+        assert_eq!(usage.cpu_reserved, 0);
+        assert_eq!(usage.memory_reserved, 0);
+        assert_eq!(usage.semaphore_reserved.get("unity"), Some(&0));
     }
 
     #[tokio::test]

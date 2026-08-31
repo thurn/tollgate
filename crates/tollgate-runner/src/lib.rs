@@ -39,6 +39,8 @@ pub enum RunnerError {
     LogFrame(#[from] serde_json::Error),
     #[error("command supervision was interrupted: {0}")]
     Interrupted(String),
+    #[error("command execution was canceled")]
+    Canceled,
     #[error("workspace verification failed: {0}")]
     WorkspaceDirty(String),
     #[error("login-shell environment bootstrap failed: {0}")]
@@ -1173,13 +1175,21 @@ pub async fn run_buildset_scheduled(
                                 &cancellation,
                             )
                             .await
-                            .map_err(|error| RunnerError::Interrupted(error.to_string()))?,
+                            .map_err(|error| match error {
+                                tollgate_scheduler::SchedulerError::Canceled => {
+                                    RunnerError::Canceled
+                                }
+                                other => RunnerError::Interrupted(other.to_string()),
+                            })?,
                     )
                 } else {
                     None
                 };
                 let name = step.name.clone();
                 let result = run_step(step, context, cancellation).await?;
+                if result.class == StepResultClass::Canceled {
+                    return Err(RunnerError::Canceled);
+                }
                 if result.class == StepResultClass::Interrupted {
                     return Err(RunnerError::Interrupted(format!(
                         "step `{name}` was externally terminated (exit {:?}, signal {:?})",
@@ -1888,6 +1898,93 @@ needs=["a","b"]
         .await
         .unwrap();
         assert!(!result.passed);
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_resource_enqueue_never_spawns_the_command() {
+        let temporary = tempfile::tempdir().unwrap();
+        let config = EffectiveConfig::parse(
+            "version=1\n[[step]]\nname=\"gate\"\nrun=\"touch command-ran\"\n",
+        )
+        .unwrap();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let result = run_buildset_scheduled(
+            &config,
+            BuildsetExecution {
+                tested_oid: GitOid::from_hex("0000000000000000000000000000000000000000").unwrap(),
+                slot_root: temporary.path().into(),
+                log_directory: temporary.path().join("logs"),
+                environment: std::env::vars().collect(),
+                context: BTreeMap::new(),
+            },
+            &[],
+            cancellation,
+            Some(Arc::new(GlobalScheduler::new(
+                tollgate_scheduler::ResourceCapacity {
+                    max_buildsets: 1,
+                    cpu_tokens: 1,
+                    memory_bytes: 1,
+                    semaphores: BTreeMap::new(),
+                },
+            ))),
+        )
+        .await;
+        assert!(matches!(result, Err(RunnerError::Canceled)));
+        assert!(!temporary.path().join("command-ran").exists());
+    }
+
+    #[tokio::test]
+    async fn cancellation_while_running_waits_for_command_supervision_acknowledgement() {
+        let temporary = tempfile::tempdir().unwrap();
+        let config = EffectiveConfig::parse(
+            "version=1\n[[step]]\nname=\"gate\"\nrun=\"touch started; while :; do sleep 0.01; done\"\n",
+        )
+        .unwrap();
+        let cancellation = CancellationToken::new();
+        let execution = BuildsetExecution {
+            tested_oid: GitOid::from_hex("0000000000000000000000000000000000000000").unwrap(),
+            slot_root: temporary.path().into(),
+            log_directory: temporary.path().join("logs"),
+            environment: std::env::vars().collect(),
+            context: BTreeMap::new(),
+        };
+        let running = {
+            let cancellation = cancellation.clone();
+            tokio::spawn(async move { run_buildset(&config, execution, &[], cancellation).await })
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !temporary.path().join("started").exists() {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::task::yield_now().await;
+        }
+        cancellation.cancel();
+        assert!(matches!(running.await.unwrap(), Err(RunnerError::Canceled)));
+    }
+
+    #[tokio::test]
+    async fn cancellation_at_the_spawn_gate_is_acknowledged_by_the_supervisor() {
+        let temporary = tempfile::tempdir().unwrap();
+        let config = EffectiveConfig::parse(
+            "version=1\n[[step]]\nname=\"gate\"\nrun=\"while :; do sleep 0.01; done\"\n",
+        )
+        .unwrap();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let result = run_step(
+            &config.steps[0],
+            ExecutionContext {
+                cwd: temporary.path().into(),
+                environment: std::env::vars().collect(),
+                read_only_context: BTreeMap::new(),
+                runner: config.runner.clone(),
+                log_path: temporary.path().join("spawn-canceled.tlog"),
+            },
+            cancellation,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.class, StepResultClass::Canceled);
     }
 
     #[cfg(unix)]
