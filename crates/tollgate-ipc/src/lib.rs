@@ -351,6 +351,12 @@ pub enum IpcCommand {
         all_slots: bool,
         command_id: CommandId,
     },
+    StorageStatus,
+    StoragePrune {
+        #[serde(default)]
+        force: bool,
+        command_id: CommandId,
+    },
     ArtifactPin {
         repository_id: RepositoryId,
         artifact_id: String,

@@ -1327,6 +1327,20 @@ async fn execute_ipc_command(service: &Service, command: IpcCommand) -> IpcRespo
                     .map_err(|error| error.to_string())?,
             )
             .map_err(|error| error.to_string()),
+            IpcCommand::StorageStatus => serde_json::to_value(
+                service
+                    .storage_status()
+                    .await
+                    .map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string()),
+            IpcCommand::StoragePrune { force, command_id } => serde_json::to_value(
+                service
+                    .prune_storage(force, command_id)
+                    .await
+                    .map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string()),
             IpcCommand::ArtifactPin {
                 repository_id,
                 artifact_id,

@@ -98,6 +98,8 @@ enum TopCommand {
     #[command(subcommand)]
     Cache(CacheCommand),
     #[command(subcommand)]
+    Storage(StorageCommand),
+    #[command(subcommand)]
     Artifact(ArtifactCommand),
     History,
     Doctor,
@@ -214,6 +216,15 @@ enum CacheCommand {
     Purge {
         #[arg(long)]
         all_slots: bool,
+    },
+}
+#[derive(Subcommand)]
+enum StorageCommand {
+    Status,
+    PreviewPrune,
+    Prune {
+        #[arg(long)]
+        force: bool,
     },
 }
 #[derive(Subcommand)]
@@ -1062,6 +1073,31 @@ async fn run(cli: Cli) -> anyhow::Result<u8> {
                 .await?;
             print_value(value, cli.json, |value| {
                 println!("{}", value["message"].as_str().unwrap_or("Cache purged."));
+                Ok(())
+            })?;
+        }
+        TopCommand::Storage(StorageCommand::Status) => {
+            let value = client.request(IpcCommand::StorageStatus).await?;
+            print_storage(value, cli.json, false)?;
+        }
+        TopCommand::Storage(StorageCommand::PreviewPrune) => {
+            let value = client.request(IpcCommand::StorageStatus).await?;
+            print_storage(value, cli.json, true)?;
+        }
+        TopCommand::Storage(StorageCommand::Prune { force }) => {
+            let value = client
+                .request(IpcCommand::StoragePrune {
+                    force,
+                    command_id: CommandId::new(),
+                })
+                .await?;
+            print_value(value, cli.json, |value| {
+                println!(
+                    "{}",
+                    value["message"]
+                        .as_str()
+                        .unwrap_or("Storage pruning completed.")
+                );
                 Ok(())
             })?;
         }
@@ -2058,6 +2094,35 @@ fn print_diagnosis(diagnosis: &DiagnoseResult) {
     }
 }
 
+fn print_storage(value: serde_json::Value, json: bool, preview: bool) -> anyhow::Result<()> {
+    print_value(value, json, |value| {
+        println!(
+            "Storage\n  cache       {} / {}\n  target      {}\n  reclaimable {}\n  free floor  {}",
+            format_bytes(value["charged_bytes"].as_u64().unwrap_or(0)),
+            format_bytes(value["hard_limit_bytes"].as_u64().unwrap_or(0)),
+            format_bytes(value["target_bytes"].as_u64().unwrap_or(0)),
+            format_bytes(value["reclaimable_bytes"].as_u64().unwrap_or(0)),
+            format_bytes(value["minimum_free_bytes"].as_u64().unwrap_or(0)),
+        );
+        if preview && let Some(entries) = value["entries"].as_array() {
+            for entry in entries.iter().filter(|entry| entry["reclaimable"] == true) {
+                println!(
+                    "  prune       {:>9}  {}  {}",
+                    format_bytes(entry["charged_bytes"].as_u64().unwrap_or(0)),
+                    entry["class"].as_str().unwrap_or("unknown"),
+                    entry["path"].as_str().unwrap_or("?"),
+                );
+            }
+        }
+        Ok(())
+    })
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    format!("{:.1} GiB", bytes as f64 / GIB)
+}
+
 fn print_value(
     value: serde_json::Value,
     json: bool,
@@ -2276,6 +2341,20 @@ mod tests {
     #[test]
     fn cache_snapshot_is_internal_maintenance() {
         assert!(Cli::try_parse_from(["tg", "cache", "snapshot"]).is_err());
+    }
+
+    #[test]
+    fn storage_prune_requires_an_explicit_force_flag_for_recovery_data() {
+        let parsed = Cli::try_parse_from(["tg", "storage", "prune", "--force"]).unwrap();
+        assert!(matches!(
+            parsed.command,
+            TopCommand::Storage(StorageCommand::Prune { force: true })
+        ));
+        let preview = Cli::try_parse_from(["tg", "storage", "preview-prune"]).unwrap();
+        assert!(matches!(
+            preview.command,
+            TopCommand::Storage(StorageCommand::PreviewPrune)
+        ));
     }
 
     #[test]

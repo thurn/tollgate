@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+pub mod storage;
+
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
@@ -656,6 +658,8 @@ pub struct TollgateService {
     global_scheduler: Arc<GlobalScheduler>,
     global_command_path: PathBuf,
     global_commands: tokio::sync::Mutex<GlobalCommandJournal>,
+    storage_maintenance: tokio::sync::Mutex<()>,
+    storage_charged_bytes: AtomicU64,
     volume_reservations: tokio::sync::Mutex<()>,
     shutting_down: AtomicBool,
 }
@@ -1160,11 +1164,14 @@ impl TollgateService {
             })),
             global_command_path,
             global_commands: tokio::sync::Mutex::new(global_commands),
+            storage_maintenance: tokio::sync::Mutex::new(()),
+            storage_charged_bytes: AtomicU64::new(u64::MAX),
             volume_reservations: tokio::sync::Mutex::new(()),
             shutting_down: AtomicBool::new(false),
         });
         service.load_registry().await?;
         service.reconcile_global_commands().await?;
+        service.storage_status().await?;
         service.spawn_maintenance();
         Ok(service)
     }
@@ -1174,7 +1181,7 @@ impl TollgateService {
         tokio::spawn(async move {
             let start = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
             let mut interval = tokio::time::interval_at(start, std::time::Duration::from_secs(2));
-            let mut ticks = 0_u64;
+            let mut ticks = 1_u64;
             loop {
                 interval.tick().await;
                 let Some(service) = service.upgrade() else {
@@ -1213,6 +1220,11 @@ impl TollgateService {
                             "Tollgate artifact retention sweep failed for {repository_id}: {error}"
                         );
                     }
+                }
+                if ticks.is_multiple_of(150)
+                    && let Err(error) = service.perform_storage_prune(false).await
+                {
+                    eprintln!("Tollgate storage maintenance failed: {error}");
                 }
                 ticks = ticks.wrapping_add(1);
             }
@@ -1370,13 +1382,17 @@ impl TollgateService {
             &config.canonical_bytes()?,
             &config.step_graph_digest,
         )?;
-        let runtime = self
-            .make_runtime(git, store, state, config, ownership_lock)
-            .await?;
-        self.runtimes
-            .write()
-            .await
-            .insert(repository_id, Arc::clone(&runtime));
+        let runtime = {
+            let _storage = self.storage_maintenance.lock().await;
+            let runtime = self
+                .make_runtime(git, store, state, config, ownership_lock)
+                .await?;
+            self.runtimes
+                .write()
+                .await
+                .insert(repository_id, Arc::clone(&runtime));
+            runtime
+        };
         self.reconfigure_global_scheduler().await;
         self.save_registry().await?;
         if bootstrap
@@ -1508,14 +1524,18 @@ impl TollgateService {
             store.update_repository_state(&state)?;
         }
         let id = state.id;
-        let runtime = self
-            .make_runtime(git, store, state, config, ownership_lock)
-            .await?;
-        self.runtimes.write().await.insert(id, Arc::clone(&runtime));
-        self.unavailable
-            .write()
-            .await
-            .retain(|entry| entry.id != id);
+        let runtime = {
+            let _storage = self.storage_maintenance.lock().await;
+            let runtime = self
+                .make_runtime(git, store, state, config, ownership_lock)
+                .await?;
+            self.runtimes.write().await.insert(id, Arc::clone(&runtime));
+            self.unavailable
+                .write()
+                .await
+                .retain(|entry| entry.id != id);
+            runtime
+        };
         self.reconfigure_global_scheduler().await;
         self.reconcile_seed_intents(&runtime).await?;
         self.reconcile_backup_intents(&runtime).await?;
@@ -4288,6 +4308,338 @@ impl TollgateService {
                 variable_count: environment.variables.len(),
             },
         })
+    }
+
+    /// Return host-wide cache usage and reclaimable entries.
+    pub async fn storage_status(&self) -> Result<storage::StorageView, ServiceError> {
+        let (registered, slots, seeds) = self.storage_inventory().await;
+        let cache_root = self.support_root.join("cache");
+        let view = tokio::task::spawn_blocking(move || {
+            storage::inspect(&cache_root, &registered, &slots, &seeds)
+        })
+        .await
+        .map_err(|error| ServiceError::Invariant(format!("storage scan failed: {error}")))?
+        .map_err(ServiceError::Io)?;
+        self.storage_charged_bytes
+            .store(view.charged_bytes, Ordering::Release);
+        Ok(view)
+    }
+
+    /// Reclaim orphaned cache roots and excess idle validation slots.
+    pub async fn prune_storage(
+        self: &Arc<Self>,
+        force: bool,
+        command_id: CommandId,
+    ) -> Result<storage::StoragePruneResult, ServiceError> {
+        let request_digest = command_digest(&serde_json::json!({"force": force}))?;
+        if let Some(response) = self
+            .prepare_global_command(
+                "storage-prune",
+                command_id,
+                &request_digest,
+                serde_json::json!({"force": force}),
+            )
+            .await?
+        {
+            return Ok(serde_json::from_value(response)?);
+        }
+        let result = self.perform_storage_prune(force).await?;
+        self.complete_global_command(command_id, &result).await?;
+        Ok(result)
+    }
+
+    async fn perform_storage_prune(
+        self: &Arc<Self>,
+        force: bool,
+    ) -> Result<storage::StoragePruneResult, ServiceError> {
+        let _storage = self.storage_maintenance.lock().await;
+        let before = self.storage_status().await?;
+        let pressured = force || before.charged_bytes > storage::HIGH_WATER_BYTES;
+        let mut removed_orphan_roots = Vec::new();
+        for entry in before
+            .entries
+            .iter()
+            .filter(|entry| entry.class == "prune-quarantine" && entry.reclaimable)
+        {
+            self.remove_prune_quarantine(&entry.path).await?;
+        }
+        for entry in before
+            .entries
+            .iter()
+            .filter(|entry| entry.class == "orphan-repository" && entry.reclaimable)
+        {
+            self.remove_orphan_cache_root(&entry.path).await?;
+            removed_orphan_roots.push(entry.path.clone());
+        }
+        let mut removed_recovery_roots = Vec::new();
+        if force {
+            for entry in before
+                .entries
+                .iter()
+                .filter(|entry| entry.class == "recovery")
+            {
+                self.remove_recovery_cache_root(&entry.path).await?;
+                removed_recovery_roots.push(entry.path.clone());
+            }
+        }
+        let removed_roots = removed_orphan_roots.len()
+            + removed_recovery_roots.len()
+            + before
+                .entries
+                .iter()
+                .filter(|entry| entry.class == "prune-quarantine" && entry.reclaimable)
+                .count();
+        let after_orphans = if removed_roots == 0 {
+            before.clone()
+        } else {
+            self.storage_status().await?
+        };
+        let (_, slots, _) = self.storage_inventory().await;
+        let mut selected = if pressured {
+            storage::excess_warm_slots(&slots)
+        } else {
+            HashSet::new()
+        };
+        if pressured {
+            let mut idle = slots
+                .iter()
+                .filter(|slot| slot.state == "idle" && !slot.repository_active)
+                .collect::<Vec<_>>();
+            idle.sort_by(|left, right| {
+                left.last_accessed_at
+                    .cmp(&right.last_accessed_at)
+                    .then_with(|| left.slot_id.to_string().cmp(&right.slot_id.to_string()))
+            });
+            let mut projected = after_orphans.charged_bytes;
+            for slot in idle {
+                if projected <= storage::TARGET_BYTES {
+                    break;
+                }
+                selected.insert(slot.slot_id);
+                projected = projected.saturating_sub(storage::tree_charged_size(&slot.path)?);
+            }
+        }
+        if pressured {
+            let mut repositories = HashMap::<RepositoryId, Option<String>>::new();
+            for seed in before
+                .entries
+                .iter()
+                .filter(|entry| entry.class == "seed" && entry.reclaimable)
+            {
+                if let Some(repository_id) = seed.repository_id {
+                    repositories.entry(repository_id).or_insert(None);
+                }
+            }
+            let (_, _, seeds) = self.storage_inventory().await;
+            for seed in seeds.iter().filter(|seed| seed.protected) {
+                repositories.insert(seed.repository_id, Some(seed.id.clone()));
+            }
+            for (repository_id, protected_seed_id) in repositories {
+                self.purge_cache_except(
+                    repository_id,
+                    false,
+                    CommandId::new(),
+                    protected_seed_id.as_deref(),
+                )
+                .await?;
+            }
+        }
+        let mut removed_slots = Vec::new();
+        for slot in slots.iter().filter(|slot| selected.contains(&slot.slot_id)) {
+            if self.remove_idle_storage_slot(slot).await? {
+                removed_slots.push(slot.slot_id);
+            }
+        }
+        let after = self.storage_status().await?;
+        Ok(storage::StoragePruneResult {
+            before_bytes: before.charged_bytes,
+            after_bytes: after.charged_bytes,
+            reclaimed_bytes: before.charged_bytes.saturating_sub(after.charged_bytes),
+            removed_slots,
+            removed_orphan_roots,
+            removed_recovery_roots,
+            message: format!(
+                "Reclaimed {} bytes; cache now uses {} of the {} byte hard limit.",
+                before.charged_bytes.saturating_sub(after.charged_bytes),
+                after.charged_bytes,
+                storage::HARD_LIMIT_BYTES
+            ),
+        })
+    }
+
+    async fn storage_inventory(
+        &self,
+    ) -> (
+        HashSet<RepositoryId>,
+        Vec<storage::SlotStorage>,
+        Vec<storage::SeedStorage>,
+    ) {
+        let runtimes = self
+            .runtimes
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut registered = self
+            .unavailable
+            .read()
+            .await
+            .iter()
+            .map(|repository| repository.id)
+            .collect::<HashSet<_>>();
+        let mut slots = Vec::new();
+        let mut seeds = Vec::new();
+        for runtime in runtimes {
+            let data = runtime.data.lock();
+            let protected_seed_id = compatible_seed(&data).ok().flatten().map(|seed| seed.id);
+            registered.insert(data.state.id);
+            let repository_active = data.items.iter().any(|item| !item.state.is_terminal())
+                || data.buildsets.iter().any(|buildset| {
+                    matches!(
+                        buildset.state,
+                        BuildsetState::Preparing | BuildsetState::Running
+                    )
+                });
+            slots.extend(data.slots.values().map(|slot| storage::SlotStorage {
+                repository_id: data.state.id,
+                slot_id: slot.id,
+                path: slot.path.clone(),
+                state: slot.state.clone(),
+                health: slot.health.clone(),
+                repository_active,
+                last_accessed_at: slot.last_used,
+            }));
+            seeds.extend(data.seeds.iter().map(|seed| storage::SeedStorage {
+                repository_id: data.state.id,
+                id: seed.id.clone(),
+                path: PathBuf::from(&seed.path),
+                state: seed.state.clone(),
+                protected: protected_seed_id.as_deref() == Some(seed.id.as_str()),
+            }));
+        }
+        (registered, slots, seeds)
+    }
+
+    async fn published_seed_bytes(&self) -> u64 {
+        let runtimes = self
+            .runtimes
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        runtimes
+            .iter()
+            .map(|runtime| {
+                runtime
+                    .data
+                    .lock()
+                    .seeds
+                    .iter()
+                    .filter(|seed| seed.state == "published")
+                    .map(|seed| seed.logical_size)
+                    .sum::<u64>()
+            })
+            .sum()
+    }
+
+    async fn remove_idle_storage_slot(
+        &self,
+        candidate: &storage::SlotStorage,
+    ) -> Result<bool, ServiceError> {
+        let runtime = self.runtime(candidate.repository_id).await?;
+        let _mutation = runtime.mutation.lock().await;
+        let current = runtime.data.lock().slots.get(&candidate.slot_id).cloned();
+        let Some(current) = current else {
+            return Ok(false);
+        };
+        if current.state != "idle" || current.path != candidate.path {
+            return Ok(false);
+        }
+        runtime
+            .git
+            .remove_slot(&runtime.mirror, &candidate.path)
+            .await?;
+        runtime.data.lock().slots.remove(&candidate.slot_id);
+        Ok(true)
+    }
+
+    async fn remove_orphan_cache_root(&self, path: &Path) -> Result<(), ServiceError> {
+        let cache_root = std::fs::canonicalize(self.support_root.join("cache"))?;
+        let canonical = std::fs::canonicalize(path)?;
+        if canonical.parent() != Some(cache_root.as_path()) {
+            return Err(ServiceError::Invariant(
+                "orphan cache root is not a direct child of the owned cache root".into(),
+            ));
+        }
+        let name = canonical
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| ServiceError::Invariant("orphan cache name is not UTF-8".into()))?;
+        let repository_id = name.parse::<RepositoryId>().map_err(|error| {
+            ServiceError::Invariant(format!("orphan cache name is not a repository ID: {error}"))
+        })?;
+        let (registered, _, _) = self.storage_inventory().await;
+        if registered.contains(&repository_id) {
+            return Err(ServiceError::Invariant(
+                "orphan cache root became registered during pruning".into(),
+            ));
+        }
+        let quarantine =
+            cache_root.join(format!(".pruned-{repository_id}-{}", uuid::Uuid::now_v7()));
+        tokio::fs::rename(&canonical, &quarantine).await?;
+        tokio::fs::remove_dir_all(&quarantine).await?;
+        sync_directory(&cache_root)?;
+        Ok(())
+    }
+
+    async fn remove_recovery_cache_root(&self, path: &Path) -> Result<(), ServiceError> {
+        let cache_root = std::fs::canonicalize(self.support_root.join("cache"))?;
+        let canonical = std::fs::canonicalize(path)?;
+        if canonical.parent() != Some(cache_root.as_path()) {
+            return Err(ServiceError::Invariant(
+                "recovery cache root is not a direct child of the owned cache root".into(),
+            ));
+        }
+        let name = canonical
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| ServiceError::Invariant("recovery cache name is not UTF-8".into()))?;
+        if !name.starts_with("recovery-") {
+            return Err(ServiceError::Invariant(
+                "recovery cache root does not use the owned recovery prefix".into(),
+            ));
+        }
+        let quarantine = cache_root.join(format!(".pruned-{name}-{}", uuid::Uuid::now_v7()));
+        tokio::fs::rename(&canonical, &quarantine).await?;
+        tokio::fs::remove_dir_all(&quarantine).await?;
+        sync_directory(&cache_root)?;
+        Ok(())
+    }
+
+    async fn remove_prune_quarantine(&self, path: &Path) -> Result<(), ServiceError> {
+        let cache_root = std::fs::canonicalize(self.support_root.join("cache"))?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| ServiceError::Invariant("prune quarantine has no parent".into()))?;
+        if std::fs::canonicalize(parent)? != cache_root {
+            return Err(ServiceError::Invariant(
+                "prune quarantine is not a direct child of the owned cache root".into(),
+            ));
+        }
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| ServiceError::Invariant("prune quarantine name is not UTF-8".into()))?;
+        if !name.starts_with(".pruned-") {
+            return Err(ServiceError::Invariant(
+                "prune quarantine does not use the owned prefix".into(),
+            ));
+        }
+        tokio::fs::remove_dir_all(path).await?;
+        sync_directory(&cache_root)?;
+        Ok(())
     }
 
     pub async fn repository_snapshot(
@@ -8661,7 +9013,6 @@ impl TollgateService {
         }
         selected.sort();
         selected.dedup();
-        const SEED_LOGICAL_BUDGET: u64 = 200 * 1024 * 1024 * 1024;
         let donor_root = std::fs::canonicalize(&donor.path)?;
         let mut estimated_size = 0u64;
         for relative in &selected {
@@ -8674,17 +9025,10 @@ impl TollgateService {
             }
             estimated_size = estimated_size.saturating_add(tree_logical_size(&source)?);
         }
-        let published_size = runtime
-            .data
-            .lock()
-            .seeds
-            .iter()
-            .filter(|seed| seed.state == "published")
-            .map(|seed| seed.logical_size)
-            .sum::<u64>();
-        if published_size.saturating_add(estimated_size) > SEED_LOGICAL_BUDGET {
+        let published_size = self.published_seed_bytes().await;
+        if published_size.saturating_add(estimated_size) > storage::SEED_LIMIT_BYTES {
             return Err(ServiceError::Invariant(
-                "cache snapshot would exceed the 200 GiB repository seed budget".into(),
+                "cache snapshot would exceed the 20 GiB host-wide seed budget".into(),
             ));
         }
         let cache_root = runtime
@@ -8883,12 +9227,24 @@ impl TollgateService {
         all_slots: bool,
         command_id: CommandId,
     ) -> Result<CacheOperationResult, ServiceError> {
+        self.purge_cache_except(repository_id, all_slots, command_id, None)
+            .await
+    }
+
+    async fn purge_cache_except(
+        self: &Arc<Self>,
+        repository_id: RepositoryId,
+        all_slots: bool,
+        command_id: CommandId,
+        protected_seed_id: Option<&str>,
+    ) -> Result<CacheOperationResult, ServiceError> {
         let runtime = self.runtime(repository_id).await?;
         let _mutation = runtime.mutation.lock().await;
         let state = runtime.data.lock().state.clone();
         let request_digest = command_digest(&serde_json::json!({
             "repository_id": repository_id,
             "all_slots": all_slots,
+            "protected_seed_id": protected_seed_id,
         }))?;
         if let Some(response) =
             runtime
@@ -8903,6 +9259,7 @@ impl TollgateService {
             .seeds
             .iter()
             .filter(|seed| seed.state == "published")
+            .filter(|seed| protected_seed_id != Some(seed.id.as_str()))
             .cloned()
             .collect::<Vec<_>>();
         let idle_slots = if all_slots {
@@ -9064,10 +9421,14 @@ impl TollgateService {
             .lock()
             .insert(item_id, cancellation.clone());
         loop {
+            let observed_storage = self.storage_charged_bytes.load(Ordering::Acquire);
+            let storage_ready = observed_storage <= storage::HARD_LIMIT_BYTES;
             let volumes = observe_volumes(&runtime)?;
-            if volumes
-                .iter()
-                .all(|volume| volume.available_bytes >= volume.warning_threshold)
+            if storage_ready
+                && volumes.iter().all(|volume| {
+                    volume.available_bytes
+                        >= volume.warning_threshold.max(storage::MINIMUM_FREE_BYTES)
+                })
             {
                 break;
             }
@@ -12468,6 +12829,19 @@ impl TollgateService {
                     self.global_commands.lock().await.records.remove(&id);
                     let journal = self.global_commands.lock().await;
                     self.persist_global_commands(&journal).await?;
+                }
+                "storage-prune" => {
+                    let force = record
+                        .payload
+                        .get("force")
+                        .and_then(serde_json::Value::as_bool)
+                        .ok_or_else(|| {
+                            ServiceError::Invariant(
+                                "storage prune intent omitted its force policy".into(),
+                            )
+                        })?;
+                    let result = self.perform_storage_prune(force).await?;
+                    self.complete_global_command(command_id, &result).await?;
                 }
                 other => {
                     return Err(ServiceError::Invariant(format!(
