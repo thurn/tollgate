@@ -465,13 +465,7 @@ async fn run(cli: Cli) -> anyhow::Result<u8> {
                 })
                 .await?;
             print_wait_value(response.clone(), cli.json, args.wait, |value| {
-                println!(
-                    "Candidate {} submitted without promotion authority\n  source  {}\n  tested  {}\n  queue revision {}",
-                    value["item_id"].as_str().unwrap_or("?"),
-                    oid_value(&value["source_oid"]),
-                    oid_value(&value["tested_oid"]),
-                    value["queue_revision"]
-                );
+                println!("{}", candidate_submission_message(value));
                 Ok(())
             })?;
             if args.wait {
@@ -719,7 +713,7 @@ async fn run(cli: Cli) -> anyhow::Result<u8> {
         }
         TopCommand::Cancel { id } => {
             let repository = select_repository(&mut client, cli.repository).await?;
-            client
+            let response = client
                 .request(IpcCommand::Cancel {
                     repository_id: repository.state.id,
                     item_id: id,
@@ -728,10 +722,20 @@ async fn run(cli: Cli) -> anyhow::Result<u8> {
                 })
                 .await?;
             if cli.json {
-                println!("{{\"status\":\"accepted\",\"item_id\":\"{id}\"}}");
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "status": response["action"],
+                        "item_id": id,
+                        "message": response["message"],
+                    }))?
+                );
             } else {
                 println!(
-                    "Canceled {id}; affected descendants will receive new validation generations."
+                    "{}",
+                    response["message"]
+                        .as_str()
+                        .unwrap_or("Cancellation completed.")
                 );
             }
         }
@@ -1846,7 +1850,7 @@ trait QueueItemDisplay {
 }
 impl QueueItemDisplay for tollgate_domain::QueueItem {
     fn state_as_display(&self) -> String {
-        format!("{:?}", self.state).to_lowercase()
+        self.state.as_str().into()
     }
 }
 
@@ -2165,6 +2169,28 @@ fn oid_value(value: &serde_json::Value) -> String {
         .map(short_oid)
         .unwrap_or_else(|| "—".into())
 }
+
+fn candidate_submission_message(value: &serde_json::Value) -> String {
+    if let Some(reason) = value["terminal_reason"].as_str() {
+        format!(
+            "Candidate {} recorded in terminal state {}\n  source  {}\n  queue revision {}\n  reason  {}",
+            value["item_id"].as_str().unwrap_or("?"),
+            value["state"].as_str().unwrap_or("unknown"),
+            oid_value(&value["source_oid"]),
+            value["queue_revision"],
+            reason,
+        )
+    } else {
+        format!(
+            "Candidate {} submitted without promotion authority\n  source  {}\n  tested  {}\n  queue revision {}",
+            value["item_id"].as_str().unwrap_or("?"),
+            oid_value(&value["source_oid"]),
+            oid_value(&value["tested_oid"]),
+            value["queue_revision"]
+        )
+    }
+}
+
 fn classify_exit(error: &anyhow::Error) -> u8 {
     if let Some(error) = error.downcast_ref::<IpcRequestError>()
         && matches!(
@@ -2172,6 +2198,7 @@ fn classify_exit(error: &anyhow::Error) -> u8 {
             "stale-queue-prefix"
                 | "unknown-source-ancestor"
                 | "unpromoted-source-ancestor"
+                | "candidate-terminal"
                 | "revision-conflict"
         )
     {
@@ -2201,6 +2228,24 @@ mod tests {
     #[test]
     fn missing_tested_oid_is_rendered_as_unavailable() {
         assert_eq!(oid_value(&serde_json::Value::Null), "—");
+    }
+
+    #[test]
+    fn terminal_candidate_submission_reports_its_retained_reason() {
+        let message = candidate_submission_message(&serde_json::json!({
+            "item_id": "019ffe40-a60d-7722-a369-2635222d1203",
+            "queue_revision": 42,
+            "source_oid": {
+                "format": "sha1",
+                "bytes": "1111111111111111111111111111111111111111",
+            },
+            "tested_oid": null,
+            "state": "merge-conflict",
+            "terminal_reason": "conflict in fixture.txt",
+        }));
+        assert!(message.contains("recorded in terminal state merge-conflict"));
+        assert!(message.contains("reason  conflict in fixture.txt"));
+        assert!(!message.contains("submitted without promotion authority"));
     }
 
     fn repository_with_candidate(candidate_id: &str) -> RepositorySnapshot {

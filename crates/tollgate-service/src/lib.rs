@@ -88,6 +88,12 @@ pub enum ServiceError {
         ancestor: GitOid,
         release_oid: GitOid,
     },
+    #[error("candidate {item_id} is terminal in state {state}: {reason}")]
+    CandidateTerminal {
+        item_id: QueueItemId,
+        state: QueueItemState,
+        reason: String,
+    },
     #[error("internal service invariant failed: {0}")]
     Invariant(String),
     #[error("I/O error: {0}")]
@@ -423,6 +429,10 @@ pub struct ApproveResult {
     pub queue_revision: u64,
     pub source_oid: GitOid,
     pub tested_oid: Option<GitOid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<QueueItemState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_reason: Option<String>,
 }
 
 struct GateSubmission {
@@ -1027,6 +1037,22 @@ fn matching_retained_evidence(
 
 fn current_queue_prefix_oid(data: &RuntimeData) -> GitOid {
     current_queue_prefix_from(&data.state, &data.items, &data.generations)
+}
+
+fn release_construction_failure(error: &GitError, release_oid: &GitOid) -> String {
+    match error {
+        GitError::SyntheticConflict {
+            source_oid,
+            source_parent_oid,
+            conflicting_paths,
+            ..
+        } => format!(
+            "candidate could not be constructed on promoted release {release_oid}: applying source {source_oid} (source base {source_parent_oid}) produced merge conflicts in {conflicting_paths:?}. Rebase the single task commit onto the latest promoted `release` {release_oid}, resolve and regenerate, then resubmit"
+        ),
+        _ => {
+            format!("candidate could not be constructed on promoted release {release_oid}: {error}")
+        }
+    }
 }
 
 fn current_queue_prefix_from(
@@ -3397,8 +3423,9 @@ impl TollgateService {
                             .state
                             .transition(ItemEvent::MergeConflict)
                             .map_err(|error| ServiceError::Invariant(error.to_string()))?;
-                        item.terminal_reason = Some(format!(
-                            "candidate could not be constructed on promoted release: {standalone_error}"
+                        item.terminal_reason = Some(release_construction_failure(
+                            &standalone_error,
+                            &state.master_oid,
                         ));
                         None
                     }
@@ -3562,6 +3589,8 @@ impl TollgateService {
                     queue_revision: state.queue_revision,
                     source_oid: item.source_oid.clone(),
                     tested_oid: Some(generation.tested_oid.clone()),
+                    state: Some(item.state),
+                    terminal_reason: item.terminal_reason.clone(),
                 };
                 let event = runtime.store.complete_check(
                     &item,
@@ -3616,6 +3645,8 @@ impl TollgateService {
                 tested_oid: generation
                     .as_ref()
                     .map(|generation| generation.tested_oid.clone()),
+                state: Some(item.state),
+                terminal_reason: item.terminal_reason.clone(),
             };
             let command_kind = if item.kind == QueueItemKind::IndependentCheck {
                 "check"
@@ -5773,6 +5804,8 @@ impl TollgateService {
             tested_oid: generation
                 .as_ref()
                 .map(|generation| generation.tested_oid.clone()),
+            state: Some(item.state),
+            terminal_reason: item.terminal_reason.clone(),
         };
         let speculative_ref = if let Some(generation) = &generation {
             Some(
@@ -5958,10 +5991,20 @@ impl TollgateService {
                 .find(|item| item.id == item_id)
                 .cloned()
                 .ok_or(ServiceError::ItemNotFound(item_id))?;
-            if item.kind != QueueItemKind::Gate || item.state.is_terminal() {
+            if item.kind != QueueItemKind::Gate {
                 return Err(ServiceError::Invariant(
                     "promotion authority can only be granted to an active gate candidate".into(),
                 ));
+            }
+            if item.state.is_terminal() {
+                return Err(ServiceError::CandidateTerminal {
+                    item_id,
+                    state: item.state,
+                    reason: item
+                        .terminal_reason
+                        .clone()
+                        .unwrap_or_else(|| "no terminal reason was recorded".into()),
+                });
             }
 
             fn append_active_dependencies(
@@ -6552,6 +6595,8 @@ impl TollgateService {
             queue_revision: state.queue_revision,
             source_oid: item.source_oid.clone(),
             tested_oid: Some(generation.tested_oid.clone()),
+            state: Some(item.state),
+            terminal_reason: item.terminal_reason.clone(),
         };
         let event = runtime.store.complete_check(
             &item,
@@ -12040,16 +12085,6 @@ impl TollgateService {
         {
             return Ok(response);
         }
-        runtime.store.prepare_operation(
-            repository_id,
-            "cancel",
-            command_id,
-            &serde_json::json!({
-                "request_digest": request_digest,
-                "item_id": item_id,
-                "expected_revision": expected_revision,
-            }),
-        )?;
         let mut item = {
             let data = runtime.data.lock();
             if data.state.queue_revision != expected_revision {
@@ -12064,6 +12099,51 @@ impl TollgateService {
                 .cloned()
                 .ok_or(ServiceError::ItemNotFound(item_id))?
         };
+        runtime.store.prepare_operation(
+            repository_id,
+            "cancel",
+            command_id,
+            &serde_json::json!({
+                "request_digest": request_digest,
+                "item_id": item_id,
+                "expected_revision": expected_revision,
+            }),
+        )?;
+        if item.state.is_terminal() {
+            let terminal_state = item.state;
+            let terminal_reason = item.terminal_reason.clone();
+            let mut state = runtime.data.lock().state.clone();
+            let result = MutationResult {
+                repository_id,
+                action: "already-terminal".into(),
+                message: format!(
+                    "Queue item {item_id} is already terminal in state {terminal_state}{}; no cancellation was needed.",
+                    terminal_reason
+                        .as_deref()
+                        .map(|reason| format!(": {reason}"))
+                        .unwrap_or_default(),
+                ),
+            };
+            let event = runtime.store.complete_operation(
+                &state,
+                "cancel",
+                command_id,
+                "cancel",
+                &request_digest,
+                &result,
+                "item.cancel-command-noop",
+                &serde_json::json!({
+                    "item_id": item_id,
+                    "state": terminal_state,
+                    "terminal_reason": terminal_reason,
+                }),
+                Actor::App,
+            )?;
+            state.event_sequence = event.sequence;
+            runtime.data.lock().state = state;
+            let _ = runtime.events.send(event);
+            return Ok(result);
+        }
         if let Some(token) = runtime.cancellations.lock().get(&item_id) {
             token.cancel();
         }
@@ -12095,9 +12175,9 @@ impl TollgateService {
             repository_id,
             action: "cancel".into(),
             message: if is_check {
-                "Independent check canceled.".into()
+                format!("Independent check {item_id} canceled.")
             } else {
-                "Queue item canceled and affected prefixes rebuilt.".into()
+                format!("Queue item {item_id} canceled and affected prefixes rebuilt.")
             },
         };
         let event = runtime.store.complete_operation(
@@ -19309,6 +19389,7 @@ run = "true"
         );
 
         assert!(result.tested_oid.is_none());
+        assert_eq!(result.state, Some(QueueItemState::MergeConflict));
         let details = service
             .item_details(initialized.state.id, result.item_id)
             .await
@@ -19321,8 +19402,9 @@ run = "true"
         assert!(message.contains("messages.json"));
         assert!(message.contains(&source_base));
         assert!(message.contains(&release));
-        assert!(message.contains("based only on promoted `release`"));
-        assert!(message.contains("never rebase it onto a speculative prefix"));
+        assert!(message.contains("latest promoted `release`"));
+        assert!(!message.contains("earlier candidate"));
+        assert_eq!(result.terminal_reason.as_deref(), Some(message));
         let snapshot = service
             .repository_snapshot(initialized.state.id)
             .await
@@ -19344,6 +19426,157 @@ run = "true"
                 ]
             ),
             result.source_oid.to_hex()
+        );
+
+        let error = service
+            .authorize_candidate(
+                initialized.state.id,
+                result.item_id,
+                snapshot.state.queue_revision,
+                CommandId::new(),
+            )
+            .await
+            .unwrap_err();
+        match error {
+            ServiceError::CandidateTerminal {
+                item_id,
+                state,
+                reason,
+            } => {
+                assert_eq!(item_id, result.item_id);
+                assert_eq!(state, QueueItemState::MergeConflict);
+                assert_eq!(reason, message);
+            }
+            error => panic!("expected terminal candidate result, got {error}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn canceling_a_failed_candidate_is_an_audited_terminal_noop() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        let feature = temporary.path().join("feature");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("base.txt"), "base\n").unwrap();
+        git(&repository, &["add", "base.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                feature.to_str().unwrap(),
+                USER_BRANCH,
+            ],
+        );
+        std::fs::write(feature.join("feature.txt"), "feature\n").unwrap();
+        git(&feature, &["add", "feature.txt"]);
+        git(&feature, &["commit", "-m", "feature"]);
+        git(&repository, &["switch", "--detach", USER_BRANCH]);
+
+        let service = TollgateService::open(temporary.path().join("support"))
+            .await
+            .unwrap();
+        let initialized = service
+            .initialize_repository(&repository, Some("false".into()))
+            .await
+            .unwrap();
+        let candidate = service
+            .submit_candidate_from(
+                initialized.state.id,
+                "HEAD".into(),
+                Some(feature.to_string_lossy().into_owned()),
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let failed = loop {
+            let item = service
+                .item_status(initialized.state.id, candidate.item_id)
+                .await
+                .unwrap();
+            if item.state == QueueItemState::Failed {
+                break item;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        };
+        let snapshot = service
+            .repository_snapshot(initialized.state.id)
+            .await
+            .unwrap();
+        let command_id = CommandId::new();
+        let result = service
+            .cancel_command(
+                initialized.state.id,
+                candidate.item_id,
+                snapshot.state.queue_revision,
+                command_id,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.action, "already-terminal");
+        assert!(result.message.contains("already terminal in state failed"));
+        assert!(
+            result
+                .message
+                .contains(failed.terminal_reason.as_deref().unwrap())
+        );
+        assert_eq!(
+            service
+                .item_status(initialized.state.id, candidate.item_id)
+                .await
+                .unwrap(),
+            failed
+        );
+        assert_eq!(
+            service
+                .repository_snapshot(initialized.state.id)
+                .await
+                .unwrap()
+                .state
+                .queue_revision,
+            snapshot.state.queue_revision
+        );
+        assert_eq!(
+            service
+                .cancel_command(
+                    initialized.state.id,
+                    candidate.item_id,
+                    snapshot.state.queue_revision,
+                    command_id,
+                )
+                .await
+                .unwrap()
+                .action,
+            "already-terminal"
+        );
+        let runtime = service.runtime(initialized.state.id).await.unwrap();
+        assert!(
+            runtime
+                .store
+                .completed_operation_records("cancel")
+                .unwrap()
+                .iter()
+                .any(|(_, observed)| {
+                    observed["item_id"] == candidate.item_id.to_string()
+                        && observed["state"] == "failed"
+                })
+        );
+        drop(runtime);
+        assert!(
+            service
+                .repository_snapshot(initialized.state.id)
+                .await
+                .unwrap()
+                .history
+                .iter()
+                .any(|event| event.kind == "item.cancel-command-noop")
         );
     }
 

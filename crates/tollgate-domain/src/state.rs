@@ -34,6 +34,28 @@ pub enum QueueItemState {
 }
 
 impl QueueItemState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Constructing => "constructing",
+            Self::Queued => "queued",
+            Self::Preparing => "preparing",
+            Self::Running => "running",
+            Self::Ready => "ready",
+            Self::Promoting => "promoting",
+            Self::PromotedLocalPushPending => "promoted-local-push-pending",
+            Self::Promoted => "promoted",
+            Self::ExternallyIntegrated => "externally-integrated",
+            Self::Failed => "failed",
+            Self::MergeConflict => "merge-conflict",
+            Self::DependencyFailed => "dependency-failed",
+            Self::Canceled => "canceled",
+            Self::Superseded => "superseded",
+            Self::InfrastructureExhausted => "infrastructure-exhausted",
+            Self::CheckPassed => "check-passed",
+            Self::CheckFailed => "check-failed",
+        }
+    }
+
     pub const fn is_terminal(self) -> bool {
         matches!(
             self,
@@ -95,6 +117,26 @@ impl QueueItemState {
             }
         };
         Ok(next)
+    }
+}
+
+impl std::fmt::Display for QueueItemState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[cfg(test)]
+mod display_tests {
+    use super::QueueItemState;
+
+    #[test]
+    fn item_states_use_their_wire_names_for_display() {
+        assert_eq!(QueueItemState::MergeConflict.to_string(), "merge-conflict");
+        assert_eq!(
+            QueueItemState::PromotedLocalPushPending.to_string(),
+            "promoted-local-push-pending"
+        );
     }
 }
 

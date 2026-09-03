@@ -1123,7 +1123,7 @@ async fn execute_ipc_command(service: &Service, command: IpcCommand) -> IpcRespo
                 service
                     .authorize_candidate(repository_id, item_id, expected_revision, command_id)
                     .await
-                    .map_err(|error| error.to_string())?,
+                    .map_err(encode_candidate_submission_error)?,
             )
             .map_err(|error| error.to_string()),
             IpcCommand::Check {
@@ -1496,6 +1496,20 @@ fn encode_candidate_submission_error(error: ServiceError) -> String {
                 "retry": "Rebase the single task commit onto release_oid only, then resubmit."
             })),
         }),
+        ServiceError::CandidateTerminal {
+            item_id,
+            state,
+            reason,
+        } => Some(StructuredError {
+            code: "candidate-terminal".into(),
+            message: message.clone(),
+            retryable: false,
+            details: Some(serde_json::json!({
+                "item_id": item_id,
+                "state": state,
+                "terminal_reason": reason,
+            })),
+        }),
         _ => None,
     };
     structured
@@ -1562,6 +1576,33 @@ mod ipc_error_tests {
                 .as_str()
                 .unwrap()
                 .contains("release_oid only")
+        );
+    }
+
+    #[test]
+    fn terminal_candidate_error_preserves_state_and_reason() {
+        let item_id = QueueItemId::new();
+        let encoded = encode_candidate_submission_error(ServiceError::CandidateTerminal {
+            item_id,
+            state: tollgate_domain::QueueItemState::MergeConflict,
+            reason: "conflict in fixture.txt".into(),
+        });
+        let error: StructuredError = serde_json::from_str(
+            encoded
+                .strip_prefix(STRUCTURED_SERVICE_ERROR_PREFIX)
+                .expect("terminal candidate errors must cross IPC as structured errors"),
+        )
+        .unwrap();
+        assert_eq!(error.code, "candidate-terminal");
+        assert!(!error.retryable);
+        assert_eq!(
+            error.details.as_ref().unwrap()["item_id"],
+            item_id.to_string()
+        );
+        assert_eq!(error.details.as_ref().unwrap()["state"], "merge-conflict");
+        assert_eq!(
+            error.details.as_ref().unwrap()["terminal_reason"],
+            "conflict in fixture.txt"
         );
     }
 
