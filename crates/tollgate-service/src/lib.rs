@@ -42,6 +42,19 @@ use tollgate_store::{
 };
 
 #[derive(Debug, Error)]
+#[error(
+    "missing artifact `{artifact}`; attempted `{attempted_recovery}`; registered repository `{registered_repository}`; candidate ref `{candidate_ref}`; recorded source OID {source_oid}; cause: {cause}"
+)]
+pub struct ExecutionCacheRecoveryError {
+    artifact: String,
+    attempted_recovery: String,
+    registered_repository: String,
+    candidate_ref: String,
+    source_oid: GitOid,
+    cause: String,
+}
+
+#[derive(Debug, Error)]
 pub enum ServiceError {
     #[error("Git error: {0}")]
     Git(#[from] GitError),
@@ -51,6 +64,23 @@ pub enum ServiceError {
     Configuration(#[from] tollgate_config::ConfigError),
     #[error("runner error: {0}")]
     Runner(#[from] tollgate_runner::RunnerError),
+    #[error("execution cache recovery failed: {0}")]
+    ExecutionCacheRecovery(Box<ExecutionCacheRecoveryError>),
+    #[error("execution cache recovery deferred: {0}")]
+    ExecutionCacheRecoveryDeferred(String),
+    #[error(
+        "retained logs for buildset {buildset_id} step `{step}` were removed with disposable cache data"
+    )]
+    RetainedLogsRemoved {
+        buildset_id: BuildsetId,
+        step: String,
+    },
+    #[error("logs for buildset {buildset_id} step `{step}` are unavailable: {reason}")]
+    StepLogsUnavailable {
+        buildset_id: BuildsetId,
+        step: String,
+        reason: String,
+    },
     #[error("repository {0} is not registered")]
     RepositoryNotFound(RepositoryId),
     #[error("repository path is not valid UTF-8")]
@@ -549,6 +579,7 @@ struct RepositoryRuntime {
     _ownership_lock: nix::fcntl::Flock<std::fs::File>,
     git: GitRepository,
     store: RepositoryStore,
+    cache_root: PathBuf,
     mirror: PathBuf,
     builder: PathBuf,
     slots_root: PathBuf,
@@ -656,6 +687,11 @@ struct UserMasterSyncProjection<'a> {
 enum CheckMode {
     Normal,
     RetainedCold(GitOid),
+}
+
+enum MissingLogKind {
+    Removed,
+    Unavailable(String),
 }
 
 pub struct TollgateService {
@@ -4277,6 +4313,7 @@ impl TollgateService {
             _ownership_lock: ownership_lock,
             git,
             store,
+            cache_root: cache,
             mirror,
             builder,
             slots_root,
@@ -9453,6 +9490,270 @@ impl TollgateService {
         Ok(result)
     }
 
+    fn cache_recovery_error(
+        runtime: &RepositoryRuntime,
+        item: &QueueItem,
+        artifact: impl Into<String>,
+        attempted_recovery: impl Into<String>,
+        cause: impl Into<String>,
+    ) -> ServiceError {
+        ServiceError::ExecutionCacheRecovery(Box::new(ExecutionCacheRecoveryError {
+            artifact: artifact.into(),
+            attempted_recovery: attempted_recovery.into(),
+            registered_repository: runtime.git.worktree_root.to_string_lossy().into_owned(),
+            candidate_ref: item.source_ref.clone(),
+            source_oid: item.source_oid.clone(),
+            cause: cause.into(),
+        }))
+    }
+
+    async fn ensure_execution_cache(
+        &self,
+        runtime: &Arc<RepositoryRuntime>,
+        item: &QueueItem,
+        generation: &ValidationGeneration,
+    ) -> Result<(), ServiceError> {
+        let retained_sources = {
+            let data = runtime.data.lock();
+            generation
+                .ordered_item_ids
+                .iter()
+                .zip(&generation.ordered_source_oids)
+                .map(|(item_id, source_oid)| {
+                    let retained = data
+                        .items
+                        .iter()
+                        .find(|candidate| candidate.id == *item_id)
+                        .ok_or_else(|| {
+                            Self::cache_recovery_error(
+                                runtime,
+                                item,
+                                format!("durable queue item {item_id}"),
+                                "load the recorded validation inputs before rebuilding the execution cache",
+                                "the queue item referenced by the validation generation is absent",
+                            )
+                        })?;
+                    Ok((retained.source_ref.clone(), source_oid.clone()))
+                })
+                .collect::<Result<Vec<_>, ServiceError>>()?
+        };
+        for (source_ref, source_oid) in &retained_sources {
+            match runtime.git.optional_ref_oid(source_ref).await {
+                Ok(Some(observed)) if observed == *source_oid => {}
+                Ok(Some(observed)) => {
+                    return Err(Self::cache_recovery_error(
+                        runtime,
+                        item,
+                        source_ref,
+                        "read the durable candidate ref from the registered repository before rebuilding the bare mirror",
+                        format!(
+                            "the ref resolved to {observed}, not the recorded source OID {source_oid}"
+                        ),
+                    ));
+                }
+                Ok(None) => {
+                    return Err(Self::cache_recovery_error(
+                        runtime,
+                        item,
+                        source_ref,
+                        "fetch the durable candidate ref from the registered repository and reconstruct the recorded validation generation",
+                        "the durable candidate ref is missing",
+                    ));
+                }
+                Err(error) => {
+                    return Err(Self::cache_recovery_error(
+                        runtime,
+                        item,
+                        source_ref,
+                        "open the registered repository and fetch the durable candidate ref before rebuilding the bare mirror",
+                        error.to_string(),
+                    ));
+                }
+            }
+        }
+
+        let mirror_metadata = tokio::fs::symlink_metadata(&runtime.mirror).await;
+        let mirror_path_is_safe = matches!(
+            &mirror_metadata,
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink()
+        );
+        let mirror_has_generation = mirror_path_is_safe
+            && runtime
+                .git
+                .mirror_tree_oid(&runtime.mirror, &generation.anchored_base_oid)
+                .await
+                .is_ok()
+            && runtime
+                .git
+                .mirror_tree_oid(&runtime.mirror, &generation.tested_oid)
+                .await
+                .is_ok();
+        let mut mirror_has_sources = mirror_path_is_safe;
+        if mirror_has_sources {
+            for (source_ref, source_oid) in &retained_sources {
+                if runtime
+                    .git
+                    .mirror_resolve_oid(&runtime.mirror, source_ref)
+                    .await
+                    .ok()
+                    .as_ref()
+                    != Some(source_oid)
+                {
+                    mirror_has_sources = false;
+                    break;
+                }
+            }
+        }
+        let builder_ready = match GitRepository::discover(&runtime.builder).await {
+            Ok(builder) => paths_identical(&builder.common_dir, &runtime.mirror).await,
+            Err(_) => false,
+        };
+        let direct_independent_check = item.kind == QueueItemKind::IndependentCheck
+            && generation.ordered_source_oids == [generation.tested_oid.clone()]
+            && generation.prefix_oids == [generation.tested_oid.clone()];
+        if mirror_has_generation
+            && mirror_has_sources
+            && (builder_ready || direct_independent_check)
+        {
+            return Ok(());
+        }
+
+        if !mirror_path_is_safe || !mirror_has_sources {
+            let active_buildset = runtime.data.lock().buildsets.iter().any(|buildset| {
+                matches!(
+                    buildset.state,
+                    BuildsetState::Preparing | BuildsetState::Running
+                )
+            });
+            if active_buildset {
+                return Err(ServiceError::ExecutionCacheRecoveryDeferred(format!(
+                    "another buildset still owns incomplete cache {}; recovery will retry after it settles",
+                    runtime.cache_root.display()
+                )));
+            }
+            if let Ok(metadata) = tokio::fs::symlink_metadata(&runtime.cache_root).await {
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err(Self::cache_recovery_error(
+                        runtime,
+                        item,
+                        runtime.cache_root.to_string_lossy().into_owned(),
+                        "replace the disposable repository cache with a newly initialized cache",
+                        "the repository cache root is not an owned directory",
+                    ));
+                }
+                tokio::fs::remove_dir_all(&runtime.cache_root)
+                    .await
+                    .map_err(|error| {
+                        Self::cache_recovery_error(
+                            runtime,
+                            item,
+                            runtime.cache_root.to_string_lossy().into_owned(),
+                            "remove the incomplete disposable cache before rebuilding it",
+                            error.to_string(),
+                        )
+                    })?;
+            }
+            tokio::fs::create_dir_all(&runtime.slots_root)
+                .await
+                .map_err(|error| {
+                    Self::cache_recovery_error(
+                        runtime,
+                        item,
+                        runtime.slots_root.to_string_lossy().into_owned(),
+                        "recreate the execution slots directory",
+                        error.to_string(),
+                    )
+                })?;
+            runtime.data.lock().slots.clear();
+        }
+
+        runtime
+            .git
+            .initialize_mirror(&runtime.mirror)
+            .await
+            .map_err(|error| {
+                Self::cache_recovery_error(
+                    runtime,
+                    item,
+                    runtime.mirror.to_string_lossy().into_owned(),
+                    "initialize a bare mirror from the registered repository and fetch release plus durable candidate refs",
+                    error.to_string(),
+                )
+            })?;
+        for (source_ref, source_oid) in &retained_sources {
+            let observed = runtime
+                .git
+                .mirror_resolve_oid(&runtime.mirror, source_ref)
+                .await
+                .map_err(|error| {
+                    Self::cache_recovery_error(
+                        runtime,
+                        item,
+                        source_ref,
+                        "fetch the durable candidate ref into the reconstructed bare mirror",
+                        error.to_string(),
+                    )
+                })?;
+            if observed != *source_oid {
+                return Err(Self::cache_recovery_error(
+                    runtime,
+                    item,
+                    source_ref,
+                    "verify the fetched candidate ref against the recorded source OID",
+                    format!("the reconstructed mirror resolved the ref to {observed}"),
+                ));
+            }
+        }
+        if direct_independent_check {
+            return Ok(());
+        }
+        let rebuilt = runtime
+            .git
+            .construct_prefix(
+                &runtime.mirror,
+                &runtime.builder,
+                &generation.anchored_base_oid,
+                &generation.ordered_source_oids,
+            )
+            .await
+            .map_err(|error| {
+                Self::cache_recovery_error(
+                    runtime,
+                    item,
+                    runtime.builder.to_string_lossy().into_owned(),
+                    "recreate the builder checkout and deterministically reconstruct the recorded validation generation",
+                    error.to_string(),
+                )
+            })?;
+        let rebuilt_prefix = rebuilt
+            .iter()
+            .map(|commit| commit.oid.clone())
+            .collect::<Vec<_>>();
+        let rebuilt_sources = rebuilt
+            .iter()
+            .map(|commit| commit.source_oid.clone())
+            .collect::<Vec<_>>();
+        let exact_generation = rebuilt_prefix == generation.prefix_oids
+            && rebuilt_sources == generation.ordered_source_oids
+            && rebuilt.last().is_some_and(|commit| {
+                commit.oid == generation.tested_oid
+                    && commit.parent_oid == generation.expected_parent_oid
+            });
+        if !exact_generation {
+            return Err(Self::cache_recovery_error(
+                runtime,
+                item,
+                format!("validation generation {}", generation.id),
+                "reconstruct the exact recorded source sequence against the exact anchored base",
+                format!(
+                    "reconstruction did not reproduce tested OID {} with parent {}",
+                    generation.tested_oid, generation.expected_parent_oid
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     async fn execute_item(
         self: &Arc<Self>,
         repository_id: RepositoryId,
@@ -9625,6 +9926,8 @@ impl TollgateService {
         };
         let config = self.configuration_for_generation(&runtime, &generation)?;
         let environment = self.environment.read().await.clone();
+        self.ensure_execution_cache(&runtime, &item, &generation)
+            .await?;
         let cold_item = runtime.cold_items.lock().remove(&item.id);
         let cold_source = runtime.cold_sources.lock().remove(&item.source_oid);
         let cold = cold_item || cold_source;
@@ -11042,6 +11345,40 @@ impl TollgateService {
             }
             return;
         }
+        if matches!(error, ServiceError::ExecutionCacheRecoveryDeferred(_))
+            && item.state == QueueItemState::Queued
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            return;
+        }
+        if matches!(error, ServiceError::ExecutionCacheRecovery(_))
+            && item.state == QueueItemState::Queued
+        {
+            if let Ok(next) = item.state.transition(ItemEvent::InfrastructureExhausted) {
+                item.state = next;
+                item.terminal_reason = Some(format!("infrastructure-exhausted:{error}"));
+                let gate_item = item.kind == QueueItemKind::Gate;
+                if let Err(persist_error) = self.replace_item(&runtime, item) {
+                    self.block_background_persistence_failure(
+                        &runtime,
+                        item_id,
+                        &persist_error.to_string(),
+                    );
+                    return;
+                }
+                if gate_item
+                    && let Err(rebuild_error) =
+                        self.rebuild_after_failure(repository_id, item_id).await
+                {
+                    self.block_background_persistence_failure(
+                        &runtime,
+                        item_id,
+                        &rebuild_error.to_string(),
+                    );
+                }
+            }
+            return;
+        }
         if matches!(
             item.state,
             QueueItemState::Preparing | QueueItemState::Running
@@ -12429,6 +12766,92 @@ impl TollgateService {
         Ok(())
     }
 
+    fn resolve_log_selection(
+        runtime: &RepositoryRuntime,
+        item_id: QueueItemId,
+        requested_buildset_id: Option<BuildsetId>,
+        step: Option<String>,
+    ) -> Result<(BuildsetId, String, MissingLogKind), ServiceError> {
+        let data = runtime.data.lock();
+        let item = data
+            .items
+            .iter()
+            .find(|item| item.id == item_id)
+            .ok_or(ServiceError::ItemNotFound(item_id))?;
+        let buildset_id = requested_buildset_id
+            .or(item.buildset_id)
+            .ok_or_else(|| ServiceError::Invariant("item has no buildset yet".into()))?;
+        let buildset = data
+            .buildsets
+            .iter()
+            .find(|candidate| candidate.id == buildset_id && candidate.item_id == item_id)
+            .ok_or_else(|| ServiceError::Invariant("item buildset is missing".into()))?;
+        let step_names = if buildset.frozen_steps.is_empty() {
+            if buildset.step_results.is_empty() {
+                data.config
+                    .steps
+                    .iter()
+                    .map(|step| step.name.as_str())
+                    .collect::<Vec<_>>()
+            } else {
+                buildset
+                    .step_results
+                    .iter()
+                    .map(|step| step.name.as_str())
+                    .collect::<Vec<_>>()
+            }
+        } else {
+            buildset
+                .frozen_steps
+                .iter()
+                .map(|step| step.name.as_str())
+                .collect::<Vec<_>>()
+        };
+        let step_name = match step {
+            Some(name) if step_names.contains(&name.as_str()) => name,
+            Some(name) => {
+                return Err(ServiceError::Invariant(format!("unknown step `{name}`")));
+            }
+            None => step_names
+                .first()
+                .map(|step| (*step).to_owned())
+                .ok_or_else(|| ServiceError::Invariant("configuration has no steps".into()))?,
+        };
+        let missing = match buildset
+            .step_results
+            .iter()
+            .find(|result| result.name == step_name)
+        {
+            Some(result) if result.result_class == "skipped" => {
+                MissingLogKind::Unavailable("the step was skipped and produced no log".into())
+            }
+            Some(_) => MissingLogKind::Removed,
+            None if !buildset.state.is_terminal() => {
+                MissingLogKind::Unavailable("the step has not started".into())
+            }
+            None => MissingLogKind::Unavailable(
+                "disposable execution cache data was removed before the step produced a retained log"
+                    .into(),
+            ),
+        };
+        Ok((buildset_id, step_name, missing))
+    }
+
+    fn missing_log_error(
+        buildset_id: BuildsetId,
+        step: String,
+        missing: MissingLogKind,
+    ) -> ServiceError {
+        match missing {
+            MissingLogKind::Removed => ServiceError::RetainedLogsRemoved { buildset_id, step },
+            MissingLogKind::Unavailable(reason) => ServiceError::StepLogsUnavailable {
+                buildset_id,
+                step,
+                reason,
+            },
+        }
+    }
+
     pub async fn logs(
         &self,
         repository_id: RepositoryId,
@@ -12439,54 +12862,8 @@ impl TollgateService {
         limit: usize,
     ) -> Result<Vec<RenderedLogFrame>, ServiceError> {
         let runtime = self.runtime(repository_id).await?;
-        let (buildset_id, step_name) = {
-            let data = runtime.data.lock();
-            let item = data
-                .items
-                .iter()
-                .find(|item| item.id == item_id)
-                .ok_or(ServiceError::ItemNotFound(item_id))?;
-            let buildset_id = requested_buildset_id
-                .or(item.buildset_id)
-                .ok_or_else(|| ServiceError::Invariant("item has no buildset yet".into()))?;
-            let buildset = data
-                .buildsets
-                .iter()
-                .find(|candidate| candidate.id == buildset_id && candidate.item_id == item_id)
-                .ok_or_else(|| ServiceError::Invariant("item buildset is missing".into()))?;
-            let step_names = if buildset.frozen_steps.is_empty() {
-                if buildset.step_results.is_empty() {
-                    data.config
-                        .steps
-                        .iter()
-                        .map(|step| step.name.as_str())
-                        .collect::<Vec<_>>()
-                } else {
-                    buildset
-                        .step_results
-                        .iter()
-                        .map(|step| step.name.as_str())
-                        .collect::<Vec<_>>()
-                }
-            } else {
-                buildset
-                    .frozen_steps
-                    .iter()
-                    .map(|step| step.name.as_str())
-                    .collect::<Vec<_>>()
-            };
-            let step_name = match step {
-                Some(name) if step_names.contains(&name.as_str()) => name,
-                Some(name) => {
-                    return Err(ServiceError::Invariant(format!("unknown step `{name}`")));
-                }
-                None => step_names
-                    .first()
-                    .map(|step| (*step).to_owned())
-                    .ok_or_else(|| ServiceError::Invariant("configuration has no steps".into()))?,
-            };
-            (buildset_id, step_name)
-        };
+        let (buildset_id, step_name, missing) =
+            Self::resolve_log_selection(&runtime, item_id, requested_buildset_id, step)?;
         let path = runtime
             .logs_root
             .join(buildset_id.to_string())
@@ -12501,6 +12878,18 @@ impl TollgateService {
                 "log range for buildset {buildset_id} step `{step_name}` was pruned by retention policy"
             )));
         }
+        match tokio::fs::symlink_metadata(&path).await {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(Self::missing_log_error(buildset_id, step_name, missing));
+            }
+            Ok(_) => {
+                return Err(ServiceError::Invariant(
+                    "retained log path is not an owned regular file".into(),
+                ));
+            }
+            Err(error) => return Err(error.into()),
+        }
         Ok(read_durable_log(path, start_sequence, limit.min(10_000)).await?)
     }
 
@@ -12512,54 +12901,8 @@ impl TollgateService {
         step: Option<String>,
     ) -> Result<PathBuf, ServiceError> {
         let runtime = self.runtime(repository_id).await?;
-        let (buildset_id, step_name) = {
-            let data = runtime.data.lock();
-            let item = data
-                .items
-                .iter()
-                .find(|item| item.id == item_id)
-                .ok_or(ServiceError::ItemNotFound(item_id))?;
-            let buildset_id = requested_buildset_id
-                .or(item.buildset_id)
-                .ok_or_else(|| ServiceError::Invariant("item has no buildset yet".into()))?;
-            let buildset = data
-                .buildsets
-                .iter()
-                .find(|candidate| candidate.id == buildset_id && candidate.item_id == item_id)
-                .ok_or_else(|| ServiceError::Invariant("item buildset is missing".into()))?;
-            let step_names = if buildset.frozen_steps.is_empty() {
-                if buildset.step_results.is_empty() {
-                    data.config
-                        .steps
-                        .iter()
-                        .map(|step| step.name.as_str())
-                        .collect::<Vec<_>>()
-                } else {
-                    buildset
-                        .step_results
-                        .iter()
-                        .map(|step| step.name.as_str())
-                        .collect::<Vec<_>>()
-                }
-            } else {
-                buildset
-                    .frozen_steps
-                    .iter()
-                    .map(|step| step.name.as_str())
-                    .collect::<Vec<_>>()
-            };
-            let step_name = match step {
-                Some(name) if step_names.contains(&name.as_str()) => name,
-                Some(name) => {
-                    return Err(ServiceError::Invariant(format!("unknown step `{name}`")));
-                }
-                None => step_names
-                    .first()
-                    .map(|step| (*step).to_owned())
-                    .ok_or_else(|| ServiceError::Invariant("configuration has no steps".into()))?,
-            };
-            (buildset_id, step_name)
-        };
+        let (buildset_id, step_name, missing) =
+            Self::resolve_log_selection(&runtime, item_id, requested_buildset_id, step)?;
         if runtime
             .store
             .step_log_state(buildset_id, &step_name)?
@@ -12572,6 +12915,18 @@ impl TollgateService {
         }
         let buildset_root = runtime.logs_root.join(buildset_id.to_string());
         let path = buildset_root.join(format!("{step_name}.tlog"));
+        match tokio::fs::symlink_metadata(&path).await {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(Self::missing_log_error(buildset_id, step_name, missing));
+            }
+            Ok(_) => {
+                return Err(ServiceError::Invariant(
+                    "retained log path is not an owned regular file".into(),
+                ));
+            }
+            Err(error) => return Err(error.into()),
+        }
         let canonical_root = tokio::fs::canonicalize(&buildset_root).await?;
         let canonical_path = tokio::fs::canonicalize(&path).await?;
         if canonical_path.parent() != Some(canonical_root.as_path())
@@ -13410,6 +13765,7 @@ fn compatible_seed(data: &RuntimeData) -> Result<Option<SeedRecord>, ServiceErro
         .iter()
         .filter(|seed| {
             seed.state == "published"
+                && Path::new(&seed.path).is_dir()
                 && seed.repository_id == data.state.id
                 && seed
                     .manifest
@@ -20805,5 +21161,699 @@ run = "true"
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         assert_eq!(git(&repository, &["rev-parse", INTEGRATION_REF]), base);
+    }
+
+    #[tokio::test]
+    async fn authorized_candidate_recovers_and_promotes_after_full_cache_deletion_and_restart() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        let candidate_worktree = temporary.path().join("candidate");
+        let support = temporary.path().join("support");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("base.txt"), "base\n").unwrap();
+        git(&repository, &["add", "base.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+        let base = git(&repository, &["rev-parse", "HEAD"]);
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "candidate",
+                candidate_worktree.to_str().unwrap(),
+                USER_BRANCH,
+            ],
+        );
+        std::fs::write(candidate_worktree.join("feature.txt"), "feature\n").unwrap();
+        git(&candidate_worktree, &["add", "feature.txt"]);
+        git(&candidate_worktree, &["commit", "-m", "candidate"]);
+        let source = git(&candidate_worktree, &["rev-parse", "HEAD"]);
+        let command = format!(
+            "sleep 0.3; test \"$(git rev-parse HEAD)\" = {source}; test \"$(git show -s --format=%P HEAD)\" = {base}; test -f feature.txt"
+        );
+
+        let service = TollgateService::open(support.clone()).await.unwrap();
+        let initialized = service
+            .initialize_repository_with_options(&repository, Some(command), false)
+            .await
+            .unwrap();
+        service.shutting_down.store(true, Ordering::Release);
+        let submitted = service
+            .submit_candidate_from(
+                initialized.state.id,
+                "HEAD".into(),
+                Some(candidate_worktree.to_string_lossy().into_owned()),
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        let revision = service
+            .repository_snapshot(initialized.state.id)
+            .await
+            .unwrap()
+            .state
+            .queue_revision;
+        let authorization = service
+            .authorize_candidate(
+                initialized.state.id,
+                submitted.item_id,
+                revision,
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authorization.item_id, submitted.item_id);
+        let before_restart = service
+            .item_details(initialized.state.id, submitted.item_id)
+            .await
+            .unwrap();
+        assert_eq!(before_restart.item.state, QueueItemState::Queued);
+        assert!(before_restart.item.promotion_authorized);
+        assert!(before_restart.attempts.is_empty());
+        let runtime = service.runtime(initialized.state.id).await.unwrap();
+        let cache_root = runtime.cache_root.clone();
+        let candidate_ref = before_restart.item.source_ref.clone();
+        assert_eq!(
+            runtime.git.optional_ref_oid(&candidate_ref).await.unwrap(),
+            Some(before_restart.item.source_oid.clone())
+        );
+        drop(runtime);
+        service.shutdown().await.unwrap();
+        drop(service);
+        std::fs::remove_dir_all(&cache_root).unwrap();
+
+        let reopened = TollgateService::open(support).await.unwrap();
+        let revision = reopened
+            .repository_snapshot(initialized.state.id)
+            .await
+            .unwrap()
+            .state
+            .queue_revision;
+        let repeated_approval = reopened
+            .authorize_candidate(
+                initialized.state.id,
+                submitted.item_id,
+                revision,
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        assert!(repeated_approval.already_authorized);
+        assert_eq!(repeated_approval.item_id, submitted.item_id);
+        assert_eq!(repeated_approval.source_oid.to_hex(), source);
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let promoted = loop {
+            let details = reopened
+                .item_details(initialized.state.id, submitted.item_id)
+                .await
+                .unwrap();
+            if details.item.state == QueueItemState::Promoted {
+                break details;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "cache-recovered candidate stalled at {:?}: {:?}",
+                details.item.state,
+                details.item.terminal_reason
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        };
+        assert_eq!(promoted.item.id, submitted.item_id);
+        assert!(promoted.item.promotion_authorized);
+        assert_eq!(promoted.attempts.len(), 1);
+        let attempt = &promoted.attempts[0];
+        assert_eq!(attempt.attempt, 1);
+        assert!(attempt.started_at.is_some());
+        assert_eq!(attempt.tested_oid.to_hex(), source);
+        assert_eq!(attempt.expected_parent_oid.to_hex(), base);
+        let generation = promoted.generation.unwrap();
+        assert_eq!(generation.anchored_base_oid.to_hex(), base);
+        assert_eq!(generation.tested_oid.to_hex(), source);
+        assert_eq!(generation.expected_parent_oid.to_hex(), base);
+        let runtime = reopened.runtime(initialized.state.id).await.unwrap();
+        assert!(runtime.mirror.is_dir());
+        assert!(runtime.builder.is_dir());
+        assert!(
+            runtime
+                .data
+                .lock()
+                .slots
+                .values()
+                .any(|slot| slot.path.is_dir())
+        );
+        assert_eq!(git(&repository, &["rev-parse", INTEGRATION_REF]), source);
+    }
+
+    #[tokio::test]
+    async fn concurrent_prefixes_recover_from_one_reconstructed_mirror() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        let first_worktree = temporary.path().join("first");
+        let second_worktree = temporary.path().join("second");
+        let support = temporary.path().join("support");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("base.txt"), "base\n").unwrap();
+        git(&repository, &["add", "base.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+        let base = git(&repository, &["rev-parse", "HEAD"]);
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "first",
+                first_worktree.to_str().unwrap(),
+                USER_BRANCH,
+            ],
+        );
+        std::fs::write(first_worktree.join("first.txt"), "first\n").unwrap();
+        git(&first_worktree, &["add", "first.txt"]);
+        git(&first_worktree, &["commit", "-m", "first"]);
+        let first_source = git(&first_worktree, &["rev-parse", "HEAD"]);
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "second",
+                second_worktree.to_str().unwrap(),
+                USER_BRANCH,
+            ],
+        );
+        std::fs::write(second_worktree.join("second.txt"), "second\n").unwrap();
+        git(&second_worktree, &["add", "second.txt"]);
+        git(&second_worktree, &["commit", "-m", "second"]);
+        let second_source = git(&second_worktree, &["rev-parse", "HEAD"]);
+
+        let service = TollgateService::open(support.clone()).await.unwrap();
+        let initialized = service
+            .initialize_repository_with_options(
+                &repository,
+                Some("sleep 0.5; test -f base.txt".into()),
+                false,
+            )
+            .await
+            .unwrap();
+        service.shutting_down.store(true, Ordering::Release);
+        let first = service
+            .submit_candidate_from(
+                initialized.state.id,
+                "HEAD".into(),
+                Some(first_worktree.to_string_lossy().into_owned()),
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        let second = service
+            .submit_candidate_from(
+                initialized.state.id,
+                "HEAD".into(),
+                Some(second_worktree.to_string_lossy().into_owned()),
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        let second_generation = service
+            .item_details(initialized.state.id, second.item_id)
+            .await
+            .unwrap()
+            .generation
+            .unwrap();
+        assert_eq!(second_generation.anchored_base_oid.to_hex(), base);
+        assert_eq!(
+            second_generation
+                .ordered_source_oids
+                .iter()
+                .map(GitOid::to_hex)
+                .collect::<Vec<_>>(),
+            [first_source, second_source]
+        );
+        let runtime = service.runtime(initialized.state.id).await.unwrap();
+        let cache_root = runtime.cache_root.clone();
+        drop(runtime);
+        service.shutdown().await.unwrap();
+        drop(service);
+        std::fs::remove_dir_all(cache_root).unwrap();
+
+        let reopened = TollgateService::open(support).await.unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let first_details = reopened
+                .item_details(initialized.state.id, first.item_id)
+                .await
+                .unwrap();
+            let second_details = reopened
+                .item_details(initialized.state.id, second.item_id)
+                .await
+                .unwrap();
+            if first_details.item.state == QueueItemState::Ready
+                && second_details.item.state == QueueItemState::Ready
+            {
+                assert_eq!(first_details.attempts.len(), 1);
+                assert_eq!(second_details.attempts.len(), 1);
+                assert!(first_details.attempts[0].started_at.is_some());
+                assert!(second_details.attempts[0].started_at.is_some());
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "concurrent cache recovery stalled at {:?} / {:?}: {:?} / {:?}",
+                first_details.item.state,
+                second_details.item.state,
+                first_details.item.terminal_reason,
+                second_details.item.terminal_reason
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn incomplete_cache_waits_for_an_active_owner_without_spending_an_attempt() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        let candidate_worktree = temporary.path().join("candidate");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("base.txt"), "base\n").unwrap();
+        git(&repository, &["add", "base.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "candidate",
+                candidate_worktree.to_str().unwrap(),
+                USER_BRANCH,
+            ],
+        );
+        std::fs::write(candidate_worktree.join("feature.txt"), "feature\n").unwrap();
+        git(&candidate_worktree, &["add", "feature.txt"]);
+        git(&candidate_worktree, &["commit", "-m", "candidate"]);
+        let service = TollgateService::open(temporary.path().join("support"))
+            .await
+            .unwrap();
+        let initialized = service
+            .initialize_repository_with_options(&repository, Some("true".into()), false)
+            .await
+            .unwrap();
+        service.shutting_down.store(true, Ordering::Release);
+        let submitted = service
+            .submit_candidate_from(
+                initialized.state.id,
+                "HEAD".into(),
+                Some(candidate_worktree.to_string_lossy().into_owned()),
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        let details = service
+            .item_details(initialized.state.id, submitted.item_id)
+            .await
+            .unwrap();
+        let generation = details.generation.unwrap();
+        let runtime = service.runtime(initialized.state.id).await.unwrap();
+        runtime.data.lock().buildsets.push(Buildset {
+            id: BuildsetId::new(),
+            item_id: QueueItemId::new(),
+            validation_generation_id: generation.id,
+            tested_oid: generation.tested_oid.clone(),
+            expected_parent_oid: generation.expected_parent_oid.clone(),
+            environment_fingerprint: "active-cache-owner".into(),
+            slot_id: None,
+            state: BuildsetState::Running,
+            retry_of: None,
+            attempt: 1,
+            created_at: OffsetDateTime::now_utc(),
+            started_at: Some(OffsetDateTime::now_utc()),
+            finished_at: None,
+            frozen_steps: Vec::new(),
+            step_results: Vec::new(),
+        });
+        std::fs::remove_dir_all(&runtime.cache_root).unwrap();
+        let error = service
+            .ensure_execution_cache(&runtime, &details.item, &generation)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ServiceError::ExecutionCacheRecoveryDeferred(_)
+        ));
+        service
+            .handle_background_error(initialized.state.id, submitted.item_id, error)
+            .await;
+        let unchanged = service
+            .item_details(initialized.state.id, submitted.item_id)
+            .await
+            .unwrap();
+        assert_eq!(unchanged.item.state, QueueItemState::Queued);
+        assert!(unchanged.attempts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn missing_builder_and_slot_are_recreated_before_the_first_attempt() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        let candidate_worktree = temporary.path().join("candidate");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("base.txt"), "base\n").unwrap();
+        git(&repository, &["add", "base.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "candidate",
+                candidate_worktree.to_str().unwrap(),
+                USER_BRANCH,
+            ],
+        );
+        std::fs::write(candidate_worktree.join("feature.txt"), "feature\n").unwrap();
+        git(&candidate_worktree, &["add", "feature.txt"]);
+        git(&candidate_worktree, &["commit", "-m", "candidate"]);
+        let service = TollgateService::open(temporary.path().join("support"))
+            .await
+            .unwrap();
+        let initialized = service
+            .initialize_repository_with_options(
+                &repository,
+                Some("test -f feature.txt".into()),
+                false,
+            )
+            .await
+            .unwrap();
+        service.shutting_down.store(true, Ordering::Release);
+        let submitted = service
+            .submit_candidate_from(
+                initialized.state.id,
+                "HEAD".into(),
+                Some(candidate_worktree.to_string_lossy().into_owned()),
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        let revision = service
+            .repository_snapshot(initialized.state.id)
+            .await
+            .unwrap()
+            .state
+            .queue_revision;
+        service
+            .authorize_candidate(
+                initialized.state.id,
+                submitted.item_id,
+                revision,
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        let runtime = service.runtime(initialized.state.id).await.unwrap();
+        assert!(runtime.mirror.is_dir());
+        let generation = service
+            .item_details(initialized.state.id, submitted.item_id)
+            .await
+            .unwrap()
+            .generation
+            .unwrap();
+        std::fs::remove_dir_all(&runtime.builder).unwrap();
+        let slot_id = SlotId::new();
+        let missing_slot = runtime.slots_root.join(slot_id.to_string());
+        runtime
+            .git
+            .provision_slot(&runtime.mirror, &missing_slot, &generation.tested_oid)
+            .await
+            .unwrap();
+        std::fs::remove_dir_all(&missing_slot).unwrap();
+        runtime.data.lock().slots.insert(
+            slot_id,
+            SlotView {
+                id: slot_id,
+                path: missing_slot.clone(),
+                state: "idle".into(),
+                checkout_oid: Some(generation.tested_oid.clone()),
+                health: "healthy".into(),
+                last_used: None,
+            },
+        );
+        drop(runtime);
+        service.shutting_down.store(false, Ordering::Release);
+        let runtime = service.runtime(initialized.state.id).await.unwrap();
+        service.spawn_eligible(initialized.state.id, &runtime);
+        drop(runtime);
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let promoted = loop {
+            let details = service
+                .item_details(initialized.state.id, submitted.item_id)
+                .await
+                .unwrap();
+            if details.item.state == QueueItemState::Promoted {
+                break details;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        };
+        assert_eq!(promoted.attempts.len(), 1);
+        assert!(promoted.attempts[0].started_at.is_some());
+        assert!(missing_slot.is_dir());
+        let runtime = service.runtime(initialized.state.id).await.unwrap();
+        assert!(runtime.builder.is_dir());
+        let slot_repository = GitRepository::discover(&missing_slot).await.unwrap();
+        assert_eq!(
+            slot_repository.resolve_oid("HEAD").await.unwrap(),
+            promoted.generation.unwrap().tested_oid
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_durable_candidate_ref_is_terminal_without_spending_attempts() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        let candidate_worktree = temporary.path().join("candidate");
+        let support = temporary.path().join("support");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("base.txt"), "base\n").unwrap();
+        git(&repository, &["add", "base.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "candidate",
+                candidate_worktree.to_str().unwrap(),
+                USER_BRANCH,
+            ],
+        );
+        std::fs::write(candidate_worktree.join("feature.txt"), "feature\n").unwrap();
+        git(&candidate_worktree, &["add", "feature.txt"]);
+        git(&candidate_worktree, &["commit", "-m", "candidate"]);
+        let source = git(&candidate_worktree, &["rev-parse", "HEAD"]);
+        let service = TollgateService::open(support.clone()).await.unwrap();
+        let initialized = service
+            .initialize_repository_with_options(&repository, Some("true".into()), false)
+            .await
+            .unwrap();
+        service.shutting_down.store(true, Ordering::Release);
+        let submitted = service
+            .submit_candidate_from(
+                initialized.state.id,
+                "HEAD".into(),
+                Some(candidate_worktree.to_string_lossy().into_owned()),
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        let revision = service
+            .repository_snapshot(initialized.state.id)
+            .await
+            .unwrap()
+            .state
+            .queue_revision;
+        service
+            .authorize_candidate(
+                initialized.state.id,
+                submitted.item_id,
+                revision,
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        let details = service
+            .item_details(initialized.state.id, submitted.item_id)
+            .await
+            .unwrap();
+        let source_ref = details.item.source_ref.clone();
+        let runtime = service.runtime(initialized.state.id).await.unwrap();
+        let cache_root = runtime.cache_root.clone();
+        drop(runtime);
+        service.shutdown().await.unwrap();
+        drop(service);
+        git(&repository, &["update-ref", "-d", &source_ref]);
+        std::fs::remove_dir_all(&cache_root).unwrap();
+        let service = TollgateService::open(support).await.unwrap();
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let failed = loop {
+            let details = service
+                .item_details(initialized.state.id, submitted.item_id)
+                .await
+                .unwrap();
+            if details.item.state == QueueItemState::InfrastructureExhausted {
+                break details;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        };
+        assert!(failed.attempts.is_empty());
+        let diagnostic = failed.item.terminal_reason.unwrap();
+        assert!(diagnostic.contains("missing artifact"));
+        assert!(diagnostic.contains("attempted"));
+        assert!(diagnostic.contains(repository.to_string_lossy().as_ref()));
+        assert!(diagnostic.contains(&source_ref));
+        assert!(diagnostic.contains(&source));
+    }
+
+    #[tokio::test]
+    async fn logs_report_when_retained_execution_data_was_removed() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("base.txt"), "base\n").unwrap();
+        git(&repository, &["add", "base.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+        let service = TollgateService::open(temporary.path().join("support"))
+            .await
+            .unwrap();
+        let initialized = service
+            .initialize_repository_with_options(&repository, Some("true".into()), false)
+            .await
+            .unwrap();
+        let check = service
+            .check_from(
+                initialized.state.id,
+                "HEAD".into(),
+                Some(repository.to_string_lossy().into_owned()),
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let buildset_id = loop {
+            let details = service
+                .item_details(initialized.state.id, check.item_id)
+                .await
+                .unwrap();
+            if details.item.state == QueueItemState::CheckPassed {
+                break details.buildset.unwrap().id;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "log fixture stalled at {:?}: {:?}",
+                details.item.state,
+                details.item.terminal_reason
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        };
+        let runtime = service.runtime(initialized.state.id).await.unwrap();
+        std::fs::remove_dir_all(runtime.logs_root.join(buildset_id.to_string())).unwrap();
+        drop(runtime);
+        let error = service
+            .logs(
+                initialized.state.id,
+                check.item_id,
+                Some(buildset_id),
+                Some("ci".into()),
+                0,
+                100,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ServiceError::RetainedLogsRemoved {
+                buildset_id: observed,
+                ref step,
+            } if observed == buildset_id && step == "ci"
+        ));
+        assert!(error.to_string().contains("removed with disposable cache"));
+    }
+
+    #[tokio::test]
+    async fn logs_distinguish_a_skipped_step_from_removed_retained_data() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("base.txt"), "base\n").unwrap();
+        std::fs::create_dir(repository.join(".tollgate")).unwrap();
+        std::fs::write(
+            repository.join(".tollgate/config.toml"),
+            "version = 1\n\n[[step]]\nname = \"failure\"\nrun = \"false\"\n\n[[step]]\nname = \"never-started\"\nrun = \"true\"\nneeds = [\"failure\"]\n",
+        )
+        .unwrap();
+        git(&repository, &["add", "base.txt", ".tollgate/config.toml"]);
+        git(&repository, &["commit", "-m", "base"]);
+        let service = TollgateService::open(temporary.path().join("support"))
+            .await
+            .unwrap();
+        let initialized = service
+            .initialize_repository_with_options(&repository, None, false)
+            .await
+            .unwrap();
+        let check = service
+            .check_from(
+                initialized.state.id,
+                "HEAD".into(),
+                Some(repository.to_string_lossy().into_owned()),
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let buildset_id = loop {
+            let details = service
+                .item_details(initialized.state.id, check.item_id)
+                .await
+                .unwrap();
+            if details.item.state == QueueItemState::CheckFailed {
+                break details.buildset.unwrap().id;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        };
+        let error = service
+            .logs(
+                initialized.state.id,
+                check.item_id,
+                Some(buildset_id),
+                Some("never-started".into()),
+                0,
+                100,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ServiceError::StepLogsUnavailable {
+                buildset_id: observed,
+                ref step,
+                ref reason,
+            } if observed == buildset_id && step == "never-started" && reason.contains("skipped")
+        ));
+        assert!(!error.to_string().contains("were removed"));
     }
 }

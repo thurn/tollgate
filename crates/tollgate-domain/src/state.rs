@@ -81,7 +81,9 @@ impl QueueItemState {
             (S::Queued, E::PreparationStarted) => S::Preparing,
             (S::Preparing, E::WorkerStarted) => S::Running,
             (S::Preparing | S::Running, E::InfrastructureRetry) => S::Queued,
-            (S::Preparing | S::Running, E::InfrastructureExhausted) => S::InfrastructureExhausted,
+            (S::Queued | S::Preparing | S::Running, E::InfrastructureExhausted) => {
+                S::InfrastructureExhausted
+            }
             (S::Running, E::BuildPassed) => S::Ready,
             (S::Running, E::VotingFailed) => S::Failed,
             (S::Running, E::IndependentCheckPassed) => S::CheckPassed,

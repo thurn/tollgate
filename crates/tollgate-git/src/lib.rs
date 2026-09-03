@@ -253,6 +253,20 @@ impl GitRepository {
         GitOid::from_hex(text(output)?.trim()).map_err(Into::into)
     }
 
+    pub async fn mirror_resolve_oid(
+        &self,
+        mirror: &Path,
+        revision: &str,
+    ) -> Result<GitOid, GitError> {
+        let output = run_raw(
+            &self.profile.executable,
+            mirror,
+            ["rev-parse", "--verify", &format!("{revision}^{{commit}}")],
+        )
+        .await?;
+        GitOid::from_hex(text(output)?.trim()).map_err(Into::into)
+    }
+
     pub async fn resolve_oid(&self, revision: &str) -> Result<GitOid, GitError> {
         let output = self
             .git(["rev-parse", "--verify", &format!("{revision}^{{commit}}")])
@@ -1027,18 +1041,25 @@ impl GitRepository {
         base: &GitOid,
         sources: &[GitOid],
     ) -> Result<Vec<SyntheticCommit>, GitError> {
-        if builder.exists() {
-            let _ = run_raw(
-                &self.profile.executable,
-                mirror,
-                [
-                    "worktree",
-                    "remove",
-                    "--force",
-                    builder.to_string_lossy().as_ref(),
-                ],
-            )
-            .await;
+        let _ = run_raw(
+            &self.profile.executable,
+            mirror,
+            [
+                "worktree",
+                "remove",
+                "--force",
+                "--force",
+                builder.to_string_lossy().as_ref(),
+            ],
+        )
+        .await;
+        if let Ok(metadata) = fs::symlink_metadata(builder).await {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(GitError::InvalidOutput(
+                    "builder cache path is not a disposable directory".into(),
+                ));
+            }
+            fs::remove_dir_all(builder).await?;
         }
         run_raw(
             &self.profile.executable,
@@ -1272,17 +1293,26 @@ impl GitRepository {
                 run_raw(&self.profile.executable, slot, ["clean", "-d", "-f"]).await?;
                 return Ok(());
             }
-            let _ = run_raw(
-                &self.profile.executable,
-                mirror,
-                [
-                    "worktree",
-                    "remove",
-                    "--force",
-                    slot.to_string_lossy().as_ref(),
-                ],
-            )
-            .await;
+        }
+        let _ = run_raw(
+            &self.profile.executable,
+            mirror,
+            [
+                "worktree",
+                "remove",
+                "--force",
+                "--force",
+                slot.to_string_lossy().as_ref(),
+            ],
+        )
+        .await;
+        if let Ok(metadata) = fs::symlink_metadata(slot).await {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(GitError::InvalidOutput(
+                    "slot cache path is not a disposable directory".into(),
+                ));
+            }
+            fs::remove_dir_all(slot).await?;
         }
         if let Some(parent) = slot.parent() {
             fs::create_dir_all(parent).await?;
