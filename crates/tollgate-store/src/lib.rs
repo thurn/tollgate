@@ -871,11 +871,31 @@ impl RepositoryStore {
     }
 
     pub fn retained_artifacts(&self) -> Result<Vec<ArtifactRecord>, StoreError> {
+        self.retained_artifacts_page(0, usize::MAX)
+    }
+
+    pub fn retained_artifact_count(&self) -> Result<usize, StoreError> {
+        let count: i64 = self.connection.lock().query_row(
+            "SELECT COUNT(*) FROM artifacts WHERE retention_state IN ('retained','pinned')",
+            [],
+            |row| row.get(0),
+        )?;
+        usize::try_from(count)
+            .map_err(|_| StoreError::Integrity("retained artifact count is negative".into()))
+    }
+
+    pub fn retained_artifacts_page(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<ArtifactRecord>, StoreError> {
         let connection = self.connection.lock();
         let mut statement = connection.prepare(
-            "SELECT artifact_id, buildset_id, source_path, retained_path, hash, size, retention_state, created_at, expires_at FROM artifacts WHERE retention_state IN ('retained','pinned') ORDER BY retained_path",
+            "SELECT artifact_id, buildset_id, source_path, retained_path, hash, size, retention_state, created_at, expires_at FROM artifacts WHERE retention_state IN ('retained','pinned') ORDER BY retained_path LIMIT ?1 OFFSET ?2",
         )?;
-        let rows = statement.query_map([], |row| {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let offset = i64::try_from(offset).unwrap_or(i64::MAX);
+        let rows = statement.query_map(params![limit, offset], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -1151,11 +1171,41 @@ impl RepositoryStore {
     pub fn seed_records(&self, repository_id: RepositoryId) -> Result<Vec<SeedRecord>, StoreError> {
         let connection = self.connection.lock();
         let mut statement = connection.prepare(
-            "SELECT manifest_json FROM seed_generations WHERE repository_id=?1 ORDER BY generation DESC",
+            "SELECT seed_id, repository_id, profile, generation, ownership_path, logical_size, state, manifest_json FROM seed_generations WHERE repository_id=?1 ORDER BY generation DESC",
         )?;
-        let rows =
-            statement.query_map([repository_id.to_string()], |row| row.get::<_, String>(0))?;
-        rows.map(|row| decode(&row?)).collect()
+        let rows = statement.query_map([repository_id.to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (id, repository_id, profile, generation, path, logical_size, state, encoded) = row?;
+            if state == "published" {
+                return decode(&encoded);
+            }
+            Ok(SeedRecord {
+                id,
+                repository_id: repository_id.parse().map_err(|error| {
+                    StoreError::Integrity(format!("invalid seed repository ID: {error}"))
+                })?,
+                profile,
+                generation: u64::try_from(generation)
+                    .map_err(|_| StoreError::Integrity("seed generation is negative".into()))?,
+                path,
+                logical_size: u64::try_from(logical_size)
+                    .map_err(|_| StoreError::Integrity("seed logical size is negative".into()))?,
+                state,
+                manifest: serde_json::Value::Null,
+            })
+        })
+        .collect()
     }
 
     pub fn mark_seed_pruned(&self, seed_id: &str) -> Result<(), StoreError> {
@@ -1535,6 +1585,46 @@ impl RepositoryStore {
         )?;
         let rows = statement.query_map([kind], |row| row.get::<_, String>(0))?;
         rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+    }
+
+    pub fn unsettled_completed_operation_evidence(
+        &self,
+        kind: &str,
+    ) -> Result<Vec<(CommandId, serde_json::Value)>, StoreError> {
+        let connection = self.connection.lock();
+        let mut statement = connection.prepare(
+            "SELECT command_id, expected_json FROM operation_intents WHERE kind=?1 AND state='completed' AND COALESCE(json_extract(observed_json, '$.cleanup'), '') <> 'complete' ORDER BY created_at",
+        )?;
+        let rows = statement.query_map([kind], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.map(|row| {
+            let (command_id, evidence) = row?;
+            Ok((
+                command_id.parse().map_err(|error| {
+                    StoreError::Integrity(format!("invalid operation command ID: {error}"))
+                })?,
+                serde_json::from_str(&evidence)?,
+            ))
+        })
+        .collect()
+    }
+
+    pub fn mark_completed_operation_cleanup(
+        &self,
+        command_id: CommandId,
+        kind: &str,
+    ) -> Result<(), StoreError> {
+        let changed = self.connection.lock().execute(
+            "UPDATE operation_intents SET observed_json=json_set(COALESCE(observed_json, '{}'), '$.cleanup', 'complete'), updated_at=?3 WHERE command_id=?1 AND kind=?2 AND state='completed'",
+            params![command_id.to_string(), kind, now()],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::Integrity(format!(
+                "completed {kind} cleanup did not match exactly one operation"
+            )));
+        }
+        Ok(())
     }
 
     pub fn completed_operation_records(

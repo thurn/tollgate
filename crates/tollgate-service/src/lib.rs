@@ -220,6 +220,32 @@ pub struct RepositorySnapshot {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ArtifactPage {
+    pub items: Vec<ArtifactRecord>,
+    pub total: usize,
+    pub offset: usize,
+}
+
+const SNAPSHOT_HISTORY_PAYLOAD_BUDGET: usize = 512 * 1024;
+
+fn compact_snapshot_history(mut events: Vec<DomainEvent>) -> Vec<DomainEvent> {
+    let mut remaining = SNAPSHOT_HISTORY_PAYLOAD_BUDGET;
+    for event in events.iter_mut().rev() {
+        let payload_bytes =
+            serde_json::to_vec(&event.payload).map_or(remaining + 1, |value| value.len());
+        if payload_bytes <= remaining {
+            remaining -= payload_bytes;
+        } else {
+            event.payload = serde_json::json!({
+                "snapshot_truncated": true,
+                "original_payload_bytes": payload_bytes,
+            });
+        }
+    }
+    events
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct QueueItemView {
     pub item: QueueItem,
     pub generation: Option<ValidationGeneration>,
@@ -3364,7 +3390,10 @@ impl TollgateService {
                 remove_owned_quarantine(&cache_root, &slot.quarantine)?;
             }
         }
-        for evidence in runtime.store.completed_operation_evidence("cache-purge")? {
+        for (command_id, evidence) in runtime
+            .store
+            .unsettled_completed_operation_evidence("cache-purge")?
+        {
             let evidence: CachePurgeEvidence = serde_json::from_value(evidence)?;
             let cache_root = std::fs::canonicalize(
                 runtime
@@ -3389,6 +3418,9 @@ impl TollgateService {
                     remove_owned_quarantine(&cache_root, &slot.quarantine)?;
                 }
             }
+            runtime
+                .store
+                .mark_completed_operation_cleanup(command_id, "cache-purge")?;
         }
         Ok(())
     }
@@ -4727,6 +4759,7 @@ impl TollgateService {
         let history = runtime
             .store
             .events_after(data.state.event_sequence.saturating_sub(500), 500)?;
+        let history = compact_snapshot_history(history);
         let queue = data
             .items
             .iter()
@@ -4830,7 +4863,25 @@ impl TollgateService {
                     state: seed.state.clone(),
                 })
                 .collect(),
-            artifacts: runtime.store.retained_artifacts()?,
+            // Artifact inventories are independently paged. Keeping the full
+            // inventory in every routine snapshot made IPC response size grow
+            // without bound as repositories retained more build outputs.
+            artifacts: Vec::new(),
+        })
+    }
+
+    pub async fn artifacts_page(
+        &self,
+        repository_id: RepositoryId,
+        offset: usize,
+        limit: usize,
+    ) -> Result<ArtifactPage, ServiceError> {
+        let runtime = self.runtime(repository_id).await?;
+        let limit = limit.clamp(1, 500);
+        Ok(ArtifactPage {
+            items: runtime.store.retained_artifacts_page(offset, limit)?,
+            total: runtime.store.retained_artifact_count()?,
+            offset,
         })
     }
 
@@ -9487,6 +9538,9 @@ impl TollgateService {
             remove_owned_quarantine(&cache_root, &slot.quarantine)?;
         }
         sync_directory(&quarantine_root)?;
+        runtime
+            .store
+            .mark_completed_operation_cleanup(command_id, "cache-purge")?;
         Ok(result)
     }
 
@@ -16219,6 +16273,14 @@ mod tests {
             snapshot.state.execution_state,
             RepositoryExecutionState::Active
         );
+        let runtime = reopened.runtime(initialized.state.id).await.unwrap();
+        assert!(
+            runtime
+                .store
+                .unsettled_completed_operation_evidence("cache-purge")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -16661,10 +16723,10 @@ policy = "clone"
             "retained"
         );
         let retained = service
-            .repository_snapshot(initialized.state.id)
+            .artifacts_page(initialized.state.id, 0, 100)
             .await
             .unwrap()
-            .artifacts;
+            .items;
         assert_eq!(retained.len(), 1);
         assert_eq!(retained[0].source_path, "result.txt");
         assert_eq!(retained[0].size, 8);
@@ -16684,10 +16746,10 @@ policy = "clone"
             .unwrap();
         assert_eq!(
             service
-                .repository_snapshot(initialized.state.id)
+                .artifacts_page(initialized.state.id, 0, 100)
                 .await
                 .unwrap()
-                .artifacts[0]
+                .items[0]
                 .retention_state,
             "pinned"
         );
@@ -16706,10 +16768,10 @@ policy = "clone"
             .unwrap();
         assert!(
             service
-                .repository_snapshot(initialized.state.id)
+                .artifacts_page(initialized.state.id, 0, 100)
                 .await
                 .unwrap()
-                .artifacts
+                .items
                 .is_empty()
         );
         let seeds = service
@@ -17773,10 +17835,10 @@ run = "test -f feature.txt"
         assert!(repository.join("broken").exists());
         assert!(
             service
-                .repository_snapshot(initialized.state.id)
+                .artifacts_page(initialized.state.id, 0, 100)
                 .await
                 .unwrap()
-                .artifacts
+                .items
                 .iter()
                 .any(|artifact| artifact.retained_path == repair.path)
         );
@@ -21855,5 +21917,32 @@ run = "true"
             } if observed == buildset_id && step == "never-started" && reason.contains("skipped")
         ));
         assert!(!error.to_string().contains("were removed"));
+    }
+
+    #[test]
+    fn snapshot_history_bounds_large_durable_event_payloads() {
+        let repository_id = RepositoryId::new();
+        let events = (1..=12)
+            .map(|sequence| DomainEvent {
+                id: EventId::new(),
+                repository_id,
+                sequence,
+                actor: Actor::App,
+                command_id: None,
+                kind: "artifact.published".into(),
+                payload: serde_json::json!({"manifest": "x".repeat(1024 * 1024)}),
+                created_at: OffsetDateTime::now_utc(),
+            })
+            .collect();
+
+        let compacted = compact_snapshot_history(events);
+        let encoded = serde_json::to_vec(&compacted).unwrap();
+
+        assert!(encoded.len() < 1024 * 1024);
+        assert_eq!(compacted.len(), 12);
+        assert!(compacted.iter().all(|event| {
+            event.payload["snapshot_truncated"] == true
+                && event.payload["original_payload_bytes"].as_u64().unwrap() > 1024 * 1024
+        }));
     }
 }

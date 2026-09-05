@@ -17,7 +17,7 @@ use tokio_util::codec::Framed;
 use tollgate_domain::{BuildsetId, CleanupPolicy, CommandId, QueueItemId, RepositoryId, SlotId};
 use tollgate_ipc::{
     Frame, FrameCodec, FrameKind, Handshake, HandshakeAck, IpcCommand, IpcResponse,
-    MAX_CONTROL_PAYLOAD, MAX_LOG_PAYLOAD, PROTOCOL_VERSION, StructuredError,
+    MAX_CONTROL_PAYLOAD, MAX_LOG_PAYLOAD, PROTOCOL_VERSION, ProtocolError, StructuredError,
     acquire_user_authority_lock, bind_user_socket, verify_peer_uid,
 };
 use tollgate_service::{
@@ -1003,15 +1003,43 @@ async fn handle_ipc_connection(
             .decode_json::<IpcCommand>()
             .map_err(|error| error.to_string())?;
         let response = execute_ipc_command(&service, command).await;
+        let response = ipc_response_frame(frame.correlation_id, &response)
+            .map_err(|error| error.to_string())?;
         framed
-            .send(
-                Frame::control(FrameKind::Response, frame.correlation_id, &response)
-                    .map_err(|error| error.to_string())?,
-            )
+            .send(response)
             .await
             .map_err(|error| error.to_string())?;
     }
     Ok(())
+}
+
+fn ipc_response_frame(
+    correlation_id: uuid::Uuid,
+    response: &IpcResponse,
+) -> Result<Frame, ProtocolError> {
+    match Frame::control(FrameKind::Response, correlation_id, response) {
+        Ok(frame) => Ok(frame),
+        Err(ProtocolError::OversizedPayload { declared, maximum }) => Frame::control(
+            FrameKind::Response,
+            correlation_id,
+            &IpcResponse {
+                ok: false,
+                result: None,
+                error: Some(StructuredError {
+                    code: "response-too-large".into(),
+                    message: format!(
+                        "Tollgate response is {declared} bytes; the protocol limit is {maximum} bytes"
+                    ),
+                    retryable: false,
+                    details: Some(serde_json::json!({
+                        "declared_bytes": declared,
+                        "maximum_bytes": maximum,
+                    })),
+                }),
+            },
+        ),
+        Err(error) => Err(error),
+    }
 }
 
 async fn execute_ipc_command(service: &Service, command: IpcCommand) -> IpcResponse {
@@ -1364,6 +1392,17 @@ async fn execute_ipc_command(service: &Service, command: IpcCommand) -> IpcRespo
                     .map_err(|error| error.to_string())?,
             )
             .map_err(|error| error.to_string()),
+            IpcCommand::Artifacts {
+                repository_id,
+                offset,
+                limit,
+            } => serde_json::to_value(
+                service
+                    .artifacts_page(repository_id, offset, limit)
+                    .await
+                    .map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string()),
             IpcCommand::Logs {
                 repository_id,
                 item_id,
@@ -1536,6 +1575,26 @@ fn classify_service_error(message: &str) -> &'static str {
 mod ipc_error_tests {
     use super::*;
     use tollgate_domain::GitOid;
+
+    #[test]
+    fn oversized_ipc_responses_return_a_structured_error_frame() {
+        let correlation_id = uuid::Uuid::now_v7();
+        let response = IpcResponse {
+            ok: true,
+            result: Some(serde_json::json!({"payload": "x".repeat(MAX_CONTROL_PAYLOAD)})),
+            error: None,
+        };
+
+        let frame = ipc_response_frame(correlation_id, &response).unwrap();
+        let response: IpcResponse = frame.decode_json().unwrap();
+
+        assert_eq!(frame.correlation_id, correlation_id);
+        assert!(!response.ok);
+        let error = response.error.unwrap();
+        assert_eq!(error.code, "response-too-large");
+        assert!(!error.retryable);
+        assert!(error.details.unwrap()["declared_bytes"].as_u64().unwrap() > 8 * 1024 * 1024);
+    }
 
     #[test]
     fn stale_candidate_error_preserves_retry_context() {

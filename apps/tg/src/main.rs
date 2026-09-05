@@ -13,7 +13,7 @@ use tollgate_ipc::{
     MAX_CONTROL_PAYLOAD, MAX_LOG_PAYLOAD, PROTOCOL_VERSION, StructuredError, verify_peer_uid,
 };
 use tollgate_service::{
-    AppSnapshot, DiagnoseResult, ItemWaitStatus, QueueItemView, RepositorySnapshot,
+    AppSnapshot, ArtifactPage, DiagnoseResult, ItemWaitStatus, QueueItemView, RepositorySnapshot,
 };
 use uuid::Uuid;
 
@@ -1107,12 +1107,28 @@ async fn run(cli: Cli) -> anyhow::Result<u8> {
         }
         TopCommand::Artifact(ArtifactCommand::List) => {
             let repository = select_repository(&mut client, cli.repository).await?;
+            let mut artifacts = Vec::new();
+            loop {
+                let page: ArtifactPage = serde_json::from_value(
+                    client
+                        .request(IpcCommand::Artifacts {
+                            repository_id: repository.state.id,
+                            offset: artifacts.len(),
+                            limit: 500,
+                        })
+                        .await?,
+                )?;
+                artifacts.extend(page.items);
+                if artifacts.len() >= page.total {
+                    break;
+                }
+            }
             if cli.json {
-                println!("{}", serde_json::to_string_pretty(&repository.artifacts)?);
-            } else if repository.artifacts.is_empty() {
+                println!("{}", serde_json::to_string_pretty(&artifacts)?);
+            } else if artifacts.is_empty() {
                 println!("No retained artifacts.");
             } else {
-                for artifact in repository.artifacts {
+                for artifact in artifacts {
                     println!(
                         "{}  {:<8}  {:>10}  {}",
                         artifact.artifact_id,
@@ -1314,6 +1330,7 @@ impl IpcClient {
     }
 
     async fn request(&mut self, command: IpcCommand) -> anyhow::Result<serde_json::Value> {
+        let mut reconnects = 0_u8;
         loop {
             let correlation = Uuid::now_v7();
             if let Err(error) = self
@@ -1321,6 +1338,10 @@ impl IpcClient {
                 .send(Frame::control(FrameKind::Request, correlation, &command)?)
                 .await
             {
+                if reconnects >= 1 {
+                    return Err(error).context("request send failed after reconnect");
+                }
+                reconnects += 1;
                 self.reconnect_once()
                     .await
                     .with_context(|| format!("request send failed before reconnect: {error}"))?;
@@ -1330,12 +1351,20 @@ impl IpcClient {
                 let frame = match self.framed.next().await {
                     Some(Ok(frame)) => frame,
                     Some(Err(error)) => {
+                        if reconnects >= 1 {
+                            return Err(error).context("response stream failed after reconnect");
+                        }
+                        reconnects += 1;
                         self.reconnect_once().await.with_context(|| {
                             format!("response stream failed before reconnect: {error}")
                         })?;
                         break;
                     }
                     None => {
+                        if reconnects >= 1 {
+                            return Err(anyhow!("app closed without responding after reconnect"));
+                        }
+                        reconnects += 1;
                         self.reconnect_once()
                             .await
                             .with_context(|| "app closed before responding; reconnect failed")?;

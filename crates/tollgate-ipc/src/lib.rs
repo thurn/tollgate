@@ -368,6 +368,11 @@ pub enum IpcCommand {
         artifact_id: String,
         command_id: CommandId,
     },
+    Artifacts {
+        repository_id: RepositoryId,
+        offset: usize,
+        limit: usize,
+    },
     Logs {
         repository_id: RepositoryId,
         item_id: QueueItemId,
