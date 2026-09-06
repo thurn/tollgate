@@ -9823,8 +9823,25 @@ impl TollgateService {
         loop {
             let observed_storage = self.storage_charged_bytes.load(Ordering::Acquire);
             let storage_ready = observed_storage <= storage::HARD_LIMIT_BYTES;
+            let (source_oid, reusable_slot_ready) = {
+                let data = runtime.data.lock();
+                let source_oid = data
+                    .items
+                    .iter()
+                    .find(|item| item.id == item_id)
+                    .map(|item| item.source_oid.clone());
+                let reusable_slot_ready = data
+                    .slots
+                    .values()
+                    .any(|slot| slot.state == "idle" && slot.health == "healthy");
+                (source_oid, reusable_slot_ready)
+            };
+            let cold_execution = runtime.cold_items.lock().contains(&item_id)
+                || source_oid
+                    .as_ref()
+                    .is_some_and(|source_oid| runtime.cold_sources.lock().contains(source_oid));
             let volumes = observe_volumes(&runtime)?;
-            if storage_ready
+            if (storage_ready || (reusable_slot_ready && !cold_execution))
                 && volumes.iter().all(|volume| {
                     volume.available_bytes
                         >= volume.warning_threshold.max(storage::MINIMUM_FREE_BYTES)
@@ -14685,6 +14702,105 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8_lossy(&output.stdout).trim().into()
+    }
+
+    #[tokio::test]
+    async fn authorized_queued_candidate_reuses_healthy_idle_slot_above_cache_hard_limit() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        let feature = temporary.path().join("feature");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("base.txt"), "base\n").unwrap();
+        git(&repository, &["add", "base.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                feature.to_str().unwrap(),
+                USER_BRANCH,
+            ],
+        );
+        std::fs::write(feature.join("feature.txt"), "feature\n").unwrap();
+        git(&feature, &["add", "feature.txt"]);
+        git(&feature, &["commit", "-m", "feature"]);
+        git(&repository, &["switch", "--detach", USER_BRANCH]);
+
+        let service = TollgateService::open(temporary.path().join("support"))
+            .await
+            .unwrap();
+        let initialized = service
+            .initialize_repository_with_options(&repository, Some("sleep 30; true".into()), false)
+            .await
+            .unwrap();
+        let runtime = service.runtime(initialized.state.id).await.unwrap();
+        let slot_id = SlotId::new();
+        let slot_path = runtime.slots_root.join(slot_id.to_string());
+        runtime
+            .git
+            .initialize_mirror(&runtime.mirror)
+            .await
+            .unwrap();
+        runtime
+            .git
+            .provision_slot(&runtime.mirror, &slot_path, &initialized.state.master_oid)
+            .await
+            .unwrap();
+        runtime.data.lock().slots.insert(
+            slot_id,
+            SlotView {
+                id: slot_id,
+                path: slot_path,
+                state: "idle".into(),
+                checkout_oid: Some(initialized.state.master_oid.clone()),
+                health: "healthy".into(),
+                last_used: None,
+            },
+        );
+        service
+            .storage_charged_bytes
+            .store(storage::HARD_LIMIT_BYTES + 1, Ordering::Release);
+
+        let candidate = service
+            .approve_from(
+                initialized.state.id,
+                "HEAD".into(),
+                Some(feature.to_string_lossy().into_owned()),
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let details = service
+                .item_details(initialized.state.id, candidate.item_id)
+                .await
+                .unwrap();
+            if details.buildset.is_some() {
+                assert!(details.item.promotion_authorized);
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "authorized queued candidate remained without a buildset despite a healthy idle slot"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        let revision = service
+            .repository_snapshot(initialized.state.id)
+            .await
+            .unwrap()
+            .state
+            .queue_revision;
+        service
+            .cancel(initialized.state.id, candidate.item_id, revision)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
