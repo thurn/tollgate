@@ -1930,13 +1930,7 @@ impl TollgateService {
             self.replace_item(runtime, item.clone())?;
             self.finish_source_cleanup(runtime, item).await?;
         }
-        for (intent_id, _, _, _) in runtime.store.unfinished_operations(&["push"])? {
-            runtime.store.set_intent_state(
-                intent_id,
-                IntentState::Canceled,
-                &serde_json::json!({"recovery": "abandoned-by-reconcile"}),
-            )?;
-        }
+        Self::abandon_remote_intents(&runtime)?;
         let affected = if changed_base {
             self.rebuild_after_base_adoption(runtime, &observed).await?
         } else {
@@ -7332,6 +7326,22 @@ impl TollgateService {
         Ok(result)
     }
 
+    fn abandon_remote_intents(runtime: &RepositoryRuntime) -> Result<(), ServiceError> {
+        let evidence = serde_json::json!({"recovery": "abandoned-by-reconcile"});
+        for (intent_id, _, _, state) in runtime.store.recoverable_operations(&["pull", "push"])? {
+            if state == IntentState::NeedsAttention {
+                runtime
+                    .store
+                    .cancel_attention_intent(intent_id, &evidence)?;
+            } else {
+                runtime
+                    .store
+                    .set_intent_state(intent_id, IntentState::Canceled, &evidence)?;
+            }
+        }
+        Ok(())
+    }
+
     pub async fn reconcile(
         self: &Arc<Self>,
         repository_id: RepositoryId,
@@ -7465,13 +7475,7 @@ impl TollgateService {
             self.replace_item(&runtime, item.clone())?;
             self.finish_source_cleanup(&runtime, item).await?;
         }
-        for (intent_id, _, _, _) in runtime.store.unfinished_operations(&["push"])? {
-            runtime.store.set_intent_state(
-                intent_id,
-                IntentState::Canceled,
-                &serde_json::json!({"recovery": "abandoned-by-reconcile"}),
-            )?;
-        }
+        Self::abandon_remote_intents(&runtime)?;
         if changed_base {
             let rebuilt = self
                 .rebuild_after_base_adoption(&runtime, &observed)
@@ -19565,6 +19569,98 @@ run = "test -f feature.txt"
             }
             assert!(tokio::time::Instant::now() < deadline);
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn reconciliation_retires_remote_intents_including_interrupted_recovery() {
+        for recovering in [false, true] {
+            let temporary = tempfile::tempdir().unwrap();
+            let repository = temporary.path().join("repository");
+            std::fs::create_dir_all(&repository).unwrap();
+            git(&repository, &["init", "-b", USER_BRANCH]);
+            std::fs::write(repository.join("base.txt"), "base").unwrap();
+            git(&repository, &["add", "."]);
+            git(&repository, &["commit", "-m", "base"]);
+            let service = TollgateService::open(temporary.path().join("support"))
+                .await
+                .unwrap();
+            let initialized = service
+                .initialize_repository_with_options(&repository, Some("true".into()), false)
+                .await
+                .unwrap();
+            let runtime = service.runtime(initialized.state.id).await.unwrap();
+            for kind in ["pull", "push"] {
+                for state in [
+                    IntentState::NeedsAttention,
+                    IntentState::ExternalApplied,
+                    IntentState::Prepared,
+                ] {
+                    if kind == "push" && state == IntentState::ExternalApplied {
+                        continue;
+                    }
+                    let command = CommandId::new();
+                    runtime
+                        .store
+                        .prepare_operation(
+                            initialized.state.id,
+                            kind,
+                            command,
+                            &serde_json::json!({}),
+                        )
+                        .unwrap();
+                    runtime
+                        .store
+                        .set_intent_state(command, state, &serde_json::json!({}))
+                        .unwrap();
+                }
+            }
+            assert_eq!(
+                runtime
+                    .store
+                    .recoverable_operations(&["pull", "push"])
+                    .unwrap()
+                    .len(),
+                5
+            );
+            let command = CommandId::new();
+            if recovering {
+                let evidence = serde_json::json!({
+                    "persisted_master": initialized.state.master_oid,
+                    "observed_master": initialized.state.master_oid,
+                    "request_digest": "reconciliation-fixture",
+                });
+                runtime
+                    .store
+                    .prepare_operation(initialized.state.id, "reconcile", command, &evidence)
+                    .unwrap();
+                service
+                    .recover_reconciliation(&runtime, command, &evidence)
+                    .await
+                    .unwrap();
+            } else {
+                service
+                    .reconcile(initialized.state.id, command)
+                    .await
+                    .unwrap();
+            }
+            assert!(
+                runtime
+                    .store
+                    .recoverable_operations(&["pull", "push"])
+                    .unwrap()
+                    .is_empty()
+            );
+            // A later startup must have no abandoned remote operation to replay.
+            service.reconcile_remote_intents(&runtime).await.unwrap();
+            assert_eq!(
+                runtime.data.lock().state.execution_state,
+                RepositoryExecutionState::Active
+            );
+            assert_eq!(
+                runtime.git.integration_oid().await.unwrap(),
+                initialized.state.master_oid
+            );
         }
     }
 
