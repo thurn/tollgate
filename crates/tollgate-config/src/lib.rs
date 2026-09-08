@@ -573,7 +573,7 @@ fn normalize_step(step: StepFile, needs: Vec<String>) -> Result<EffectiveStep, C
                 });
             }
             for pattern in &artifact.patterns {
-                validate_pattern(pattern)?;
+                artifact_pattern(pattern, Some("configuration-validation"))?;
             }
             Ok(EffectiveArtifact {
                 name: artifact.name,
@@ -831,6 +831,28 @@ fn parse_duration(value: &str) -> Result<u64, String> {
     number
         .checked_mul(multiplier)
         .ok_or_else(|| "duration overflows".into())
+}
+
+/// Resolve the artifact-only buildset token from runner-owned execution context.
+pub fn artifact_pattern(pattern: &str, buildset_id: Option<&str>) -> Result<String, ConfigError> {
+    const TOKEN: &str = "{{buildset_id}}";
+    let resolved = if pattern.contains(TOKEN) {
+        let id = buildset_id.ok_or_else(|| ConfigError::InvalidMatcher {
+            pattern: pattern.into(),
+            message: "artifact pattern requires trusted buildset identity".into(),
+        })?;
+        assert!(
+            !id.is_empty()
+                && id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        );
+        pattern.replace(TOKEN, id)
+    } else {
+        pattern.to_owned()
+    };
+    validate_pattern(&resolved)?;
+    Ok(resolved)
 }
 
 fn validate_pattern(pattern: &str) -> Result<(), ConfigError> {

@@ -1210,7 +1210,7 @@ pub async fn run_buildset_scheduled(
         .iter()
         .filter(|step| applicable_names.contains(step.name.as_str()))
     {
-        if verify_required_artifacts(step, &execution.slot_root).is_err() {
+        if verify_required_artifacts(step, &execution.slot_root, &execution.context).is_err() {
             results.insert(step.name.clone(), StepResultClass::ExitFailure);
             if let Some((_, result)) = ordered.iter_mut().find(|(name, _)| name == &step.name) {
                 result.class = StepResultClass::ExitFailure;
@@ -1259,12 +1259,21 @@ pub async fn run_buildset_scheduled(
     })
 }
 
-fn verify_required_artifacts(step: &EffectiveStep, root: &Path) -> Result<(), RunnerError> {
+fn verify_required_artifacts(
+    step: &EffectiveStep,
+    root: &Path,
+    context: &BTreeMap<String, String>,
+) -> Result<(), RunnerError> {
     for artifact in step.artifacts.iter().filter(|artifact| artifact.required) {
         let mut builder = globset::GlobSetBuilder::new();
         for pattern in &artifact.patterns {
+            let pattern = tollgate_config::artifact_pattern(
+                pattern,
+                context.get("TOLLGATE_BUILDSET_ID").map(String::as_str),
+            )
+            .map_err(|error| RunnerError::Interrupted(error.to_string()))?;
             builder.add(
-                globset::Glob::new(pattern)
+                globset::Glob::new(&pattern)
                     .map_err(|error| RunnerError::Interrupted(error.to_string()))?,
             );
         }
@@ -1834,7 +1843,14 @@ needs=["a","b"]
             .args(["rev-parse", "HEAD"])
             .output()
             .unwrap();
-        let config = EffectiveConfig::parse("version=1\n[[step]]\nname=\"gate\"\nrun=\"true\"\n[[step.artifact]]\nname=\"report\"\npatterns=[\"reports/*.xml\"]\nrequired=true\n").unwrap();
+        let config = EffectiveConfig::parse("version=1\n[[step]]\nname=\"gate\"\nrun=\"true\"\n[[step.artifact]]\nname=\"report\"\npatterns=[\"reports/{{buildset_id}}/*.xml\"]\nrequired=true\n").unwrap();
+        // A previous execution's matching basename cannot satisfy this buildset.
+        std::fs::create_dir_all(temporary.path().join("reports/previous")).unwrap();
+        std::fs::write(
+            temporary.path().join("reports/previous/result.xml"),
+            "stale",
+        )
+        .unwrap();
         let result = run_buildset(
             &config,
             BuildsetExecution {
@@ -1842,7 +1858,7 @@ needs=["a","b"]
                 slot_root: temporary.path().into(),
                 log_directory: temporary.path().join("logs"),
                 environment: std::env::vars().collect(),
-                context: BTreeMap::new(),
+                context: BTreeMap::from([("TOLLGATE_BUILDSET_ID".into(), "current".into())]),
             },
             &[],
             CancellationToken::new(),
@@ -1993,6 +2009,9 @@ needs=["a","b"]
         let temporary = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink("/etc/passwd", temporary.path().join("report")).unwrap();
         let config = EffectiveConfig::parse("version=1\n[[step]]\nname=\"gate\"\nrun=\"true\"\n[[step.artifact]]\nname=\"report\"\npatterns=[\"report\"]\nrequired=true\n").unwrap();
-        assert!(verify_required_artifacts(&config.steps[0], temporary.path()).is_err());
+        assert!(
+            verify_required_artifacts(&config.steps[0], temporary.path(), &BTreeMap::new())
+                .is_err()
+        );
     }
 }

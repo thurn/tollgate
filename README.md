@@ -34,6 +34,12 @@ The script installs to `/Applications/Tollgate.app`, updates `~/.local/bin/tg`,
 restarts Tollgate, and verifies the service with `tg --no-launch doctor`. Set
 `TOLLGATE_INSTALL_DIR` to use a different Applications directory.
 
+Artifact patterns may contain `{{buildset_id}}`, resolved from Tollgate's execution
+identity rather than the shell environment. For example,
+`patterns = ["artifacts/{{buildset_id}}/report.json"]` collects only that buildset's
+report. The step can write it using the read-only `TOLLGATE_BUILDSET_ID` variable;
+old files from other executions cannot satisfy a required artifact with this pattern.
+
 ## First repository
 
 Launch the app and choose **Add repository**, or run:

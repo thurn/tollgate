@@ -5282,7 +5282,11 @@ impl TollgateService {
                 slot_root: slot.clone(),
                 log_directory: logs.join(directory),
                 environment: (*environment.variables).clone(),
-                context: context.clone(),
+                context: {
+                    let mut context = context.clone();
+                    context.insert("TOLLGATE_BUILDSET_ID".into(), BuildsetId::new().to_string());
+                    context
+                },
             };
             let before = run_buildset(
                 &config,
@@ -10161,6 +10165,7 @@ impl TollgateService {
             environment: (*environment.variables).clone(),
             context: BTreeMap::from([
                 ("CI".into(), "1".into()),
+                ("TOLLGATE_BUILDSET_ID".into(), buildset_id.to_string()),
                 ("TOLLGATE_ITEM_ID".into(), item_id.to_string()),
                 ("TOLLGATE_TESTED_OID".into(), generation.tested_oid.to_hex()),
                 (
@@ -10646,6 +10651,18 @@ impl TollgateService {
         if config.steps.iter().all(|step| step.artifacts.is_empty()) {
             return Ok(Vec::new());
         }
+        let mut resolved = config.clone();
+        for artifact in resolved
+            .steps
+            .iter_mut()
+            .flat_map(|step| &mut step.artifacts)
+        {
+            for pattern in &mut artifact.patterns {
+                *pattern =
+                    tollgate_config::artifact_pattern(pattern, Some(&buildset_id.to_string()))?;
+            }
+        }
+        let config = &resolved;
         const RETENTION_BUDGET: u64 = 50 * 1024 * 1024 * 1024;
         const MAX_DISCOVERED_FILES: usize = 100_000;
         const MAX_RETAINED_FILES: usize = 10_000;
@@ -14443,6 +14460,28 @@ async fn discover_artifact_files(
         .collect::<Vec<_>>();
     roots.sort();
     roots.dedup();
+    // A literal prefix can skip intermediate directories during discovery.
+    // Check those ancestors before following the prefix into the filesystem.
+    for root in &roots {
+        let mut ancestor = slot_root.to_path_buf();
+        for component in root
+            .strip_prefix(slot_root)
+            .expect("slot-relative artifact root")
+            .components()
+        {
+            ancestor.push(component);
+            let metadata = match tokio::fs::symlink_metadata(&ancestor).await {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                Err(error) => return Err(error.into()),
+            };
+            if metadata.file_type().is_symlink() {
+                return Err(ServiceError::Invariant(
+                    "artifact prefix contains a symbolic link".into(),
+                ));
+            }
+        }
+    }
     let mut selected_roots = Vec::<PathBuf>::new();
     for root in roots {
         if !selected_roots
@@ -14679,6 +14718,24 @@ mod tests {
             .unwrap();
 
         assert_eq!(files, vec![slot.join("artifacts/results/report.json")]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn literal_artifact_prefix_cannot_follow_a_symlink_outside_the_slot() {
+        let slot = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(outside.path().join("results")).unwrap();
+        std::fs::write(outside.path().join("results/report.json"), "outside").unwrap();
+        std::os::unix::fs::symlink(outside.path(), slot.path().join("artifacts")).unwrap();
+        let config = EffectiveConfig::parse(
+            "version=1\n[[step]]\nname='ci'\nrun='true'\nartifact=[{name='report',patterns=['artifacts/results/report.json']}]",
+        ).unwrap();
+        assert!(
+            discover_artifact_files(slot.path(), &config, &[], 1)
+                .await
+                .is_err()
+        );
     }
 
     fn git_output(directory: &Path, args: &[&str]) -> std::process::Output {
@@ -16741,7 +16798,7 @@ mod tests {
             .initialize_repository(
                 &repository,
                 Some(
-                    "mkdir -p target scripts/__pycache__ orphan/cache; printf cache > target/cache; printf bytecode > scripts/__pycache__/ci.pyc; printf orphan > orphan/cache/value; printf retained > result.txt; test -f feature.txt"
+                    "mkdir -p target scripts/__pycache__ orphan/cache; printf cache > target/cache; printf bytecode > scripts/__pycache__/ci.pyc; printf orphan > orphan/cache/value; mkdir -p artifacts/stale artifacts/$TOLLGATE_BUILDSET_ID; printf stale > artifacts/stale/result.txt; printf retained > artifacts/$TOLLGATE_BUILDSET_ID/result.txt; test -f feature.txt"
                         .into(),
                 ),
             )
@@ -16757,11 +16814,14 @@ mod tests {
 
 [[step]]
 name = "ci"
-run = "mkdir -p target scripts/__pycache__ orphan/cache; printf cache > target/cache; printf bytecode > scripts/__pycache__/ci.pyc; printf orphan > orphan/cache/value; printf retained > result.txt; test -f feature.txt"
+run = "mkdir -p target scripts/__pycache__ orphan/cache; printf cache > target/cache; printf bytecode > scripts/__pycache__/ci.pyc; printf orphan > orphan/cache/value; mkdir -p artifacts/stale artifacts/$TOLLGATE_BUILDSET_ID; printf stale > artifacts/stale/result.txt; printf retained > artifacts/$TOLLGATE_BUILDSET_ID/result.txt; test -f feature.txt"
+
+[step.environment]
+TOLLGATE_BUILDSET_ID = "stale"
 
 [[step.artifact]]
 name = "result"
-patterns = ["result.txt"]
+patterns = ["artifacts/{{buildset_id}}/result.txt"]
 required = true
 
 [[cache.paths]]
@@ -16834,17 +16894,21 @@ policy = "clone"
             .unwrap()
             .unwrap()
             .path();
-        assert_eq!(
-            std::fs::read_to_string(buildset_directory.join("ci/result/result.txt")).unwrap(),
-            "retained"
-        );
+        let retained_file = buildset_directory.join(format!(
+            "ci/result/artifacts/{}/result.txt",
+            buildset_directory.file_name().unwrap().to_string_lossy()
+        ));
+        assert_eq!(std::fs::read_to_string(retained_file).unwrap(), "retained");
         let retained = service
             .artifacts_page(initialized.state.id, 0, 100)
             .await
             .unwrap()
             .items;
         assert_eq!(retained.len(), 1);
-        assert_eq!(retained[0].source_path, "result.txt");
+        assert_eq!(
+            retained[0].source_path,
+            format!("artifacts/{}/result.txt", retained[0].buildset_id)
+        );
         assert_eq!(retained[0].size, 8);
         assert_eq!(
             retained[0].hash,
