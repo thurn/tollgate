@@ -678,7 +678,19 @@ Configuration parsing rejects unknown fields. Canonicalization sorts maps and se
 
 Optional include/exclude globs are evaluated against the approved source commit's own single-commit diff, not the cumulative speculative prefix. Paths are repository-root-relative UTF-8 strings with `/` separators and case-sensitive matching. The grammar supports literal characters, `?`, `*` within one component, `**` across components, and bracket character classes; absolute patterns, parent traversal, malformed classes, and platform-native separator ambiguity are rejected. For a rename or copy, both old and new paths participate. Deletions participate using the old path. Diff acquisition uses stable NUL-delimited Git plumbing and an unrepresentable path is a configuration/buildset error rather than a silent mismatch.
 
-No matcher means always applicable. Include patterns select a step when any changed path matches; matching excludes then remove it. A step with matchers that is not selected is `skipped`, which is distinct from success and is omitted from that buildset's applicable voting-step set. A dependent whose hard `needs` prerequisite was skipped is a configuration error for that buildset; a skipped `soft_needs` prerequisite permits the dependent to run. Matcher evaluation and the resulting applicable voting-step IDs are frozen in the validation generation before execution.
+No matcher means always applicable. Include patterns select a step when any
+changed path matches; matching excludes then remove it. `include_mode = "all"`
+requires every changed path to match an include, while `exclude_mode = "all"`
+removes a step only when every changed path matches an exclude. Empty change
+sets never satisfy either all-path predicate. These modes allow trusted policy
+to partition a narrow allowlist from mixed or unknown changes without a
+candidate-owned selector. A step with matchers that is not selected is
+`skipped`, which is distinct from success and is omitted from that buildset's
+applicable voting-step set. A dependent whose hard `needs` prerequisite was
+skipped is a configuration error for that buildset; a skipped `soft_needs`
+prerequisite permits the dependent to run. Matcher evaluation and the resulting
+applicable voting-step IDs are frozen in the validation generation before
+execution.
 
 ### 11.4 Initialization templates
 

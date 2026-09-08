@@ -173,13 +173,25 @@ pub struct StepFile {
     #[serde(default)]
     pub include: Vec<String>,
     #[serde(default)]
+    pub include_mode: MatchMode,
+    #[serde(default)]
     pub exclude: Vec<String>,
+    #[serde(default)]
+    pub exclude_mode: MatchMode,
     #[serde(default)]
     pub environment: BTreeMap<String, String>,
     #[serde(default)]
     pub remove_environment: Vec<String>,
     #[serde(default)]
     pub artifact: Vec<ArtifactFile>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MatchMode {
+    #[default]
+    Any,
+    All,
 }
 
 fn root_directory() -> String {
@@ -273,7 +285,11 @@ pub struct EffectiveStep {
     pub rss_limit_bytes: Option<u64>,
     pub semaphores: Vec<String>,
     pub include: Vec<String>,
+    #[serde(default, skip_serializing_if = "match_mode_is_any")]
+    pub include_mode: MatchMode,
     pub exclude: Vec<String>,
+    #[serde(default, skip_serializing_if = "match_mode_is_any")]
+    pub exclude_mode: MatchMode,
     pub environment: BTreeMap<String, String>,
     pub remove_environment: Vec<String>,
     pub artifacts: Vec<EffectiveArtifact>,
@@ -499,10 +515,30 @@ impl EffectiveStep {
         }
         let includes = build_matcher(&self.include)?;
         let excludes = build_matcher(&self.exclude)?;
-        let selected =
-            self.include.is_empty() || changed_paths.iter().any(|path| includes.is_match(path));
-        Ok(selected && !changed_paths.iter().any(|path| excludes.is_match(path)))
+        let selected = self.include.is_empty()
+            || self
+                .include_mode
+                .matches(changed_paths, |path| includes.is_match(path));
+        let excluded = !self.exclude.is_empty()
+            && self
+                .exclude_mode
+                .matches(changed_paths, |path| excludes.is_match(path));
+        Ok(selected && !excluded)
     }
+}
+
+impl MatchMode {
+    fn matches(self, changed_paths: &[String], matches: impl Fn(&str) -> bool) -> bool {
+        !changed_paths.is_empty()
+            && match self {
+                Self::Any => changed_paths.iter().any(|path| matches(path)),
+                Self::All => changed_paths.iter().all(|path| matches(path)),
+            }
+    }
+}
+
+fn match_mode_is_any(mode: &MatchMode) -> bool {
+    *mode == MatchMode::Any
 }
 
 fn normalize_step(step: StepFile, needs: Vec<String>) -> Result<EffectiveStep, ConfigError> {
@@ -610,7 +646,9 @@ fn normalize_step(step: StepFile, needs: Vec<String>) -> Result<EffectiveStep, C
         rss_limit_bytes: step.rss_limit_bytes,
         semaphores: sorted_names(step.semaphores)?,
         include: step.include,
+        include_mode: step.include_mode,
         exclude: step.exclude,
+        exclude_mode: step.exclude_mode,
         environment: step.environment,
         remove_environment: sorted_unique(step.remove_environment)?,
         artifacts,
@@ -991,6 +1029,27 @@ mod tests {
             .is_err()
         );
         assert!(EffectiveConfig::parse("version = 1\n[[step]]\nname = \"a\"\nrun = \"a\"\nneeds = [\"b\"]\n[[step]]\nname = \"b\"\nrun = \"b\"\nneeds = [\"a\"]\n").is_err());
+    }
+
+    #[test]
+    fn all_path_modes_safely_partition_prose_and_mixed_changes() {
+        let config = EffectiveConfig::parse(
+            "version = 1\n[[step]]\nname = \"prose\"\nrun = \"prose\"\ninclude = [\"docs/**\"]\ninclude_mode = \"all\"\nneeds = []\n[[step]]\nname = \"full\"\nrun = \"full\"\nexclude = [\"docs/**\"]\nexclude_mode = \"all\"\nneeds = []\n",
+        )
+        .unwrap();
+
+        let names = |paths: &[&str]| {
+            config
+                .applicable_steps(&paths.iter().map(|path| (*path).into()).collect::<Vec<_>>())
+                .unwrap()
+                .into_iter()
+                .map(|step| step.name.as_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&["docs/one.md", "docs/nested/two.md"]), ["prose"]);
+        assert_eq!(names(&["docs/one.md", "src/main.rs"]), ["full"]);
+        assert_eq!(names(&["src/main.rs"]), ["full"]);
+        assert_eq!(names(&[]), ["full"]);
     }
 
     #[test]
