@@ -2,6 +2,7 @@
 set -eu
 
 project_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$project_root"
 install_dir=${TOLLGATE_INSTALL_DIR:-/Applications}
 built_app="$project_root/target/release/bundle/macos/Tollgate.app"
 installed_app="$install_dir/Tollgate.app"
