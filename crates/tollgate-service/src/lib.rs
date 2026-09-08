@@ -731,6 +731,7 @@ pub struct TollgateService {
     global_command_path: PathBuf,
     global_commands: tokio::sync::Mutex<GlobalCommandJournal>,
     storage_maintenance: tokio::sync::Mutex<()>,
+    storage_inspection: tokio::sync::Mutex<()>,
     storage_charged_bytes: AtomicU64,
     volume_reservations: tokio::sync::Mutex<()>,
     shutting_down: AtomicBool,
@@ -1253,15 +1254,28 @@ impl TollgateService {
             global_command_path,
             global_commands: tokio::sync::Mutex::new(global_commands),
             storage_maintenance: tokio::sync::Mutex::new(()),
+            storage_inspection: tokio::sync::Mutex::new(()),
             storage_charged_bytes: AtomicU64::new(u64::MAX),
             volume_reservations: tokio::sync::Mutex::new(()),
             shutting_down: AtomicBool::new(false),
         });
         service.load_registry().await?;
         service.reconcile_global_commands().await?;
-        service.storage_status().await?;
+        service.spawn_initial_storage_scan();
         service.spawn_maintenance();
         Ok(service)
+    }
+
+    fn spawn_initial_storage_scan(self: &Arc<Self>) {
+        let service = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let Some(service) = service.upgrade() else {
+                return;
+            };
+            if let Err(error) = service.storage_status().await {
+                eprintln!("Tollgate initial storage scan failed: {error}");
+            }
+        });
     }
 
     fn spawn_maintenance(self: &Arc<Self>) {
@@ -4406,6 +4420,7 @@ impl TollgateService {
 
     /// Return host-wide cache usage and reclaimable entries.
     pub async fn storage_status(&self) -> Result<storage::StorageView, ServiceError> {
+        let _inspection = self.storage_inspection.lock().await;
         let (registered, slots, seeds) = self.storage_inventory().await;
         let cache_root = self.support_root.join("cache");
         let view = tokio::task::spawn_blocking(move || {
