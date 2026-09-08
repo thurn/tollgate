@@ -70,11 +70,12 @@
     "step": {
       "type": "object", "additionalProperties": false, "required": ["name"],
       "oneOf": [{ "required": ["run"], "not": { "required": ["argv"] } }, { "required": ["argv"], "not": { "required": ["run"] } }],
+      "allOf": [{ "if": { "properties": { "reuse_on_retry": { "const": true } }, "required": ["reuse_on_retry"] }, "then": { "properties": { "final": { "const": false }, "artifact": { "maxItems": 0 } } } }],
       "properties": {
         "name": { "$ref": "#/$defs/name" }, "run": { "type": "string", "minLength": 1 }, "argv": { "$ref": "#/$defs/argv" },
         "working_directory": { "$ref": "#/$defs/relativePath" }, "needs": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/name" } },
         "soft_needs": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/name" } }, "timeout": { "type": "string", "pattern": "^[0-9]+[smhd]$", "default": "60m" },
-        "voting": { "type": "boolean", "default": true }, "final": { "type": "boolean", "default": false }, "cpu_tokens": { "type": "integer", "minimum": 0, "default": 0 },
+        "voting": { "type": "boolean", "default": true }, "final": { "type": "boolean", "default": false }, "reuse_on_retry": { "type": "boolean", "default": false }, "cpu_tokens": { "type": "integer", "minimum": 0, "default": 0 },
         "memory_bytes": { "type": "integer", "minimum": 0, "default": 0 }, "rss_limit_bytes": { "type": "integer", "minimum": 1048576 },
         "semaphores": { "type": "array", "uniqueItems": true, "default": [], "items": { "$ref": "#/$defs/name" } },
         "include": { "type": "array", "items": { "type": "string" } }, "exclude": { "type": "array", "items": { "type": "string" } },

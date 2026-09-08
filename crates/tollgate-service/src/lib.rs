@@ -30,9 +30,9 @@ use tollgate_git::{
 };
 use tollgate_runner::apfs::{CloneManifest, force_clone_file, force_clone_tree, verify_clone_tree};
 use tollgate_runner::{
-    BuildsetExecution, EnvironmentSnapshot, RenderedLogFrame, RunnerError, StepResultClass,
-    durable_log_tail_start, read_durable_log, run_buildset, run_buildset_scheduled,
-    verify_durable_log,
+    BuildsetExecution, EnvironmentSnapshot, RenderedLogFrame, ReusableStepResult, RunnerError,
+    StepResult, StepResultClass, durable_log_tail_start, read_durable_log, run_buildset,
+    run_buildset_scheduled, verify_durable_log,
 };
 use tollgate_scheduler::{
     DispatchRequest, GlobalScheduler, PriorityClass, ResourceCapacity, SchedulerError,
@@ -496,6 +496,14 @@ struct GateSubmission {
     cleanup_policy: CleanupPolicy,
     command_id: CommandId,
     promotion_authorized: bool,
+    retry_of_item_id: Option<QueueItemId>,
+}
+
+struct CheckSubmission {
+    command_id: CommandId,
+    purpose: String,
+    mode: CheckMode,
+    retry_of_item_id: Option<QueueItemId>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1504,9 +1512,12 @@ impl TollgateService {
                 repository_id,
                 INTEGRATION_REF.into(),
                 Some(runtime.git.worktree_root.to_string_lossy().into_owned()),
-                CommandId::new(),
-                "bootstrap".into(),
-                CheckMode::Normal,
+                CheckSubmission {
+                    command_id: CommandId::new(),
+                    purpose: "bootstrap".into(),
+                    mode: CheckMode::Normal,
+                    retry_of_item_id: None,
+                },
             )
             .await?;
         }
@@ -5169,9 +5180,12 @@ impl TollgateService {
                     repository_id,
                     generation.expected_parent_oid.to_hex(),
                     None,
-                    command_id,
-                    format!("diagnose:{item_id}:base"),
-                    CheckMode::RetainedCold(generation.expected_parent_oid.clone()),
+                    CheckSubmission {
+                        command_id,
+                        purpose: format!("diagnose:{item_id}:base"),
+                        mode: CheckMode::RetainedCold(generation.expected_parent_oid.clone()),
+                        retry_of_item_id: None,
+                    },
                 )
                 .await?;
             replay_item_ids.push(baseline.item_id);
@@ -5196,9 +5210,12 @@ impl TollgateService {
                     repository_id,
                     generation.tested_oid.to_hex(),
                     None,
-                    derived_command_id(command_id, "diagnose-candidate-stability"),
-                    format!("diagnose:{item_id}:candidate"),
-                    CheckMode::RetainedCold(generation.tested_oid.clone()),
+                    CheckSubmission {
+                        command_id: derived_command_id(command_id, "diagnose-candidate-stability"),
+                        purpose: format!("diagnose:{item_id}:candidate"),
+                        mode: CheckMode::RetainedCold(generation.tested_oid.clone()),
+                        retry_of_item_id: None,
+                    },
                 )
                 .await?;
             replay_item_ids.push(candidate.item_id);
@@ -5524,6 +5541,7 @@ impl TollgateService {
                 cleanup_policy,
                 command_id,
                 promotion_authorized: true,
+                retry_of_item_id: None,
             },
         )
         .await
@@ -5573,6 +5591,7 @@ impl TollgateService {
                 cleanup_policy,
                 command_id,
                 promotion_authorized: false,
+                retry_of_item_id: None,
             },
         )
         .await
@@ -5590,6 +5609,7 @@ impl TollgateService {
             cleanup_policy,
             command_id,
             promotion_authorized,
+            retry_of_item_id,
         } = submission;
         let runtime = self.runtime(repository_id).await?;
         let mutation = runtime.mutation.lock().await;
@@ -5651,6 +5671,7 @@ impl TollgateService {
             "purpose": purpose,
             "cleanup_policy": cleanup_policy,
             "promotion_authorized": promotion_authorized,
+            "retry_of_item_id": retry_of_item_id,
         }))?;
         let command_kind = if promotion_authorized {
             "approve"
@@ -5874,6 +5895,7 @@ impl TollgateService {
             cleanup_state: CleanupState::NotEligible,
             cleanup_policy,
             dependencies,
+            retry_of_item_id,
             promotion_authorized,
             promotion_authorized_at: promotion_authorized.then(OffsetDateTime::now_utc),
             promotion_authorized_by: promotion_authorized.then_some(command_id),
@@ -6504,9 +6526,12 @@ impl TollgateService {
             repository_id,
             revision,
             worktree_path,
-            command_id,
-            "check".into(),
-            CheckMode::Normal,
+            CheckSubmission {
+                command_id,
+                purpose: "check".into(),
+                mode: CheckMode::Normal,
+                retry_of_item_id: None,
+            },
         )
         .await
     }
@@ -6516,10 +6541,14 @@ impl TollgateService {
         repository_id: RepositoryId,
         revision: String,
         worktree_path: Option<String>,
-        command_id: CommandId,
-        purpose: String,
-        mode: CheckMode,
+        submission: CheckSubmission,
     ) -> Result<ApproveResult, ServiceError> {
+        let CheckSubmission {
+            command_id,
+            purpose,
+            mode,
+            retry_of_item_id,
+        } = submission;
         let runtime = self.runtime(repository_id).await?;
         let _mutation = runtime.mutation.lock().await;
         let requested_revision = revision.clone();
@@ -6586,6 +6615,7 @@ impl TollgateService {
             "purpose": purpose.clone(),
             "cold": cold,
             "retained_source_oid": retained_source_oid,
+            "retry_of_item_id": retry_of_item_id,
         }))?;
         if let Some(response) =
             runtime
@@ -6648,6 +6678,7 @@ impl TollgateService {
             cleanup_state: CleanupState::NotEligible,
             cleanup_policy: CleanupPolicy::Automatic,
             dependencies: Vec::new(),
+            retry_of_item_id,
             promotion_authorized: false,
             promotion_authorized_at: None,
             promotion_authorized_by: None,
@@ -7913,25 +7944,44 @@ impl TollgateService {
             runtime.cold_sources.lock().insert(source_oid.clone());
         }
         let result = if kind == QueueItemKind::IndependentCheck {
-            self.check_from(repository_id, source, worktree_path, child_command_id)
-                .await
-        } else if promotion_authorized {
-            self.approve_from_with_cleanup_policy(
+            self.check_from_with_purpose(
                 repository_id,
                 source,
                 worktree_path,
-                purpose.filter(|purpose| purpose == "push-master"),
-                cleanup_policy,
-                child_command_id,
+                CheckSubmission {
+                    command_id: child_command_id,
+                    purpose: "check".into(),
+                    mode: CheckMode::Normal,
+                    retry_of_item_id: Some(item_id),
+                },
+            )
+            .await
+        } else if promotion_authorized {
+            self.enqueue_gate_from(
+                repository_id,
+                source,
+                worktree_path,
+                GateSubmission {
+                    purpose: purpose.filter(|purpose| purpose == "push-master"),
+                    cleanup_policy,
+                    command_id: child_command_id,
+                    promotion_authorized: true,
+                    retry_of_item_id: Some(item_id),
+                },
             )
             .await
         } else {
-            self.submit_candidate_from_with_cleanup_policy(
+            self.enqueue_gate_from(
                 repository_id,
                 source,
                 worktree_path,
-                cleanup_policy,
-                child_command_id,
+                GateSubmission {
+                    purpose: None,
+                    cleanup_policy,
+                    command_id: child_command_id,
+                    promotion_authorized: false,
+                    retry_of_item_id: Some(item_id),
+                },
             )
             .await
         };
@@ -10010,7 +10060,15 @@ impl TollgateService {
                     buildset.item_id == item_id
                         && buildset.validation_generation_id == generation.id
                 })
-                .max_by_key(|buildset| buildset.attempt);
+                .max_by_key(|buildset| buildset.attempt)
+                .or_else(|| {
+                    item.retry_of_item_id.and_then(|retry_of_item_id| {
+                        data.buildsets
+                            .iter()
+                            .filter(|buildset| buildset.item_id == retry_of_item_id)
+                            .max_by_key(|buildset| buildset.created_at)
+                    })
+                });
             (
                 item,
                 generation,
@@ -10193,6 +10251,95 @@ impl TollgateService {
                 ),
             ]),
         };
+        let previous_buildset = (!cold)
+            .then_some(retry_of)
+            .flatten()
+            .and_then(|previous_id| {
+                let data = runtime.data.lock();
+                let previous = data
+                    .buildsets
+                    .iter()
+                    .find(|candidate| candidate.id == previous_id)?;
+                let previous_generation = data
+                    .generations
+                    .iter()
+                    .find(|candidate| candidate.id == previous.validation_generation_id)?;
+                (previous.state.is_terminal()
+                    && previous.tested_oid == generation.tested_oid
+                    && previous.expected_parent_oid == generation.expected_parent_oid
+                    && previous.environment_fingerprint == environment.fingerprint
+                    && previous_generation.configuration_digest == generation.configuration_digest
+                    && previous_generation.step_graph_digest == generation.step_graph_digest
+                    && previous_generation.engine_epoch == generation.engine_epoch)
+                    .then(|| previous.clone())
+            });
+        let mut reusable_steps = HashMap::new();
+        if let Some(previous) = previous_buildset {
+            for summary in previous
+                .step_results
+                .iter()
+                .filter(|result| result.result_class == "success")
+            {
+                let Some(step) = config.steps.iter().find(|step| step.name == summary.name) else {
+                    continue;
+                };
+                if !step.reuse_on_retry
+                    || runtime.store.step_log_state(previous.id, &summary.name)?
+                        != Some("sealed".into())
+                {
+                    continue;
+                }
+                let Some((source_attempt_id, result)) = runtime
+                    .store
+                    .successful_step_result(previous.id, &summary.name)?
+                else {
+                    continue;
+                };
+                let mut result: StepResult = serde_json::from_value(result)?;
+                if result.class != StepResultClass::Success
+                    || !verify_durable_log(
+                        &result.log.path,
+                        &result.log.hash,
+                        result.log.stdout_end,
+                        result.log.stderr_end,
+                    )
+                    .await
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                let retained_log = runtime
+                    .logs_root
+                    .join(buildset_id.to_string())
+                    .join(format!("{}.tlog", summary.name));
+                if retain_reused_log(&result.log.path, &retained_log)
+                    .await
+                    .is_err()
+                    || !verify_durable_log(
+                        &retained_log,
+                        &result.log.hash,
+                        result.log.stdout_end,
+                        result.log.stderr_end,
+                    )
+                    .await
+                    .unwrap_or(false)
+                {
+                    let _ = tokio::fs::remove_file(&retained_log).await;
+                    let _ = tokio::fs::remove_file(log_index_path(&retained_log)).await;
+                    continue;
+                }
+                result.attempt_id = StepAttemptId::new();
+                result.elapsed_ms = 0;
+                result.log.path = retained_log;
+                reusable_steps.insert(
+                    summary.name.clone(),
+                    ReusableStepResult {
+                        source_attempt_id,
+                        result,
+                    },
+                );
+            }
+        }
         let mut sleep_assertion = IdleSleepAssertion::acquire().await;
         let volume_monitor_stop = CancellationToken::new();
         let volume_monitor_failed = Arc::new(AtomicBool::new(false));
@@ -10225,6 +10372,7 @@ impl TollgateService {
             &changed_paths,
             cancellation,
             Some(Arc::clone(&self.global_scheduler)),
+            reusable_steps,
         )
         .await;
         volume_monitor_stop.cancel();
@@ -10346,6 +10494,7 @@ impl TollgateService {
                 stdout_end: result.log.stdout_end,
                 stderr_end: result.log.stderr_end,
                 diagnostics: result.diagnostics.clone(),
+                reused_from_attempt_id: outcome.reused_steps.get(name).copied(),
             })
             .chain(outcome.skipped.iter().map(|name| BuildsetStepResult {
                 name: name.clone(),
@@ -10357,6 +10506,7 @@ impl TollgateService {
                 stdout_end: 0,
                 stderr_end: 0,
                 diagnostics: Vec::new(),
+                reused_from_attempt_id: None,
             }))
             .collect();
         runtime.cancellations.lock().remove(&item_id);
@@ -13850,6 +14000,7 @@ fn freeze_steps(buildset: BuildsetId, config: &EffectiveConfig) -> Vec<FrozenSte
                 .collect(),
             voting: step.voting,
             final_step: step.final_step,
+            reuse_on_retry: step.reuse_on_retry,
             timeout_ns: step.timeout_ns,
             cpu_tokens: step.cpu_tokens,
             memory_bytes: step.memory_bytes,
@@ -14296,6 +14447,25 @@ async fn hash_file(path: &Path) -> Result<String, ServiceError> {
         hasher.update(&buffer[..read]);
     }
     Ok(hasher.finalize().to_hex().to_string())
+}
+
+fn log_index_path(path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.idx", path.display()))
+}
+
+async fn retain_reused_log(source: &Path, destination: &Path) -> Result<(), std::io::Error> {
+    let parent = destination.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "log path has no parent")
+    })?;
+    tokio::fs::create_dir_all(parent).await?;
+    tokio::fs::hard_link(source, destination).await?;
+    if let Err(error) =
+        tokio::fs::hard_link(log_index_path(source), log_index_path(destination)).await
+    {
+        let _ = tokio::fs::remove_file(destination).await;
+        return Err(error);
+    }
+    Ok(())
 }
 
 async fn copy_artifact_exclusive(
@@ -15845,6 +16015,255 @@ mod tests {
             .unwrap();
         assert_eq!(replay.queue_revision, retried.queue_revision);
         assert_eq!(replay.tested_oid, retried.tested_oid);
+    }
+
+    #[tokio::test]
+    async fn retry_reuses_successful_steps_from_the_exact_failed_generation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        let successful_runs = temporary.path().join("successful-runs");
+        let pass_after_retry = temporary.path().join("pass-after-retry");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("base.txt"), "base\n").unwrap();
+        std::fs::create_dir(repository.join(".tollgate")).unwrap();
+        std::fs::write(
+            repository.join(".tollgate/config.toml"),
+            format!(
+                r#"version = 1
+allow_concurrent_roots = false
+
+[[step]]
+name = "successful"
+run = "printf x >> '{}'"
+reuse_on_retry = true
+
+[[step]]
+name = "flaky"
+run = "if test -f '{}'; then true; else touch '{}'; false; fi"
+needs = ["successful"]
+"#,
+                successful_runs.display(),
+                pass_after_retry.display(),
+                pass_after_retry.display(),
+            ),
+        )
+        .unwrap();
+        git(&repository, &["add", "base.txt", ".tollgate/config.toml"]);
+        git(&repository, &["commit", "-m", "base"]);
+        let service = TollgateService::open(temporary.path().join("support"))
+            .await
+            .unwrap();
+        let initialized = service
+            .initialize_repository_with_options(&repository, None, false)
+            .await
+            .unwrap();
+        let first = service
+            .check_from(
+                initialized.state.id,
+                "HEAD".into(),
+                Some(repository.to_string_lossy().into_owned()),
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let item = service
+                .item_status(initialized.state.id, first.item_id)
+                .await
+                .unwrap();
+            if item.state == QueueItemState::CheckFailed {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "state={:?}",
+                item.state
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        let retried = service
+            .retry(initialized.state.id, first.item_id, false, CommandId::new())
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let details = loop {
+            let details = service
+                .item_details(initialized.state.id, retried.item_id)
+                .await
+                .unwrap();
+            if details.item.state == QueueItemState::CheckPassed {
+                break details;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "state={:?}",
+                details.item.state
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        };
+
+        assert_eq!(std::fs::read_to_string(&successful_runs).unwrap(), "x");
+        let successful = details
+            .buildset
+            .unwrap()
+            .step_results
+            .into_iter()
+            .find(|step| step.name == "successful")
+            .unwrap();
+        assert_eq!(successful.result_class, "success");
+        assert!(successful.reused_from_attempt_id.is_some());
+        assert_eq!(successful.elapsed_ms, 0);
+
+        let cold = service
+            .retry(initialized.state.id, first.item_id, true, CommandId::new())
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let cold_details = loop {
+            let details = service
+                .item_details(initialized.state.id, cold.item_id)
+                .await
+                .unwrap();
+            if details.item.state == QueueItemState::CheckPassed {
+                break details;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "state={:?}",
+                details.item.state
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        };
+        assert_eq!(std::fs::read_to_string(&successful_runs).unwrap(), "xx");
+        assert!(
+            cold_details
+                .buildset
+                .unwrap()
+                .step_results
+                .into_iter()
+                .all(|step| step.reused_from_attempt_id.is_none())
+        );
+    }
+
+    #[tokio::test]
+    async fn promoted_retry_certifies_the_new_attempt_with_reused_step_evidence() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        let feature = temporary.path().join("feature");
+        let successful_runs = temporary.path().join("successful-runs");
+        let pass_after_retry = temporary.path().join("pass-after-retry");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("base.txt"), "base\n").unwrap();
+        std::fs::create_dir(repository.join(".tollgate")).unwrap();
+        std::fs::write(
+            repository.join(".tollgate/config.toml"),
+            format!(
+                r#"version = 1
+allow_concurrent_roots = false
+
+[[step]]
+name = "successful"
+run = "printf x >> '{}'"
+reuse_on_retry = true
+
+[[step]]
+name = "repaired"
+run = "if test -f '{}'; then true; else touch '{}'; false; fi"
+needs = ["successful"]
+"#,
+                successful_runs.display(),
+                pass_after_retry.display(),
+                pass_after_retry.display(),
+            ),
+        )
+        .unwrap();
+        git(&repository, &["add", "base.txt", ".tollgate/config.toml"]);
+        git(&repository, &["commit", "-m", "base"]);
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                feature.to_str().unwrap(),
+                USER_BRANCH,
+            ],
+        );
+        std::fs::write(feature.join("feature.txt"), "feature\n").unwrap();
+        git(&feature, &["add", "feature.txt"]);
+        git(&feature, &["commit", "-m", "feature"]);
+        git(&repository, &["switch", "--detach", USER_BRANCH]);
+        let service = TollgateService::open(temporary.path().join("support"))
+            .await
+            .unwrap();
+        let initialized = service
+            .initialize_repository_with_options(&repository, None, false)
+            .await
+            .unwrap();
+        let first = service
+            .approve_from(
+                initialized.state.id,
+                "HEAD".into(),
+                Some(feature.to_string_lossy().into_owned()),
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let item = service
+                .item_status(initialized.state.id, first.item_id)
+                .await
+                .unwrap();
+            if item.state == QueueItemState::Failed {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "state={:?}",
+                item.state
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let retried = service
+            .retry(initialized.state.id, first.item_id, false, CommandId::new())
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let details = loop {
+            let details = service
+                .item_details(initialized.state.id, retried.item_id)
+                .await
+                .unwrap();
+            if details.item.state == QueueItemState::Promoted {
+                break details;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "state={:?}",
+                details.item.state
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        };
+
+        assert_eq!(std::fs::read_to_string(&successful_runs).unwrap(), "x");
+        assert!(details.item.certificate_id.is_some());
+        assert!(
+            details
+                .buildset
+                .unwrap()
+                .step_results
+                .into_iter()
+                .find(|step| step.name == "successful")
+                .unwrap()
+                .reused_from_attempt_id
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -20924,6 +21343,7 @@ run = "true"
                     cleanup_policy: CleanupPolicy::Automatic,
                     command_id: CommandId::new(),
                     promotion_authorized: false,
+                    retry_of_item_id: None,
                 },
             )
             .await
@@ -21066,6 +21486,7 @@ run = "true"
                     cleanup_policy: CleanupPolicy::Automatic,
                     command_id: CommandId::new(),
                     promotion_authorized: false,
+                    retry_of_item_id: None,
                 },
             )
             .await

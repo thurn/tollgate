@@ -795,6 +795,28 @@ impl RepositoryStore {
         ).optional()?)
     }
 
+    pub fn successful_step_result(
+        &self,
+        buildset_id: tollgate_domain::BuildsetId,
+        step_name: &str,
+    ) -> Result<Option<(StepAttemptId, serde_json::Value)>, StoreError> {
+        let value: Option<(String, String)> = self.connection.lock().query_row(
+            "SELECT step_attempts.attempt_id, step_attempts.attempt_json FROM step_attempts JOIN steps ON steps.step_id=step_attempts.step_id WHERE steps.buildset_id=?1 AND steps.name=?2 AND step_attempts.result_class='success' ORDER BY step_attempts.retry_number DESC LIMIT 1",
+            params![buildset_id.to_string(), step_name],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional()?;
+        value
+            .map(|(attempt_id, result)| {
+                Ok((
+                    attempt_id.parse().map_err(|error| {
+                        StoreError::Integrity(format!("invalid retained step attempt ID: {error}"))
+                    })?,
+                    decode(&result)?,
+                ))
+            })
+            .transpose()
+    }
+
     pub fn record_artifact(
         &self,
         buildset_id: tollgate_domain::BuildsetId,
@@ -2604,6 +2626,7 @@ mod tests {
             cleanup_state: CleanupState::NotEligible,
             cleanup_policy: CleanupPolicy::Automatic,
             dependencies: Vec::new(),
+            retry_of_item_id: None,
             promotion_authorized: false,
             promotion_authorized_at: None,
             promotion_authorized_by: None,
@@ -2702,6 +2725,7 @@ mod tests {
             cleanup_state: CleanupState::NotEligible,
             cleanup_policy: CleanupPolicy::Automatic,
             dependencies: Vec::new(),
+            retry_of_item_id: None,
             promotion_authorized: false,
             promotion_authorized_at: None,
             promotion_authorized_by: None,

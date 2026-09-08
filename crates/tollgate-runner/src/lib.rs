@@ -1054,6 +1054,13 @@ pub struct BuildsetResult {
     pub skipped: Vec<String>,
     pub workspace_verified: bool,
     pub workspace_verification_error: Option<String>,
+    pub reused_steps: HashMap<String, StepAttemptId>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ReusableStepResult {
+    pub source_attempt_id: StepAttemptId,
+    pub result: StepResult,
 }
 
 pub async fn run_buildset(
@@ -1062,7 +1069,15 @@ pub async fn run_buildset(
     changed_paths: &[String],
     cancellation: CancellationToken,
 ) -> Result<BuildsetResult, RunnerError> {
-    run_buildset_scheduled(config, execution, changed_paths, cancellation, None).await
+    run_buildset_scheduled(
+        config,
+        execution,
+        changed_paths,
+        cancellation,
+        None,
+        HashMap::new(),
+    )
+    .await
 }
 
 pub async fn run_buildset_scheduled(
@@ -1071,6 +1086,7 @@ pub async fn run_buildset_scheduled(
     changed_paths: &[String],
     cancellation: CancellationToken,
     scheduler: Option<Arc<GlobalScheduler>>,
+    reusable_steps: HashMap<String, ReusableStepResult>,
 ) -> Result<BuildsetResult, RunnerError> {
     let applicable = config
         .applicable_steps(changed_paths)
@@ -1081,6 +1097,20 @@ pub async fn run_buildset_scheduled(
         .collect::<std::collections::HashSet<_>>();
     let mut results = HashMap::new();
     let mut ordered = Vec::new();
+    let mut reused = HashMap::new();
+    for step in &config.steps {
+        if let Some(reusable) = reusable_steps.get(&step.name) {
+            let name = step.name.clone();
+            if applicable_names.contains(name.as_str())
+                && reusable.result.class == StepResultClass::Success
+                && step.reuse_on_retry
+            {
+                results.insert(name.clone(), StepResultClass::Success);
+                reused.insert(name.clone(), reusable.source_attempt_id);
+                ordered.push((name, reusable.result.clone()));
+            }
+        }
+    }
     let mut skipped = config
         .steps
         .iter()
@@ -1099,7 +1129,10 @@ pub async fn run_buildset_scheduled(
             )));
         }
     }
-    let mut pending = applicable;
+    let mut pending = applicable
+        .into_iter()
+        .filter(|step| !results.contains_key(step.name.as_str()))
+        .collect::<Vec<_>>();
     while !pending.is_empty() {
         let ordinary_pending = pending.iter().any(|step| !step.final_step);
         let mut runnable = pending
@@ -1256,6 +1289,7 @@ pub async fn run_buildset_scheduled(
         skipped,
         workspace_verified,
         workspace_verification_error,
+        reused_steps: reused,
     })
 }
 
@@ -1944,6 +1978,7 @@ needs=["a","b"]
                     semaphores: BTreeMap::new(),
                 },
             ))),
+            HashMap::new(),
         )
         .await;
         assert!(matches!(result, Err(RunnerError::Canceled)));

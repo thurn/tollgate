@@ -85,6 +85,8 @@ pub struct QueueItem {
     #[serde(default)]
     pub cleanup_policy: CleanupPolicy,
     pub dependencies: Vec<QueueItemId>,
+    #[serde(default)]
+    pub retry_of_item_id: Option<QueueItemId>,
     /// Promotion authority is deliberately separate from admission to the
     /// speculative queue. Legacy persisted items default to authorized.
     #[serde(default = "default_promotion_authorized")]
@@ -198,6 +200,8 @@ pub struct BuildsetStepResult {
     pub stderr_end: u64,
     #[serde(default)]
     pub diagnostics: Vec<StepDiagnostic>,
+    #[serde(default)]
+    pub reused_from_attempt_id: Option<StepAttemptId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -226,6 +230,8 @@ pub struct FrozenStep {
     pub soft_needs: Vec<StepId>,
     pub voting: bool,
     pub final_step: bool,
+    #[serde(default)]
+    pub reuse_on_retry: bool,
     pub timeout_ns: u64,
     pub cpu_tokens: u16,
     pub memory_bytes: u64,

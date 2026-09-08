@@ -25,7 +25,7 @@ export interface SourceMetadata {
 export interface QueueItem {
   id: string; repository_id: string; kind: QueueItemKind; enqueue_sequence: number; source_oid: GitOid; source_ref: string;
   metadata: SourceMetadata; state: QueueItemState; terminal_reason?: string; remote_state: RemoteState;
-  cleanup_state: CleanupState; dependencies: string[]; promotion_authorized: boolean;
+  cleanup_state: CleanupState; dependencies: string[]; retry_of_item_id?: string; promotion_authorized: boolean;
   promotion_authorized_at?: string; promotion_authorized_by?: string; current_generation_id?: string;
   buildset_id?: string; certificate_id?: string;
 }
@@ -41,8 +41,8 @@ export interface Buildset {
   state: BuildsetState; retry_of?: string; attempt: number; created_at: string;
   started_at?: string; finished_at?: string; frozen_steps?: FrozenStep[]; step_results: BuildsetStepResult[];
 }
-export interface FrozenStep { id: string; name: string; command: { kind: "shell"; runner: string[]; script: string } | { kind: "argv"; argv: string[] }; working_directory: string; needs: string[]; soft_needs: string[]; voting: boolean; final_step: boolean; timeout_ns: number; cpu_tokens: number; memory_bytes: number; rss_limit_bytes?: number; semaphores: string[] }
-export interface BuildsetStepResult { name: string; result_class: string; exit_code?: number; signal?: number; elapsed_ms: number; log_hash: string; stdout_end: number; stderr_end: number }
+export interface FrozenStep { id: string; name: string; command: { kind: "shell"; runner: string[]; script: string } | { kind: "argv"; argv: string[] }; working_directory: string; needs: string[]; soft_needs: string[]; voting: boolean; final_step: boolean; reuse_on_retry?: boolean; timeout_ns: number; cpu_tokens: number; memory_bytes: number; rss_limit_bytes?: number; semaphores: string[] }
+export interface BuildsetStepResult { name: string; result_class: string; exit_code?: number; signal?: number; elapsed_ms: number; log_hash: string; stdout_end: number; stderr_end: number; reused_from_attempt_id?: string }
 export type FailureOrigin = "candidate-introduced" | "inherited-from-base" | "flaky-or-non-hermetic" | "origin-unknown";
 export interface StepFailureAttribution { name: string; origin: FailureOrigin; candidate_result: string; baseline_result?: string; baseline_buildset_id?: string; diagnostics: unknown[] }
 export interface FailureAttribution { origin: FailureOrigin; candidate_buildset_id: string; candidate_tested_oid: GitOid; base_oid: GitOid; configuration_digest: string; step_graph_digest: string; environment_fingerprint: string; steps: StepFailureAttribution[] }
@@ -57,7 +57,7 @@ export interface PassCertificate {
 export interface EffectiveStep {
   name: string; command: { kind: "shell"; script: string } | { kind: "argv"; argv: string[] };
   working_directory: string; needs: string[]; soft_needs: string[]; voting: boolean;
-  final_step: boolean; timeout_ns: number; cpu_tokens: number; memory_bytes: number;
+  final_step: boolean; reuse_on_retry: boolean; timeout_ns: number; cpu_tokens: number; memory_bytes: number;
   rss_limit_bytes?: number; semaphores: string[]; include: string[]; exclude: string[];
   environment: Record<string, string>; remove_environment: string[]; artifacts: unknown[];
 }

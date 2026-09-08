@@ -161,6 +161,8 @@ pub struct StepFile {
     pub voting: bool,
     #[serde(default, rename = "final")]
     pub final_step: bool,
+    #[serde(default)]
+    pub reuse_on_retry: bool,
     #[serde(default = "default_timeout")]
     pub timeout: String,
     #[serde(default)]
@@ -206,6 +208,10 @@ const fn default_true() -> bool {
 
 fn is_true(value: &bool) -> bool {
     *value
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -279,6 +285,8 @@ pub struct EffectiveStep {
     pub soft_needs: Vec<String>,
     pub voting: bool,
     pub final_step: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub reuse_on_retry: bool,
     pub timeout_ns: u64,
     pub cpu_tokens: u16,
     pub memory_bytes: u64,
@@ -632,6 +640,12 @@ fn normalize_step(step: StepFile, needs: Vec<String>) -> Result<EffectiveStep, C
             ),
         });
     }
+    if step.reuse_on_retry && (step.final_step || !artifacts.is_empty()) {
+        return Err(ConfigError::InvalidStep {
+            step: step.name.clone(),
+            message: "retry reuse requires an ordinary step with no retained artifacts".into(),
+        });
+    }
     Ok(EffectiveStep {
         name: step.name,
         command,
@@ -640,6 +654,7 @@ fn normalize_step(step: StepFile, needs: Vec<String>) -> Result<EffectiveStep, C
         soft_needs: sorted_unique(step.soft_needs)?,
         voting: step.voting,
         final_step: step.final_step,
+        reuse_on_retry: step.reuse_on_retry,
         timeout_ns,
         cpu_tokens: step.cpu_tokens,
         memory_bytes: step.memory_bytes,
@@ -1063,5 +1078,34 @@ mod tests {
     fn artifact_names_are_unique_and_retention_is_nonzero() {
         assert!(EffectiveConfig::parse("version = 1\n[[step]]\nname = \"ci\"\nrun = \"ci\"\n[[step.artifact]]\nname = \"report\"\npatterns = [\"out\"]\n[[step.artifact]]\nname = \"report\"\npatterns = [\"other\"]\n").is_err());
         assert!(EffectiveConfig::parse("version = 1\n[[step]]\nname = \"ci\"\nrun = \"ci\"\n[[step.artifact]]\nname = \"report\"\npatterns = [\"out\"]\nretention_days = 0\n").is_err());
+    }
+
+    #[test]
+    fn retry_reuse_is_explicit_and_excludes_artifacts_and_finalizers() {
+        let defaulted =
+            EffectiveConfig::parse("version = 1\n[[step]]\nname = \"ci\"\nrun = \"ci\"\n").unwrap();
+        let explicit_false = EffectiveConfig::parse(
+            "version = 1\n[[step]]\nname = \"ci\"\nrun = \"ci\"\nreuse_on_retry = false\n",
+        )
+        .unwrap();
+        assert_eq!(defaulted.digest, explicit_false.digest);
+        let ordinary = EffectiveConfig::parse(
+            "version = 1\n[[step]]\nname = \"ci\"\nrun = \"ci\"\nreuse_on_retry = true\n",
+        )
+        .unwrap();
+        assert!(ordinary.steps[0].reuse_on_retry);
+        assert_ne!(defaulted.digest, ordinary.digest);
+        assert!(
+            EffectiveConfig::parse(
+                "version = 1\n[[step]]\nname = \"ci\"\nrun = \"ci\"\nreuse_on_retry = true\nfinal = true\n"
+            )
+            .is_err()
+        );
+        assert!(
+            EffectiveConfig::parse(
+                "version = 1\n[[step]]\nname = \"ci\"\nrun = \"ci\"\nreuse_on_retry = true\n[[step.artifact]]\nname = \"report\"\npatterns = [\"out\"]\n"
+            )
+            .is_err()
+        );
     }
 }
