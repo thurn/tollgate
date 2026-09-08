@@ -14,12 +14,13 @@ if [ "$(uname -s)" != Darwin ]; then
   exit 1
 fi
 
-for command_name in cargo codesign ditto npm rustc open osascript; do
+for command_name in cargo codesign ditto git npm rustc open osascript; do
   if ! command -v "$command_name" >/dev/null 2>&1; then
     echo "Required command is unavailable: $command_name" >&2
     exit 1
   fi
 done
+authority_checkout=$(dirname -- "$(git rev-parse --path-format=absolute --git-common-dir)")
 
 if [ ! -d "$install_dir" ]; then
   echo "Install directory does not exist: $install_dir" >&2
@@ -104,7 +105,7 @@ open "$installed_app"
 
 attempts=0
 startup_timeout=120
-until [ -n "$(installed_pid)" ] && "$cli_link" --no-launch status >/dev/null 2>&1; do
+until [ -n "$(installed_pid)" ] && "$cli_link" --no-launch repo list >/dev/null 2>&1; do
   attempts=$((attempts + 1))
   if [ "$attempts" -ge "$startup_timeout" ]; then
     echo "Tollgate was installed, but it did not become healthy within $startup_timeout seconds." >&2
@@ -113,5 +114,5 @@ until [ -n "$(installed_pid)" ] && "$cli_link" --no-launch status >/dev/null 2>&
   sleep 1
 done
 
-"$cli_link" --no-launch doctor
+(cd "$authority_checkout" && "$cli_link" --no-launch doctor)
 echo "Installed and running: $installed_app"
