@@ -439,6 +439,8 @@ struct SeedPruneEvidence {
     record: SeedRecord,
     original: PathBuf,
     quarantine: PathBuf,
+    #[serde(default)]
+    missing_before_prune: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -3301,6 +3303,7 @@ impl TollgateService {
                         verify_seed_record_at(&seed.quarantine, &seed.record)?;
                     }
                     (false, true) => verify_seed_record_at(&seed.quarantine, &seed.record)?,
+                    (false, false) if seed.missing_before_prune => {}
                     _ => ambiguous = true,
                 }
             }
@@ -9491,21 +9494,39 @@ impl TollgateService {
         verify_owned_directory(&cache_root, &quarantine_root)?;
         let mut seed_evidence = Vec::new();
         for seed in &seeds {
-            let original = std::fs::canonicalize(&seed.path)?;
+            let (original, missing_before_prune) = match std::fs::canonicalize(&seed.path) {
+                Ok(original) => (original, false),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    let seed_path = Path::new(&seed.path);
+                    let parent = seed_path
+                        .parent()
+                        .ok_or_else(|| ServiceError::Invariant("seed path has no parent".into()))?;
+                    let parent = std::fs::canonicalize(parent)?;
+                    let name = seed_path.file_name().ok_or_else(|| {
+                        ServiceError::Invariant("seed path has no file name".into())
+                    })?;
+                    (parent.join(name), true)
+                }
+                Err(error) => return Err(error.into()),
+            };
             if !original.starts_with(&cache_root)
-                || std::fs::symlink_metadata(&original)?
-                    .file_type()
-                    .is_symlink()
+                || (!missing_before_prune
+                    && std::fs::symlink_metadata(&original)?
+                        .file_type()
+                        .is_symlink())
             {
                 return Err(ServiceError::Invariant(
                     "seed path failed owned-cache identity verification".into(),
                 ));
             }
-            verify_seed_record_at(&original, seed)?;
+            if !missing_before_prune {
+                verify_seed_record_at(&original, seed)?;
+            }
             seed_evidence.push(SeedPruneEvidence {
                 record: seed.clone(),
                 original,
                 quarantine: quarantine_root.join(format!("seed-{}-{}", seed.id, command_id)),
+                missing_before_prune,
             });
         }
         let slot_evidence = idle_slots
@@ -9536,8 +9557,16 @@ impl TollgateService {
                     "seed quarantine destination already exists".into(),
                 ));
             }
-            tokio::fs::rename(&seed.original, &seed.quarantine).await?;
-            verify_seed_record_at(&seed.quarantine, &seed.record)?;
+            if seed.missing_before_prune {
+                if tokio::fs::try_exists(&seed.original).await? {
+                    return Err(ServiceError::Invariant(
+                        "missing seed path appeared after prune evidence was prepared".into(),
+                    ));
+                }
+            } else {
+                tokio::fs::rename(&seed.original, &seed.quarantine).await?;
+                verify_seed_record_at(&seed.quarantine, &seed.record)?;
+            }
             pruned_ids.push(seed.record.id.clone());
             logical_bytes = logical_bytes.saturating_add(seed.record.logical_size);
         }
@@ -9605,7 +9634,9 @@ impl TollgateService {
         }
         let _ = runtime.events.send(event);
         for seed in &evidence.seeds {
-            tokio::fs::remove_dir_all(&seed.quarantine).await?;
+            if tokio::fs::try_exists(&seed.quarantine).await? {
+                remove_owned_quarantine(&cache_root, &seed.quarantine)?;
+            }
         }
         for slot in &evidence.slots {
             remove_owned_quarantine(&cache_root, &slot.quarantine)?;
@@ -16815,6 +16846,109 @@ needs = ["successful"]
                 .unwrap()
                 .state,
             "idle"
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_purge_retires_a_published_seed_whose_directory_is_missing() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        let support = temporary.path().join("support");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("base.txt"), "base\n").unwrap();
+        git(&repository, &["add", "base.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+
+        let service = TollgateService::open(support.clone()).await.unwrap();
+        let initialized = service
+            .initialize_repository(
+                &repository,
+                Some("mkdir -p target && echo cached > target/cache".into()),
+            )
+            .await
+            .unwrap();
+        std::fs::write(
+            repository.join(".tollgate/config.toml"),
+            r#"version = 1
+
+[[step]]
+name = "ci"
+run = "mkdir -p target && echo cached > target/cache"
+
+[[cache.paths]]
+path = "target"
+policy = "clone"
+"#,
+        )
+        .unwrap();
+        service
+            .apply_configuration(initialized.state.id, CommandId::new())
+            .await
+            .unwrap();
+        let check = service
+            .check_from(
+                initialized.state.id,
+                "HEAD".into(),
+                Some(repository.to_string_lossy().into_owned()),
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let details = service
+                .item_details(initialized.state.id, check.item_id)
+                .await
+                .unwrap();
+            if details.item.state == QueueItemState::CheckPassed {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        service
+            .snapshot_cache(initialized.state.id, CommandId::new())
+            .await
+            .unwrap();
+        let seed = service
+            .repository_snapshot(initialized.state.id)
+            .await
+            .unwrap()
+            .seeds
+            .into_iter()
+            .find(|seed| seed.state == "published")
+            .unwrap();
+        std::fs::remove_dir_all(&seed.path).unwrap();
+
+        let purged = service
+            .purge_cache(initialized.state.id, false, CommandId::new())
+            .await
+            .unwrap();
+        assert_eq!(purged.seed_ids, vec![seed.id.clone()]);
+        let snapshot = service
+            .repository_snapshot(initialized.state.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot
+                .seeds
+                .iter()
+                .find(|record| record.id == seed.id)
+                .unwrap()
+                .state,
+            "pruned"
+        );
+
+        drop(service);
+        let reopened = TollgateService::open(support).await.unwrap();
+        let snapshot = reopened
+            .repository_snapshot(initialized.state.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot.state.execution_state,
+            RepositoryExecutionState::Active
         );
     }
 
