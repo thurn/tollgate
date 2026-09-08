@@ -104,7 +104,7 @@ open "$installed_app"
 
 attempts=0
 startup_timeout=120
-until [ -n "$(installed_pid)" ] && "$cli_link" --no-launch doctor >/dev/null 2>&1; do
+until [ -n "$(installed_pid)" ] && "$cli_link" --no-launch status >/dev/null 2>&1; do
   attempts=$((attempts + 1))
   if [ "$attempts" -ge "$startup_timeout" ]; then
     echo "Tollgate was installed, but it did not become healthy within $startup_timeout seconds." >&2
