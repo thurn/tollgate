@@ -1,4 +1,4 @@
-use std::{path::PathBuf, process::ExitCode, time::Duration};
+use std::{collections::HashMap, path::PathBuf, process::ExitCode, time::Duration};
 
 use anyhow::{Context, anyhow};
 use clap::{Args, Parser, Subcommand};
@@ -568,6 +568,7 @@ async fn run(cli: Cli) -> anyhow::Result<u8> {
                     &mut client,
                     repository.state.id,
                     &diagnosis.replay_item_ids,
+                    cli.json,
                 )
                 .await?;
                 diagnosis = serde_json::from_value(
@@ -2023,11 +2024,14 @@ async fn wait_for_terminal_checks(
     client: &mut IpcClient,
     repository_id: RepositoryId,
     item_ids: &[QueueItemId],
+    json: bool,
 ) -> anyhow::Result<()> {
+    let mut observed = HashMap::new();
+    let mut last_update = tokio::time::Instant::now();
     loop {
         let mut complete = true;
         for item_id in item_ids {
-            let command = || IpcCommand::ItemStatus {
+            let command = || IpcCommand::ItemWaitStatus {
                 repository_id,
                 item_id: *item_id,
             };
@@ -2040,14 +2044,62 @@ async fn wait_for_terminal_checks(
                     })?
                 }
             };
-            let item: tollgate_domain::QueueItem = serde_json::from_value(value)?;
-            complete &= item.state.is_terminal();
+            let status: ItemWaitStatus = serde_json::from_value(value)?;
+            if observed.insert(*item_id, status.item.state) != Some(status.item.state) {
+                if !json {
+                    println!("  Replay check {item_id}: {}", status.item.state);
+                }
+                last_update = tokio::time::Instant::now();
+            }
+            complete &= status.item.state.is_terminal();
+            if let Some(reason) = diagnostic_replay_unavailable(&status) {
+                return Err(anyhow!(
+                    "diagnostic replay check {item_id} cannot make progress; {reason}"
+                ));
+            }
         }
         if complete {
             return Ok(());
         }
+        if !json && last_update.elapsed() >= Duration::from_secs(30) {
+            let pending = item_ids
+                .iter()
+                .filter_map(|item_id| {
+                    observed
+                        .get(item_id)
+                        .filter(|state| !state.is_terminal())
+                        .map(|state| format!("{item_id} ({state})"))
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!("  Replay checks still active: {pending}");
+            last_update = tokio::time::Instant::now();
+        }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+}
+
+fn diagnostic_replay_unavailable(status: &ItemWaitStatus) -> Option<String> {
+    if status.item.state.is_terminal()
+        || status.repository_execution_state == tollgate_domain::RepositoryExecutionState::Active
+    {
+        return None;
+    }
+    let recovery = status
+        .block_reasons
+        .iter()
+        .map(|reason| reason.recovery_action.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    Some(format!(
+        "the repository is {:?}; {}",
+        status.repository_execution_state,
+        if recovery.is_empty() {
+            "resume or repair the repository, then retry the diagnosis"
+        } else {
+            recovery.as_str()
+        }
+    ))
 }
 
 fn print_diagnosis(diagnosis: &DiagnoseResult) {
@@ -2056,8 +2108,12 @@ fn print_diagnosis(diagnosis: &DiagnoseResult) {
         return;
     };
     println!(
-        "Failure origin: {:?}\n  confidence  {}\n  executions  {} new full gate(s), {} in-flight gate(s) reused\n  queue       {}\n  candidate   {} (buildset {})\n  base        {}\n  config      {}\n  graph       {}\n  environment {}",
+        "Failure origin: {:?}\n  class       {}\n  confidence  {}\n  executions  {} new full gate(s), {} in-flight gate(s) reused\n  queue       {}\n  candidate   {} (buildset {})\n  base        {}\n  config      {}\n  graph       {}\n  environment {}",
         attribution.origin,
+        attribution
+            .failure_kind
+            .map(|kind| format!("{kind:?}"))
+            .unwrap_or_else(|| "unspecified".into()),
         match attribution.origin {
             tollgate_service::FailureOrigin::FlakyOrNonHermetic =>
                 "contradictory exact candidate results observed",
@@ -2084,10 +2140,13 @@ fn print_diagnosis(diagnosis: &DiagnoseResult) {
     );
     for step in &attribution.steps {
         println!(
-            "  {}: {:?} (candidate {}, base {}, base buildset {})",
+            "  {}: {:?} (candidate {}{}, base {}, base buildset {})",
             step.name,
             step.origin,
             step.candidate_result,
+            step.failure_kind
+                .map(|kind| format!("/{kind:?}"))
+                .unwrap_or_default(),
             step.baseline_result
                 .as_deref()
                 .unwrap_or("no comparable run"),
@@ -2529,5 +2588,23 @@ mod tests {
         assert!(value.get("attempts").is_none());
         assert!(value.get("configuration").is_none());
         assert!(value.get("resources").is_none());
+    }
+
+    #[test]
+    fn diagnostic_replay_wait_stops_when_repository_cannot_execute() {
+        let repository = repository_with_candidate("019ffe40-a60d-7722-a369-2635222d1203");
+        let mut status = ItemWaitStatus {
+            item: repository.queue[0].item.clone(),
+            repository_execution_state: tollgate_domain::RepositoryExecutionState::Paused,
+            block_reasons: Vec::new(),
+        };
+
+        assert!(
+            diagnostic_replay_unavailable(&status)
+                .unwrap()
+                .contains("resume or repair")
+        );
+        status.item.state = tollgate_domain::QueueItemState::CheckFailed;
+        assert_eq!(diagnostic_replay_unavailable(&status), None);
     }
 }

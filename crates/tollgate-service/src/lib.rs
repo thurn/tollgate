@@ -89,6 +89,8 @@ pub enum ServiceError {
     NonUtf8Path,
     #[error("repository cannot execute while it is {0:?}")]
     RepositoryUnavailable(RepositoryExecutionState),
+    #[error("diagnostic replay cannot start: {0}")]
+    DiagnosticReplayUnavailable(String),
     #[error("configuration file is missing; initialize the repository first")]
     MissingConfiguration,
     #[error("queue item {0} was not found")]
@@ -274,6 +276,8 @@ pub enum FailureOrigin {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FailureAttribution {
     pub origin: FailureOrigin,
+    #[serde(default)]
+    pub failure_kind: Option<DiagnosticFailureKind>,
     pub candidate_buildset_id: BuildsetId,
     pub candidate_tested_oid: GitOid,
     pub base_oid: GitOid,
@@ -287,6 +291,8 @@ pub struct FailureAttribution {
 pub struct StepFailureAttribution {
     pub name: String,
     pub origin: FailureOrigin,
+    #[serde(default)]
+    pub failure_kind: Option<DiagnosticFailureKind>,
     pub candidate_result: String,
     pub baseline_result: Option<String>,
     pub baseline_buildset_id: Option<BuildsetId>,
@@ -933,6 +939,7 @@ fn failure_attribution(
         steps.push(StepFailureAttribution {
             name: result.name.clone(),
             origin,
+            failure_kind: consistent_diagnostic_failure_kind(&result.diagnostics),
             candidate_result: result.result_class.clone(),
             baseline_result: baseline.map(|(_, entry)| entry.result_class.clone()),
             baseline_buildset_id: baseline.map(|(candidate, _)| candidate.id),
@@ -958,8 +965,13 @@ fn failure_attribution(
     } else {
         FailureOrigin::OriginUnknown
     };
+    let failure_kind = steps
+        .first()
+        .and_then(|step| step.failure_kind)
+        .filter(|kind| steps.iter().all(|step| step.failure_kind == Some(*kind)));
     Some(FailureAttribution {
         origin,
+        failure_kind,
         candidate_buildset_id: buildset.id,
         candidate_tested_oid: generation.tested_oid.clone(),
         base_oid: generation.expected_parent_oid.clone(),
@@ -968,6 +980,16 @@ fn failure_attribution(
         environment_fingerprint: evidence_environment,
         steps,
     })
+}
+
+fn consistent_diagnostic_failure_kind(
+    diagnostics: &[StepDiagnostic],
+) -> Option<DiagnosticFailureKind> {
+    let mut kinds = diagnostics
+        .iter()
+        .filter_map(|diagnostic| diagnostic.failure_kind);
+    let first = kinds.next()?;
+    kinds.all(|kind| kind == first).then_some(first)
 }
 
 fn queue_item_view(data: &RuntimeData, item: &QueueItem) -> QueueItemView {
@@ -4477,6 +4499,33 @@ impl TollgateService {
         Ok(view)
     }
 
+    async fn ensure_diagnostic_replay_admission(
+        &self,
+        runtime: &Arc<RepositoryRuntime>,
+    ) -> Result<(), ServiceError> {
+        let mut charged_bytes = self.storage_charged_bytes.load(Ordering::Acquire);
+        if charged_bytes == u64::MAX {
+            charged_bytes = self.storage_status().await?.charged_bytes;
+        }
+        if charged_bytes > storage::HARD_LIMIT_BYTES {
+            return Err(ServiceError::DiagnosticReplayUnavailable(format!(
+                "a cold validation slot is required, but the cache uses {charged_bytes} bytes, above the {} byte hard limit; run `tg storage status` and reclaim cache space with `tg storage prune --force`, then retry",
+                storage::HARD_LIMIT_BYTES
+            )));
+        }
+        if let Some(volume) = observe_volumes(runtime)?.into_iter().find(|volume| {
+            volume.available_bytes < volume.warning_threshold.max(storage::MINIMUM_FREE_BYTES)
+        }) {
+            return Err(ServiceError::DiagnosticReplayUnavailable(format!(
+                "a cold validation slot is required, but volume {} has {} bytes available and requires at least {} bytes; free space, run `tg storage status`, then retry",
+                volume.id,
+                volume.available_bytes,
+                volume.warning_threshold.max(storage::MINIMUM_FREE_BYTES)
+            )));
+        }
+        Ok(())
+    }
+
     /// Reclaim orphaned cache roots and excess idle validation slots.
     pub async fn prune_storage(
         self: &Arc<Self>,
@@ -5105,6 +5154,9 @@ impl TollgateService {
         }
 
         let (base_retained, candidate_probe_retained, base_in_flight, candidate_in_flight) = {
+            let dispatching = runtime.dispatching.lock().clone();
+            let cold_items = runtime.cold_items.lock().clone();
+            let cold_sources = runtime.cold_sources.lock().clone();
             let data = runtime.data.lock();
             let failed_steps = buildset
                 .step_results
@@ -5165,6 +5217,14 @@ impl TollgateService {
                     if item.id == item_id || item.state.is_terminal() {
                         return None;
                     }
+                    let actively_tracked = matches!(
+                        item.state,
+                        QueueItemState::Preparing | QueueItemState::Running
+                    ) || (item.state == QueueItemState::Queued
+                        && dispatching.contains(&item.id));
+                    if !actively_tracked {
+                        return None;
+                    }
                     let replay_generation = item
                         .current_generation_id
                         .and_then(|id| data.generations.iter().find(|entry| entry.id == id))?;
@@ -5181,7 +5241,14 @@ impl TollgateService {
                                 entry.environment_fingerprint == buildset.environment_fingerprint
                             })
                     });
-                    (inputs_match && environment_matches).then_some(item.id)
+                    let cold = cold_items.contains(&item.id)
+                        || cold_sources.contains(&item.source_oid)
+                        || item
+                            .metadata
+                            .purpose
+                            .as_deref()
+                            .is_some_and(|purpose| purpose.starts_with("diagnose:"));
+                    (inputs_match && environment_matches).then_some((item.id, item.state, cold))
                 })
             };
             (
@@ -5192,6 +5259,20 @@ impl TollgateService {
             )
         };
 
+        let needs_cold_admission =
+            |retained: bool, in_flight: &Option<(QueueItemId, QueueItemState, bool)>| {
+                !retained
+                    && in_flight.as_ref().is_none_or(|(_, state, diagnostic)| {
+                        *diagnostic
+                            && !matches!(state, QueueItemState::Preparing | QueueItemState::Running)
+                    })
+            };
+        if needs_cold_admission(base_retained, &base_in_flight)
+            || needs_cold_admission(candidate_probe_retained, &candidate_in_flight)
+        {
+            self.ensure_diagnostic_replay_admission(&runtime).await?;
+        }
+
         let mut replay_item_ids = Vec::new();
         let mut scheduled_replay_item_ids = Vec::new();
         let mut reused_replay_item_ids = Vec::new();
@@ -5200,7 +5281,7 @@ impl TollgateService {
             replay_reasons.push(
                 "base replay omitted: a matching successful base buildset is retained".into(),
             );
-        } else if let Some(existing) = base_in_flight {
+        } else if let Some((existing, _, _)) = base_in_flight {
             replay_item_ids.push(existing);
             reused_replay_item_ids.push(existing);
             replay_reasons.push(format!(
@@ -5230,7 +5311,7 @@ impl TollgateService {
             replay_reasons.push(
                 "candidate replay omitted: a matching repeat candidate result is retained".into(),
             );
-        } else if let Some(existing) = candidate_in_flight {
+        } else if let Some((existing, _, _)) = candidate_in_flight {
             replay_item_ids.push(existing);
             reused_replay_item_ids.push(existing);
             replay_reasons.push(format!(
@@ -15061,6 +15142,28 @@ mod tests {
     use std::process::Command as StdCommand;
     use tollgate_git::USER_BRANCH;
 
+    #[test]
+    fn conflicting_structured_failure_kinds_remain_unspecified() {
+        let diagnostics = [
+            StepDiagnostic {
+                code: "test.validation".into(),
+                message: "validation evidence".into(),
+                failure_kind: Some(DiagnosticFailureKind::Validation),
+                paths: Vec::new(),
+                repair: None,
+            },
+            StepDiagnostic {
+                code: "test.infrastructure".into(),
+                message: "infrastructure evidence".into(),
+                failure_kind: Some(DiagnosticFailureKind::Infrastructure),
+                paths: Vec::new(),
+                repair: None,
+            },
+        ];
+
+        assert_eq!(consistent_diagnostic_failure_kind(&diagnostics), None);
+    }
+
     #[tokio::test]
     async fn artifact_discovery_does_not_walk_unrelated_generated_trees() {
         let temporary = tempfile::tempdir().unwrap();
@@ -18770,7 +18873,7 @@ run = "test -f feature.txt"
         let service = TollgateService::open(temporary.path().join("support"))
             .await
             .unwrap();
-        let command = r#"if test -f broken; then printf '%s\n' '{"code":"generated-output-drift","message":"generated state is stale","paths":["broken"],"repair":{"kind":"argv","argv":["rm","broken"]}}' > "$TOLLGATE_DIAGNOSTICS_FILE"; sleep 1; exit 1; fi"#;
+        let command = r#"if test -f broken; then printf '%s\n' '{"code":"generated-output-drift","message":"generated state is stale","failure_kind":"validation","paths":["broken"],"repair":{"kind":"argv","argv":["rm","broken"]}}' > "$TOLLGATE_DIAGNOSTICS_FILE"; sleep 1; exit 1; fi"#;
         let initialized = service
             .initialize_repository_with_options(&repository, Some(command.into()), false)
             .await
@@ -18838,6 +18941,14 @@ run = "test -f feature.txt"
         let attribution = details.failure_attribution.unwrap();
         assert_eq!(attribution.origin, FailureOrigin::CandidateIntroduced);
         assert_eq!(
+            attribution.failure_kind,
+            Some(DiagnosticFailureKind::Validation)
+        );
+        assert_eq!(
+            attribution.steps[0].failure_kind,
+            Some(DiagnosticFailureKind::Validation)
+        );
+        assert_eq!(
             attribution.steps[0].diagnostics[0].code,
             "generated-output-drift"
         );
@@ -18887,6 +18998,72 @@ run = "test -f feature.txt"
                 .iter()
                 .any(|artifact| artifact.retained_path == repair.path)
         );
+
+        service
+            .storage_charged_bytes
+            .store(storage::HARD_LIMIT_BYTES + 1, Ordering::Release);
+        let cold_retry = service
+            .retry(
+                initialized.state.id,
+                candidate.item_id,
+                true,
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            service
+                .item_status(initialized.state.id, cold_retry.item_id)
+                .await
+                .unwrap()
+                .state,
+            QueueItemState::Queued
+        );
+        let item_count = service
+            .repository_snapshot(initialized.state.id)
+            .await
+            .unwrap()
+            .checks
+            .len();
+        let blocked = service
+            .diagnose_failure(
+                initialized.state.id,
+                candidate.item_id,
+                true,
+                false,
+                CommandId::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            blocked
+                .to_string()
+                .contains("above the 85899345920 byte hard limit")
+        );
+        assert!(blocked.to_string().contains("tg storage prune --force"));
+        assert_eq!(
+            service
+                .repository_snapshot(initialized.state.id)
+                .await
+                .unwrap()
+                .checks
+                .len(),
+            item_count,
+            "a blocked diagnostic replay must not leave a queued check"
+        );
+        service
+            .storage_charged_bytes
+            .store(storage::HARD_LIMIT_BYTES, Ordering::Release);
+        let revision = service
+            .repository_snapshot(initialized.state.id)
+            .await
+            .unwrap()
+            .state
+            .queue_revision;
+        service
+            .cancel(initialized.state.id, cold_retry.item_id, revision)
+            .await
+            .unwrap();
 
         let matrix = service
             .diagnose_failure(

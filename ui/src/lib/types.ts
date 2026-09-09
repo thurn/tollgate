@@ -44,8 +44,9 @@ export interface Buildset {
 export interface FrozenStep { id: string; name: string; command: { kind: "shell"; runner: string[]; script: string } | { kind: "argv"; argv: string[] }; working_directory: string; needs: string[]; soft_needs: string[]; voting: boolean; final_step: boolean; reuse_on_retry?: boolean; timeout_ns: number; cpu_tokens: number; memory_bytes: number; rss_limit_bytes?: number; semaphores: string[] }
 export interface BuildsetStepResult { name: string; result_class: string; exit_code?: number; signal?: number; elapsed_ms: number; log_hash: string; stdout_end: number; stderr_end: number; reused_from_attempt_id?: string }
 export type FailureOrigin = "candidate-introduced" | "inherited-from-base" | "flaky-or-non-hermetic" | "origin-unknown";
-export interface StepFailureAttribution { name: string; origin: FailureOrigin; candidate_result: string; baseline_result?: string; baseline_buildset_id?: string; diagnostics: unknown[] }
-export interface FailureAttribution { origin: FailureOrigin; candidate_buildset_id: string; candidate_tested_oid: GitOid; base_oid: GitOid; configuration_digest: string; step_graph_digest: string; environment_fingerprint: string; steps: StepFailureAttribution[] }
+export type DiagnosticFailureKind = "validation" | "infrastructure";
+export interface StepFailureAttribution { name: string; origin: FailureOrigin; failure_kind?: DiagnosticFailureKind; candidate_result: string; baseline_result?: string; baseline_buildset_id?: string; diagnostics: unknown[] }
+export interface FailureAttribution { origin: FailureOrigin; failure_kind?: DiagnosticFailureKind; candidate_buildset_id: string; candidate_tested_oid: GitOid; base_oid: GitOid; configuration_digest: string; step_graph_digest: string; environment_fingerprint: string; steps: StepFailureAttribution[] }
 export interface SuccessfulStepResult { step_id: string; attempt_id: string; log_stdout_end: number; log_stderr_end: number; log_hash: string }
 export interface PassCertificate {
   id: string; buildset_id: string; queue_item_id: string; validation_generation_id: string;

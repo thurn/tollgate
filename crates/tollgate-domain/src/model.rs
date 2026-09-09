@@ -209,9 +209,18 @@ pub struct StepDiagnostic {
     pub code: String,
     pub message: String,
     #[serde(default)]
+    pub failure_kind: Option<DiagnosticFailureKind>,
+    #[serde(default)]
     pub paths: Vec<String>,
     #[serde(default)]
     pub repair: Option<RepairCommand>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DiagnosticFailureKind {
+    Validation,
+    Infrastructure,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

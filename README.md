@@ -145,10 +145,12 @@ A step may publish structured diagnostics by writing one JSON object per line
 to the read-only `TOLLGATE_DIAGNOSTICS_FILE` environment variable:
 
 ```json
-{"code":"generated-output-drift","message":"Generated reports are stale","paths":["reports/current.csv"],"repair":{"kind":"argv","argv":["tool","generate"]}}
+{"code":"generated-output-drift","message":"Generated reports are stale","failure_kind":"validation","paths":["reports/current.csv"],"repair":{"kind":"argv","argv":["tool","generate"]}}
 ```
 
-Tollgate bounds and validates this JSONL channel; it does not infer repairs by
+The optional `failure_kind` is `validation` or `infrastructure` and remains
+separate from the base-versus-candidate origin comparison. Tollgate bounds and
+validates this JSONL channel; it does not infer repairs by
 scraping logs. `tg diagnose <candidate-id> --verify-repair` explicitly runs one
 unambiguous structured repair in a fresh clone, reruns every applicable voting
 step, and retains a binary patch only if they pass. The original source and

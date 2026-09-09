@@ -743,8 +743,8 @@ The runner exports generic read-only context such as `CI=1`, queue/check mode, r
 
 Each step also receives a read-only `TOLLGATE_DIAGNOSTICS_FILE` path outside the
 checkout. A step may write bounded JSONL records containing a stable diagnostic
-code, human message, repository-relative paths, and an optional explicit `argv`
-repair. Tollgate rejects malformed, oversized, symlinked, path-traversing, or
+code, human message, optional `validation` or `infrastructure` failure kind,
+repository-relative paths, and an optional explicit `argv` repair. Tollgate rejects malformed, oversized, symlinked, path-traversing, or
 otherwise invalid diagnostic output and never derives repair commands from log
 text. Diagnostics are sealed into the step attempt and buildset result.
 
@@ -758,7 +758,10 @@ explicit replay reuses comparable completed or in-flight work, schedules the
 exact base only when successful base evidence is missing, and adds at most one
 candidate stability probe because the original candidate failure is already
 the first observation. A changed environment fingerprint cannot be combined
-with the original evidence.
+with the original evidence. Failure kind is orthogonal to origin: when every
+failed step supplies the same structured kind, diagnosis preserves it at both
+step and summary level. A replay that requires a fresh cold slot is rejected
+before enqueue when cache or volume limits make that work inadmissible.
 
 Repair verification is explicit and never mutates retained source. Tollgate
 first reproduces the diagnosed failure in a disposable checkout, executes one

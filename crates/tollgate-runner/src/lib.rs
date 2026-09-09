@@ -420,6 +420,7 @@ fn containment_diagnostics(message: Option<String>) -> Vec<StepDiagnostic> {
         .map(|message| StepDiagnostic {
             code: "tollgate.containment-escape".into(),
             message,
+            failure_kind: Some(tollgate_domain::DiagnosticFailureKind::Infrastructure),
             paths: Vec::new(),
             repair: None,
         })
@@ -450,6 +451,7 @@ pub async fn run_step(
             result.diagnostics.push(StepDiagnostic {
                 code: "tollgate.diagnostics-invalid".into(),
                 message: error,
+                failure_kind: Some(tollgate_domain::DiagnosticFailureKind::Infrastructure),
                 paths: Vec::new(),
                 repair: None,
             });
@@ -1602,7 +1604,7 @@ printf 'restored asset\n' > tracked
 [[step]]
 name="ci"
 run='''
-printf '%s\n' '{"code":"generated-output-drift","message":"Generated report is stale","paths":["reports/current.csv"],"repair":{"kind":"argv","argv":["tool","generate"]}}' > "$TOLLGATE_DIAGNOSTICS_FILE"
+printf '%s\n' '{"code":"generated-output-drift","message":"Generated report is stale","failure_kind":"infrastructure","paths":["reports/current.csv"],"repair":{"kind":"argv","argv":["tool","generate"]}}' > "$TOLLGATE_DIAGNOSTICS_FILE"
 exit 1
 '''
 "#,
@@ -1621,6 +1623,10 @@ exit 1
         assert_eq!(result.class, StepResultClass::ExitFailure);
         assert_eq!(result.diagnostics.len(), 1);
         assert_eq!(result.diagnostics[0].code, "generated-output-drift");
+        assert_eq!(
+            result.diagnostics[0].failure_kind,
+            Some(tollgate_domain::DiagnosticFailureKind::Infrastructure)
+        );
         assert_eq!(result.diagnostics[0].paths, vec!["reports/current.csv"]);
         assert_eq!(
             result.diagnostics[0].repair,
