@@ -5,6 +5,7 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use parking_lot::Mutex;
@@ -17,7 +18,7 @@ use tollgate_domain::{
     RepositoryId, RepositoryState, StepAttemptId, StepId, ValidationGeneration,
 };
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 pub type PromotionEdge = (Vec<u8>, Vec<u8>);
 
 #[derive(Clone, Debug, Serialize)]
@@ -34,6 +35,32 @@ pub struct StepAttemptRecord {
     pub broker_sequence_end: u64,
     pub log_hash: String,
     pub log_path: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct SqliteStorageStats {
+    pub page_size: u64,
+    pub page_count: u64,
+    pub freelist_pages: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct BackupCopyStats {
+    pub page_size: u64,
+    pub pages_copied: u64,
+    pub source_freelist_pages: u64,
+    pub bytes_copied: u64,
+    pub successful_steps: u64,
+    pub contention_waits: u64,
+    pub copy_ms: u64,
+    pub integrity_check_ms: u64,
+}
+
+struct BackupStepStats {
+    pages_copied: u64,
+    successful_steps: u64,
+    contention_waits: u64,
+    copy_ms: u64,
 }
 
 #[derive(Debug, Error)]
@@ -128,7 +155,11 @@ impl RepositoryStore {
             return Ok(0);
         }
         let database_bytes = std::fs::metadata(path)?.len();
-        Ok(database_bytes.saturating_add(512 * 1024 * 1024))
+        // Keep room for both the crash-recovery backup and SQLite's VACUUM rebuild. In the
+        // worst case neither is smaller than the source database.
+        Ok(database_bytes
+            .saturating_mul(2)
+            .saturating_add(512 * 1024 * 1024))
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
@@ -863,6 +894,7 @@ impl RepositoryStore {
             "UPDATE operation_intents SET state='completed', observed_json=?2, updated_at=?3 WHERE repository_id=?1 AND command_id=?4 AND kind='artifact' AND state IN ('prepared','external-applied')",
             params![state.id.to_string(), encode(observed)?, now(), command_id.to_string()],
         )?;
+        compact_terminal_intent(&transaction, command_id)?;
         transaction.execute(
             "UPDATE volume_reservations SET active=0 WHERE intent_id IN (SELECT intent_id FROM operation_intents WHERE command_id=?1)",
             [command_id.to_string()],
@@ -874,7 +906,7 @@ impl RepositoryStore {
             actor: Actor::App,
             command_id: Some(command_id),
             kind: "artifact.published".into(),
-            payload: serde_json::to_value(records)?,
+            payload: artifact_audit_payload(records)?,
             created_at: OffsetDateTime::now_utc(),
         };
         insert_event(&transaction, &event)?;
@@ -1102,8 +1134,8 @@ impl RepositoryStore {
             .and_then(serde_json::Value::as_array)
             .map_or(0, Vec::len) as i64;
         transaction.execute(
-            "INSERT INTO cache_manifests (seed_id, hash, entry_count, manifest_json) VALUES (?1, ?2, ?3, ?4)",
-            params![seed.id, manifest_hash, entry_count, encode(&seed.manifest)?],
+            "INSERT INTO cache_manifests (seed_id, hash, entry_count) VALUES (?1, ?2, ?3)",
+            params![seed.id, manifest_hash, entry_count],
         )?;
         transaction.commit()?;
         Ok(())
@@ -1152,8 +1184,8 @@ impl RepositoryStore {
                 .and_then(serde_json::Value::as_array)
                 .map_or(0, Vec::len) as i64;
             transaction.execute(
-                "INSERT INTO cache_manifests (seed_id, hash, entry_count, manifest_json) VALUES (?1, ?2, ?3, ?4)",
-                params![seed.id, manifest_hash, entry_count, encode(&seed.manifest)?],
+                "INSERT INTO cache_manifests (seed_id, hash, entry_count) VALUES (?1, ?2, ?3)",
+                params![seed.id, manifest_hash, entry_count],
             )?;
         }
         let sequence = state.event_sequence + 1;
@@ -1167,6 +1199,7 @@ impl RepositoryStore {
             "UPDATE operation_intents SET state='completed', observed_json=?2, updated_at=?3 WHERE repository_id=?1 AND command_id=?4 AND kind='cache-snapshot' AND state IN ('prepared','external-applied')",
             params![state.id.to_string(), encode(seed)?, now(), command_id.to_string()],
         )?;
+        compact_terminal_intent(&transaction, command_id)?;
         transaction.execute(
             "UPDATE volume_reservations SET active=0 WHERE intent_id IN (SELECT intent_id FROM operation_intents WHERE command_id=?1)",
             [command_id.to_string()],
@@ -1231,18 +1264,21 @@ impl RepositoryStore {
     }
 
     pub fn mark_seed_pruned(&self, seed_id: &str) -> Result<(), StoreError> {
-        let connection = self.connection.lock();
-        let encoded: String = connection.query_row(
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let encoded: String = transaction.query_row(
             "SELECT manifest_json FROM seed_generations WHERE seed_id=?1",
             [seed_id],
             |row| row.get(0),
         )?;
         let mut seed: SeedRecord = decode(&encoded)?;
         seed.state = "pruned".into();
-        connection.execute(
+        seed.manifest = serde_json::Value::Null;
+        transaction.execute(
             "UPDATE seed_generations SET state='pruned', manifest_json=?2 WHERE seed_id=?1",
             params![seed_id, encode(&seed)?],
         )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -1271,6 +1307,7 @@ impl RepositoryStore {
                 )));
             }
             observed.state = "pruned".into();
+            observed.manifest = serde_json::Value::Null;
             transaction.execute(
                 "UPDATE seed_generations SET state='pruned', manifest_json=?2 WHERE seed_id=?1 AND state='published'",
                 params![expected.id, encode(&observed)?],
@@ -1637,7 +1674,9 @@ impl RepositoryStore {
         command_id: CommandId,
         kind: &str,
     ) -> Result<(), StoreError> {
-        let changed = self.connection.lock().execute(
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
             "UPDATE operation_intents SET observed_json=json_set(COALESCE(observed_json, '{}'), '$.cleanup', 'complete'), updated_at=?3 WHERE command_id=?1 AND kind=?2 AND state='completed'",
             params![command_id.to_string(), kind, now()],
         )?;
@@ -1645,6 +1684,14 @@ impl RepositoryStore {
             return Err(StoreError::Integrity(format!(
                 "completed {kind} cleanup did not match exactly one operation"
             )));
+        }
+        compact_terminal_intent(&transaction, command_id)?;
+        transaction.commit()?;
+        if kind == "cache-purge" {
+            // Cache cleanup can release hundreds of MiB of manifest and recovery payload pages.
+            // Reclaim them here, off the promotion path, instead of carrying them into every
+            // subsequent backup. This is crash-safe: the durable cleanup marker committed first.
+            connection.execute_batch("PRAGMA incremental_vacuum")?;
         }
         Ok(())
     }
@@ -1870,6 +1917,7 @@ impl RepositoryStore {
                 [command_id.to_string()],
             )?;
         }
+        compact_terminal_intent(&transaction, command_id)?;
         transaction.commit()?;
         Ok(())
     }
@@ -1995,20 +2043,49 @@ impl RepositoryStore {
         Ok(())
     }
 
-    pub fn backup_to(&self, destination: impl AsRef<Path>) -> Result<(), StoreError> {
+    pub fn sqlite_storage_stats(&self) -> Result<SqliteStorageStats, StoreError> {
+        let connection = self.connection.lock();
+        let page_size: i64 = connection.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+        let page_count: i64 = connection.query_row("PRAGMA page_count", [], |row| row.get(0))?;
+        let freelist_pages: i64 =
+            connection.query_row("PRAGMA freelist_count", [], |row| row.get(0))?;
+        Ok(SqliteStorageStats {
+            page_size: nonnegative_sqlite_count("page size", page_size)?,
+            page_count: nonnegative_sqlite_count("page count", page_count)?,
+            freelist_pages: nonnegative_sqlite_count("freelist page count", freelist_pages)?,
+        })
+    }
+
+    pub fn backup_to(&self, destination: impl AsRef<Path>) -> Result<BackupCopyStats, StoreError> {
+        let destination_path = destination.as_ref();
         let source = self.connection.lock();
-        let mut destination = Connection::open(destination)?;
-        let backup = rusqlite::backup::Backup::new(&source, &mut destination)?;
-        backup.run_to_completion(128, std::time::Duration::from_millis(10), None)?;
-        drop(backup);
+        let page_size: i64 = source.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+        let page_size = nonnegative_sqlite_count("page size", page_size)?;
+        let freelist_pages: i64 =
+            source.query_row("PRAGMA freelist_count", [], |row| row.get(0))?;
+        let source_freelist_pages =
+            nonnegative_sqlite_count("freelist page count", freelist_pages)?;
+        let mut destination = Connection::open(destination_path)?;
+        let copied = copy_online_backup(&source, &mut destination)?;
+        let integrity_started = Instant::now();
         let integrity: String =
             destination.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+        let integrity_check_ms = elapsed_millis(integrity_started.elapsed());
         if integrity != "ok" {
             return Err(StoreError::Integrity(format!(
                 "online backup integrity check failed: {integrity}"
             )));
         }
-        Ok(())
+        Ok(BackupCopyStats {
+            page_size,
+            pages_copied: copied.pages_copied,
+            source_freelist_pages,
+            bytes_copied: copied.pages_copied.saturating_mul(page_size),
+            successful_steps: copied.successful_steps,
+            contention_waits: copied.contention_waits,
+            copy_ms: copied.copy_ms,
+            integrity_check_ms,
+        })
     }
 
     pub fn record_backup(&self, path: &Path, hash: &str) -> Result<(), StoreError> {
@@ -2024,6 +2101,7 @@ impl RepositoryStore {
         command_id: CommandId,
         path: &Path,
         hash: &str,
+        observed: &impl Serialize,
     ) -> Result<(), StoreError> {
         let mut connection = self.connection.lock();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2033,7 +2111,7 @@ impl RepositoryStore {
         )?;
         transaction.execute(
             "UPDATE operation_intents SET state='completed', observed_json=?2, updated_at=?3 WHERE command_id=?1 AND kind='backup' AND state IN ('prepared','external-applied')",
-            params![command_id.to_string(), encode(&serde_json::json!({"path": path, "hash": hash}))?, now()],
+            params![command_id.to_string(), encode(observed)?, now()],
         )?;
         transaction.execute(
             "UPDATE volume_reservations SET active=0 WHERE intent_id IN (SELECT intent_id FROM operation_intents WHERE command_id=?1)",
@@ -2139,6 +2217,209 @@ fn activate_retained_generation(
     Ok(())
 }
 
+fn compact_terminal_intent(
+    transaction: &rusqlite::Transaction<'_>,
+    command_id: CommandId,
+) -> Result<(), StoreError> {
+    let record: Option<(String, String, String, Option<String>)> = transaction
+        .query_row(
+            "SELECT kind, state, expected_json, observed_json FROM operation_intents WHERE command_id=?1 ORDER BY created_at DESC LIMIT 1",
+            [command_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    let Some((kind, state, expected, observed)) = record else {
+        return Ok(());
+    };
+    if state != "completed" && state != "canceled" {
+        return Ok(());
+    }
+    match kind.as_str() {
+        "cache-snapshot" => {
+            if let Some(observed) = observed {
+                transaction.execute(
+                    "UPDATE operation_intents SET observed_json=?2 WHERE command_id=?1",
+                    params![command_id.to_string(), compacted_payload(&observed)?],
+                )?;
+            }
+        }
+        "cache-purge" => {
+            let cleanup_complete = state == "canceled"
+                || observed.as_ref().is_some_and(|value| {
+                    serde_json::from_str::<serde_json::Value>(value)
+                        .ok()
+                        .and_then(|value| value.get("cleanup").cloned())
+                        .is_some_and(|value| value == "complete")
+                });
+            if cleanup_complete {
+                transaction.execute(
+                    "UPDATE operation_intents SET expected_json=?2 WHERE command_id=?1",
+                    params![command_id.to_string(), compacted_payload(&expected)?],
+                )?;
+            }
+        }
+        "artifact" => {
+            transaction.execute(
+                "UPDATE operation_intents SET expected_json=?2 WHERE command_id=?1",
+                params![command_id.to_string(), compacted_payload(&expected)?],
+            )?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn compacted_payload(encoded: &str) -> Result<String, StoreError> {
+    if serde_json::from_str::<serde_json::Value>(encoded)?
+        .get("compacted")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        return Ok(encoded.to_owned());
+    }
+    encode(&serde_json::json!({
+        "compacted": true,
+        "original_bytes": encoded.len(),
+        "blake3": blake3::hash(encoded.as_bytes()).to_hex().to_string(),
+    }))
+}
+
+fn compact_all_terminal_intents(transaction: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+    let command_ids = {
+        let mut statement = transaction.prepare(
+            "SELECT command_id FROM operation_intents WHERE state IN ('completed','canceled') AND kind IN ('cache-snapshot','cache-purge','artifact')",
+        )?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    for command_id in command_ids {
+        compact_terminal_intent(
+            transaction,
+            command_id.parse().map_err(|error| {
+                StoreError::Integrity(format!("invalid operation command ID: {error}"))
+            })?,
+        )?;
+    }
+    Ok(())
+}
+
+fn compact_pruned_seed_manifests(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<(), StoreError> {
+    let seeds = {
+        let mut statement = transaction
+            .prepare("SELECT seed_id, manifest_json FROM seed_generations WHERE state='pruned'")?;
+        statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    for (seed_id, encoded) in seeds {
+        let mut seed: SeedRecord = decode(&encoded)?;
+        seed.state = "pruned".into();
+        seed.manifest = serde_json::Value::Null;
+        transaction.execute(
+            "UPDATE seed_generations SET manifest_json=?2 WHERE seed_id=?1",
+            params![seed_id, encode(&seed)?],
+        )?;
+    }
+    Ok(())
+}
+
+fn artifact_audit_payload(records: &[ArtifactRecord]) -> Result<serde_json::Value, StoreError> {
+    let encoded = serde_json::to_string(records)?;
+    let artifact_bytes = records
+        .iter()
+        .fold(0_u64, |total, record| total.saturating_add(record.size));
+    let buildset_id = records.first().map(|record| record.buildset_id.to_string());
+    Ok(serde_json::json!({
+        "compacted": true,
+        "artifact_count": records.len(),
+        "artifact_bytes": artifact_bytes,
+        "buildset_id": buildset_id,
+        "original_bytes": encoded.len(),
+        "blake3": blake3::hash(encoded.as_bytes()).to_hex().to_string(),
+    }))
+}
+
+fn compact_artifact_events(transaction: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+    let event_ids = {
+        let mut statement = transaction.prepare(
+            "SELECT event_id FROM events
+             WHERE kind='artifact.published'
+               AND COALESCE(json_extract(event_json, '$.payload.compacted'), 0) <> 1",
+        )?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    for event_id in event_ids {
+        let encoded: String = transaction.query_row(
+            "SELECT event_json FROM events WHERE event_id=?1",
+            [&event_id],
+            |row| row.get(0),
+        )?;
+        let mut event: DomainEvent = decode(&encoded)?;
+        let records: Vec<ArtifactRecord> = serde_json::from_value(event.payload)?;
+        event.payload = artifact_audit_payload(&records)?;
+        transaction.execute(
+            "UPDATE events SET event_json=?2 WHERE event_id=?1",
+            params![event_id, encode(&event)?],
+        )?;
+    }
+    Ok(())
+}
+
+fn table_has_column(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+) -> Result<bool, StoreError> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<HashSet<_>, _>>()?;
+    Ok(columns.contains(column))
+}
+
+fn copy_online_backup(
+    source: &Connection,
+    destination: &mut Connection,
+) -> Result<BackupStepStats, StoreError> {
+    let backup = rusqlite::backup::Backup::new(source, destination)?;
+    let copy_started = Instant::now();
+    let mut successful_steps = 0_u64;
+    let mut contention_waits = 0_u64;
+    // Keep bounded steps and back off for actual contention, but do not sleep after every
+    // successful step: that pause scales with database pages and dominated large backups.
+    loop {
+        match backup.step(4_096)? {
+            rusqlite::backup::StepResult::More => {
+                successful_steps = successful_steps.saturating_add(1);
+            }
+            rusqlite::backup::StepResult::Busy | rusqlite::backup::StepResult::Locked => {
+                contention_waits = contention_waits.saturating_add(1);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            rusqlite::backup::StepResult::Done => {
+                successful_steps = successful_steps.saturating_add(1);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let progress = backup.progress();
+    let pages_copied = nonnegative_sqlite_count("backup page count", progress.pagecount.into())?;
+    Ok(BackupStepStats {
+        pages_copied,
+        successful_steps,
+        contention_waits,
+        copy_ms: elapsed_millis(copy_started.elapsed()),
+    })
+}
+
 fn migrate(connection: &Connection, database_path: Option<&Path>) -> Result<(), StoreError> {
     let mut version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version > SCHEMA_VERSION {
@@ -2154,6 +2435,7 @@ fn migrate(connection: &Connection, database_path: Option<&Path>) -> Result<(), 
             |row| row.get(0),
         )?;
         if !has_legacy_schema {
+            connection.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
             connection.execute_batch(SCHEMA)?;
             connection.execute_batch("DROP INDEX IF EXISTS queue_active_source")?;
             connection.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -2179,6 +2461,8 @@ fn migrate(connection: &Connection, database_path: Option<&Path>) -> Result<(), 
     } else {
         HashSet::new()
     };
+    let cache_manifest_has_payload =
+        table_has_column(connection, "cache_manifests", "manifest_json")?;
     let transaction = connection.unchecked_transaction()?;
     if version == 1 {
         if !artifact_columns.contains("created_at") {
@@ -2197,8 +2481,33 @@ fn migrate(connection: &Connection, database_path: Option<&Path>) -> Result<(), 
             params![encode_time(migrated_at), encode_time(migrated_at + time::Duration::days(30))],
         )?;
     }
+    if cache_manifest_has_payload {
+        transaction.execute_batch(
+            "CREATE TABLE cache_manifests_v3 (
+               seed_id TEXT PRIMARY KEY REFERENCES seed_generations(seed_id),
+               hash TEXT NOT NULL,
+               entry_count INTEGER NOT NULL
+             ) STRICT;
+             INSERT INTO cache_manifests_v3 (seed_id, hash, entry_count)
+               SELECT seed_id, hash, entry_count FROM cache_manifests;
+             DROP TABLE cache_manifests;
+             ALTER TABLE cache_manifests_v3 RENAME TO cache_manifests;",
+        )?;
+    }
+    compact_pruned_seed_manifests(&transaction)?;
+    compact_all_terminal_intents(&transaction)?;
+    compact_artifact_events(&transaction)?;
     transaction.execute_batch(SCHEMA)?;
     transaction.execute_batch("DROP INDEX IF EXISTS queue_active_source")?;
+    transaction.commit()?;
+
+    // Converting to incremental auto-vacuum plus this one-time rebuild releases the historical
+    // duplicate payload pages immediately. user_version is intentionally advanced afterward so
+    // an interrupted VACUUM retries this idempotent migration on the next open.
+    connection.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
+    connection.execute_batch("VACUUM")?;
+
+    let transaction = connection.unchecked_transaction()?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     if let Some((path, hash)) = backup {
         transaction.execute(
@@ -2235,9 +2544,7 @@ fn create_migration_backup(
     let temporary = root.join(format!(".migration-v{schema_version}-{token}.sqlite3.tmp"));
     let destination = root.join(format!("migration-v{schema_version}-{token}.sqlite3"));
     let mut output = Connection::open(&temporary)?;
-    let backup = rusqlite::backup::Backup::new(source, &mut output)?;
-    backup.run_to_completion(128, std::time::Duration::from_millis(10), None)?;
-    drop(backup);
+    copy_online_backup(source, &mut output)?;
     let integrity: String = output.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
     if integrity != "ok" {
         return Err(StoreError::Integrity(format!(
@@ -2286,6 +2593,13 @@ fn decode<T: DeserializeOwned>(value: &str) -> Result<T, StoreError> {
 }
 fn enum_json(value: &impl Serialize) -> Result<String, StoreError> {
     encode(value).map(|value| value.trim_matches('"').to_owned())
+}
+fn nonnegative_sqlite_count(name: &str, value: i64) -> Result<u64, StoreError> {
+    u64::try_from(value)
+        .map_err(|_| StoreError::Integrity(format!("negative SQLite {name}: {value}")))
+}
+fn elapsed_millis(elapsed: Duration) -> u64 {
+    u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
 }
 fn now() -> String {
     OffsetDateTime::now_utc().unix_timestamp_nanos().to_string()
@@ -2344,7 +2658,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS unfinished_promotion ON operation_intents(repo
 CREATE UNIQUE INDEX IF NOT EXISTS unfinished_push ON operation_intents(repository_id) WHERE kind='push' AND state IN ('prepared','external-applied');
 CREATE TABLE IF NOT EXISTS slots (slot_id TEXT PRIMARY KEY, repository_id TEXT NOT NULL REFERENCES repository_state(repository_id), ownership_path TEXT NOT NULL, state TEXT NOT NULL, metadata_json TEXT NOT NULL) STRICT;
 CREATE TABLE IF NOT EXISTS seed_generations (seed_id TEXT PRIMARY KEY, repository_id TEXT NOT NULL REFERENCES repository_state(repository_id), profile TEXT NOT NULL, generation INTEGER NOT NULL, ownership_path TEXT NOT NULL, logical_size INTEGER NOT NULL, state TEXT NOT NULL, manifest_json TEXT NOT NULL, UNIQUE(repository_id,profile,generation)) STRICT;
-CREATE TABLE IF NOT EXISTS cache_manifests (seed_id TEXT PRIMARY KEY REFERENCES seed_generations(seed_id), hash TEXT NOT NULL, entry_count INTEGER NOT NULL, manifest_json TEXT NOT NULL) STRICT;
+CREATE TABLE IF NOT EXISTS cache_manifests (seed_id TEXT PRIMARY KEY REFERENCES seed_generations(seed_id), hash TEXT NOT NULL, entry_count INTEGER NOT NULL) STRICT;
 CREATE TABLE IF NOT EXISTS artifacts (artifact_id TEXT PRIMARY KEY, buildset_id TEXT NOT NULL REFERENCES buildsets(buildset_id), step_id TEXT REFERENCES steps(step_id), source_path TEXT NOT NULL, retained_path TEXT NOT NULL, hash TEXT NOT NULL, size INTEGER NOT NULL, retention_state TEXT NOT NULL CHECK(retention_state IN ('retained','pinned','pruned')), created_at TEXT NOT NULL, expires_at TEXT NOT NULL) STRICT;
 CREATE UNIQUE INDEX IF NOT EXISTS artifact_buildset_path ON artifacts(buildset_id,retained_path);
 CREATE TABLE IF NOT EXISTS log_streams (stream_id TEXT PRIMARY KEY, attempt_id TEXT NOT NULL REFERENCES step_attempts(attempt_id), stream TEXT NOT NULL CHECK(stream IN ('stdout','stderr')), retained_start INTEGER NOT NULL DEFAULT 0, retained_end INTEGER NOT NULL DEFAULT 0, sealed_hash TEXT, state TEXT NOT NULL) STRICT;
@@ -2371,6 +2685,26 @@ mod tests {
         GitOid::new(ObjectFormat::Sha1, vec![value; 20]).unwrap()
     }
 
+    fn test_state(name: &str) -> RepositoryState {
+        RepositoryState {
+            id: RepositoryId::new(),
+            name: name.into(),
+            path: format!("/{name}"),
+            integration_ref: "refs/heads/release".into(),
+            master_oid: oid(1),
+            queue_revision: 0,
+            event_sequence: 0,
+            engine_epoch: 1,
+            execution_state: RepositoryExecutionState::Active,
+            block_reasons: Vec::new(),
+            active_configuration_digest: "digest".into(),
+            active_window: 20,
+            active_window_floor: 3,
+            active_window_ceiling: 20,
+            remote_enabled: false,
+        }
+    }
+
     #[test]
     fn initializes_and_reads_repository_state() {
         let store = RepositoryStore::open_in_memory().unwrap();
@@ -2394,6 +2728,57 @@ mod tests {
         store.initialize_repository(&state).unwrap();
         assert_eq!(store.repository_state().unwrap(), state);
         store.quick_integrity_check().unwrap();
+    }
+
+    #[test]
+    fn online_backup_is_standalone_consistent_and_reports_copied_pages() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source_path = temporary.path().join("state.sqlite3");
+        let backup_path = temporary.path().join("backup.sqlite3");
+        let store = RepositoryStore::open(&source_path).unwrap();
+        let mut state = RepositoryState {
+            id: RepositoryId::new(),
+            name: "backup-test".into(),
+            path: "/backup-test".into(),
+            integration_ref: "refs/heads/release".into(),
+            master_oid: oid(1),
+            queue_revision: 0,
+            event_sequence: 0,
+            engine_epoch: 1,
+            execution_state: RepositoryExecutionState::Active,
+            block_reasons: Vec::new(),
+            active_configuration_digest: "digest".into(),
+            active_window: 20,
+            active_window_floor: 3,
+            active_window_ceiling: 20,
+            remote_enabled: false,
+        };
+        store.initialize_repository(&state).unwrap();
+        store
+            .connection
+            .lock()
+            .execute_batch(
+                "CREATE TABLE backup_payload (payload BLOB NOT NULL) STRICT;
+                 INSERT INTO backup_payload VALUES (zeroblob(33554432));",
+            )
+            .unwrap();
+        let source_stats = store.sqlite_storage_stats().unwrap();
+        assert!(source_stats.page_count > 4_096);
+
+        let copied = store.backup_to(&backup_path).unwrap();
+        assert_eq!(copied.page_size, source_stats.page_size);
+        assert_eq!(copied.pages_copied, source_stats.page_count);
+        assert_eq!(copied.bytes_copied, copied.pages_copied * copied.page_size);
+        assert!(copied.successful_steps > 1);
+        assert_eq!(copied.contention_waits, 0);
+
+        state.queue_revision = 1;
+        store.update_repository_state(&state).unwrap();
+        drop(store);
+        std::fs::remove_file(&source_path).unwrap();
+        let restored = RepositoryStore::open(&backup_path).unwrap();
+        restored.quick_integrity_check().unwrap();
+        assert_eq!(restored.repository_state().unwrap().queue_revision, 0);
     }
 
     #[test]
@@ -2482,6 +2867,221 @@ mod tests {
             .query_row("PRAGMA integrity_check", [], |row| row.get(0))
             .unwrap();
         assert_eq!(integrity, "ok");
+    }
+
+    #[test]
+    fn v3_migration_compacts_disposable_payloads_without_removing_audit_rows() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("state.sqlite3");
+        let store = RepositoryStore::open(&path).unwrap();
+        let state = test_state("v3-compaction");
+        store.initialize_repository(&state).unwrap();
+        let seed = SeedRecord {
+            id: "seed-pruned".into(),
+            repository_id: state.id,
+            profile: "default".into(),
+            generation: 1,
+            path: "/cache/seed-pruned".into(),
+            logical_size: 1,
+            state: "pruned".into(),
+            manifest: serde_json::json!({"entries": ["x".repeat(2 * 1024 * 1024)]}),
+        };
+        store.record_seed(&seed).unwrap();
+        let artifact = ArtifactRecord {
+            artifact_id: "artifact-audit".into(),
+            buildset_id: tollgate_domain::BuildsetId::new(),
+            source_path: "report.json".into(),
+            retained_path: "z".repeat(2 * 1024 * 1024),
+            hash: "artifact-hash".into(),
+            size: 42,
+            retention_state: "pruned".into(),
+            created_at: OffsetDateTime::now_utc(),
+            expires_at: OffsetDateTime::now_utc(),
+        };
+        {
+            let mut connection = store.connection.lock();
+            let transaction = connection.transaction().unwrap();
+            insert_event(
+                &transaction,
+                &DomainEvent {
+                    id: EventId::new(),
+                    repository_id: state.id,
+                    sequence: 1,
+                    actor: Actor::App,
+                    command_id: Some(CommandId::new()),
+                    kind: "artifact.published".into(),
+                    payload: serde_json::to_value([artifact]).unwrap(),
+                    created_at: OffsetDateTime::now_utc(),
+                },
+            )
+            .unwrap();
+            transaction.commit().unwrap();
+        }
+        drop(store);
+
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "ALTER TABLE cache_manifests
+                   ADD COLUMN manifest_json TEXT NOT NULL DEFAULT '{}';",
+            )
+            .unwrap();
+        let encoded_seed = encode(&seed).unwrap();
+        connection
+            .execute(
+                "UPDATE cache_manifests SET manifest_json=?1 WHERE seed_id=?2",
+                params![encode(&seed.manifest).unwrap(), seed.id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE seed_generations SET manifest_json=?1 WHERE seed_id=?2",
+                params![encoded_seed, seed.id],
+            )
+            .unwrap();
+        let large = encode(&serde_json::json!({
+            "entries": ["y".repeat(2 * 1024 * 1024)]
+        }))
+        .unwrap();
+        let cases = [
+            ("cache-snapshot", "completed", "{}", Some(large.as_str())),
+            ("artifact", "canceled", large.as_str(), None),
+            (
+                "cache-purge",
+                "completed",
+                large.as_str(),
+                Some(r#"{"cleanup":"complete"}"#),
+            ),
+        ];
+        for (kind, intent_state, expected, observed) in cases {
+            connection
+                .execute(
+                    "INSERT INTO operation_intents
+                     (intent_id, repository_id, kind, state, command_id, expected_json,
+                      observed_json, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
+                    params![
+                        uuid::Uuid::now_v7().to_string(),
+                        state.id.to_string(),
+                        kind,
+                        intent_state,
+                        CommandId::new().to_string(),
+                        expected,
+                        observed,
+                        now(),
+                    ],
+                )
+                .unwrap();
+        }
+        connection.pragma_update(None, "user_version", 2).unwrap();
+        connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+        drop(connection);
+        let bytes_before = std::fs::metadata(&path).unwrap().len();
+
+        let store = RepositoryStore::open(&path).unwrap();
+        store.quick_integrity_check().unwrap();
+        let seeds = store.seed_records(state.id).unwrap();
+        assert_eq!(seeds.len(), 1);
+        assert_eq!(seeds[0].state, "pruned");
+        assert_eq!(seeds[0].manifest, serde_json::Value::Null);
+        drop(store);
+
+        let connection = Connection::open(&path).unwrap();
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        assert_eq!(
+            connection
+                .query_row("PRAGMA auto_vacuum", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert!(!table_has_column(&connection, "cache_manifests", "manifest_json").unwrap());
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM operation_intents", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM operation_intents
+                     WHERE json_extract(expected_json, '$.compacted')=1
+                        OR json_extract(observed_json, '$.compacted')=1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            3
+        );
+        let artifact_event: String = connection
+            .query_row(
+                "SELECT event_json FROM events WHERE kind='artifact.published'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let artifact_event: DomainEvent = decode(&artifact_event).unwrap();
+        assert_eq!(artifact_event.payload["compacted"], true);
+        assert_eq!(artifact_event.payload["artifact_count"], 1);
+        assert_eq!(artifact_event.payload["artifact_bytes"], 42);
+        let bytes_after = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            bytes_after < bytes_before / 2,
+            "{bytes_before} -> {bytes_after}"
+        );
+    }
+
+    #[test]
+    fn cache_purge_recovery_payload_survives_until_cleanup_is_durable() {
+        let store = RepositoryStore::open_in_memory().unwrap();
+        let state = test_state("cache-purge-recovery");
+        store.initialize_repository(&state).unwrap();
+        let command_id = CommandId::new();
+        let expected = serde_json::json!({"quarantine_paths": ["/cache/quarantine"]});
+        store
+            .prepare_operation(state.id, "cache-purge", command_id, &expected)
+            .unwrap();
+        store
+            .set_intent_state(
+                command_id,
+                IntentState::Completed,
+                &serde_json::json!({"seed_count": 1}),
+            )
+            .unwrap();
+
+        let unsettled = store
+            .unsettled_completed_operation_evidence("cache-purge")
+            .unwrap();
+        assert_eq!(unsettled, vec![(command_id, expected.clone())]);
+
+        store
+            .mark_completed_operation_cleanup(command_id, "cache-purge")
+            .unwrap();
+        assert!(
+            store
+                .unsettled_completed_operation_evidence("cache-purge")
+                .unwrap()
+                .is_empty()
+        );
+        let records = store.completed_operation_records("cache-purge").unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].0["compacted"], true);
+        assert_eq!(
+            records[0].0["blake3"],
+            blake3::hash(encode(&expected).unwrap().as_bytes())
+                .to_hex()
+                .to_string()
+        );
+        assert_eq!(records[0].1["cleanup"], "complete");
     }
 
     #[test]

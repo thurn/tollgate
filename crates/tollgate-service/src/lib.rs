@@ -9,6 +9,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
+    time::Instant,
 };
 
 use directories::ProjectDirs;
@@ -38,7 +39,8 @@ use tollgate_scheduler::{
     DispatchRequest, GlobalScheduler, PriorityClass, ResourceCapacity, SchedulerError,
 };
 use tollgate_store::{
-    ArtifactRecord, IntentState, RepositoryStore, SeedRecord, StepAttemptRecord, StoreError,
+    ArtifactRecord, BackupCopyStats, IntentState, RepositoryStore, SeedRecord, StepAttemptRecord,
+    StoreError,
 };
 
 #[derive(Debug, Error)]
@@ -464,6 +466,26 @@ struct BackupEvidence {
     temporary: PathBuf,
     destination: PathBuf,
     allowance: u64,
+    #[serde(default)]
+    pre_admission_database_bytes: u64,
+    #[serde(default)]
+    pre_admission_wal_bytes: u64,
+    #[serde(default)]
+    pre_admission_page_size: u64,
+    #[serde(default)]
+    pre_admission_page_count: u64,
+    #[serde(default)]
+    pre_admission_freelist_pages: u64,
+    #[serde(default)]
+    retained_backup_count_before: u64,
+    #[serde(default)]
+    retained_backup_bytes_before: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+struct BackupInventory {
+    count: u64,
+    bytes: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -3241,9 +3263,16 @@ impl TollgateService {
                     ));
                 }
                 let hash = RepositoryStore::verified_backup_hash(&evidence.destination)?;
-                runtime
-                    .store
-                    .complete_backup(command_id, &evidence.destination, &hash)?;
+                runtime.store.complete_backup(
+                    command_id,
+                    &evidence.destination,
+                    &hash,
+                    &serde_json::json!({
+                        "path": evidence.destination,
+                        "hash": hash,
+                        "recovery": "published-backup-verified",
+                    }),
+                )?;
                 if temporary_exists {
                     let metadata = std::fs::symlink_metadata(&evidence.temporary)?;
                     if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -13893,6 +13922,7 @@ async fn create_verified_backup(
     service: &TollgateService,
     runtime: &RepositoryRuntime,
 ) -> Result<(), ServiceError> {
+    let backup_started = Instant::now();
     let root = runtime.git.common_dir.join("tollgate/backups");
     std::fs::create_dir_all(&root)?;
     if std::fs::symlink_metadata(&root)?.file_type().is_symlink() {
@@ -13900,10 +13930,17 @@ async fn create_verified_backup(
             "repository backup root was replaced by a symlink".into(),
         ));
     }
-    let database_size =
-        std::fs::metadata(runtime.git.common_dir.join("tollgate/state.sqlite3"))?.len();
+    let database = runtime.git.common_dir.join("tollgate/state.sqlite3");
+    let database_size = std::fs::metadata(&database)?.len();
+    let wal_size = optional_file_len(&sqlite_sidecar_path(&database, "-wal"))?;
+    let sqlite = runtime.store.sqlite_storage_stats()?;
+    let retained_before = backup_inventory(&root)?;
     let emergency_allowance = runtime.data.lock().config.resources.volume_emergency_bytes;
-    let allowance = database_size.saturating_add(emergency_allowance);
+    let allowance = sqlite
+        .page_count
+        .saturating_mul(sqlite.page_size)
+        .max(database_size)
+        .saturating_add(emergency_allowance);
     let identity = format!(
         "{}-{}",
         OffsetDateTime::now_utc().unix_timestamp(),
@@ -13917,6 +13954,13 @@ async fn create_verified_backup(
         temporary: temporary.clone(),
         destination: destination.clone(),
         allowance,
+        pre_admission_database_bytes: database_size,
+        pre_admission_wal_bytes: wal_size,
+        pre_admission_page_size: sqlite.page_size,
+        pre_admission_page_count: sqlite.page_count,
+        pre_admission_freelist_pages: sqlite.freelist_pages,
+        retained_backup_count_before: retained_before.count,
+        retained_backup_bytes_before: retained_before.bytes,
     };
     runtime
         .store
@@ -13932,15 +13976,22 @@ async fn create_verified_backup(
         )?;
         return Err(error);
     }
-    let publication = (|| -> Result<String, ServiceError> {
-        runtime.store.backup_to(&temporary)?;
+    let database_size_before_copy = std::fs::metadata(&database)?.len();
+    let wal_size_before_copy = optional_file_len(&sqlite_sidecar_path(&database, "-wal"))?;
+    let publication = (|| -> Result<(String, BackupCopyStats, u64, u64), ServiceError> {
+        let copy = runtime.store.backup_to(&temporary)?;
+        let sync_started = Instant::now();
         std::fs::File::open(&temporary)?.sync_all()?;
         std::fs::rename(&temporary, &destination)?;
         sync_directory(&root)?;
-        Ok(RepositoryStore::verified_backup_hash(&destination)?)
+        let sync_ms = elapsed_millis(sync_started);
+        let hash_started = Instant::now();
+        let hash = RepositoryStore::verified_backup_hash(&destination)?;
+        let hash_ms = elapsed_millis(hash_started);
+        Ok((hash, copy, sync_ms, hash_ms))
     })();
-    let hash = match publication {
-        Ok(hash) => hash,
+    let (hash, copy, sync_ms, hash_ms) = match publication {
+        Ok(publication) => publication,
         Err(error) => {
             let destination_exists = destination.exists();
             if temporary.exists()
@@ -13961,10 +14012,68 @@ async fn create_verified_backup(
             return Err(error);
         }
     };
-    runtime
-        .store
-        .complete_backup(command_id, &destination, &hash)?;
-    let mut backups = std::fs::read_dir(&root)?
+    let cleanup_started = Instant::now();
+    let mut backups = backup_database_files(&root)?
+        .into_iter()
+        .map(|path| {
+            let modified = std::fs::metadata(&path)?.modified()?;
+            Ok::<_, std::io::Error>((modified, path))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    backups.sort_by(|left, right| left.cmp(right));
+    let remove_count = backups.len().saturating_sub(5);
+    let mut removed_count = 0_u64;
+    let mut removed_bytes = 0_u64;
+    for (_, old) in backups.into_iter().take(remove_count) {
+        if old.parent() == Some(root.as_path()) {
+            removed_bytes = removed_bytes.saturating_add(std::fs::metadata(&old)?.len());
+            std::fs::remove_file(&old)?;
+            removed_count = removed_count.saturating_add(1);
+            remove_backup_sidecar(&root, sqlite_sidecar_path(&old, "-wal"))?;
+            remove_backup_sidecar(&root, sqlite_sidecar_path(&old, "-shm"))?;
+        }
+    }
+    sync_directory(&root)?;
+    let cleanup_ms = elapsed_millis(cleanup_started);
+    let retained_after = backup_inventory(&root)?;
+    let destination_bytes = std::fs::metadata(&destination)?.len();
+    runtime.store.complete_backup(
+        command_id,
+        &destination,
+        &hash,
+        &serde_json::json!({
+            "path": destination,
+            "hash": hash,
+            "method": "sqlite-online-backup",
+            "source_database_bytes_before_copy": database_size_before_copy,
+            "source_wal_bytes_before_copy": wal_size_before_copy,
+            "source_page_size": copy.page_size,
+            "source_page_count": copy.pages_copied,
+            "source_freelist_pages": copy.source_freelist_pages,
+            "pages_copied": copy.pages_copied,
+            "bytes_copied": copy.bytes_copied,
+            "successful_copy_steps": copy.successful_steps,
+            "contention_waits": copy.contention_waits,
+            "destination_bytes": destination_bytes,
+            "copy_ms": copy.copy_ms,
+            "integrity_check_ms": copy.integrity_check_ms,
+            "sync_ms": sync_ms,
+            "hash_ms": hash_ms,
+            "cleanup_ms": cleanup_ms,
+            "removed_backup_count": removed_count,
+            "removed_backup_bytes": removed_bytes,
+            "retained_backup_count_before": retained_before.count,
+            "retained_backup_bytes_before": retained_before.bytes,
+            "retained_backup_count_after": retained_after.count,
+            "retained_backup_bytes_after": retained_after.bytes,
+            "total_ms": elapsed_millis(backup_started),
+        }),
+    )?;
+    Ok(())
+}
+
+fn backup_database_files(root: &Path) -> Result<Vec<PathBuf>, ServiceError> {
+    Ok(std::fs::read_dir(root)?
         .filter_map(Result::ok)
         .filter(|entry| {
             entry
@@ -13973,16 +14082,49 @@ async fn create_verified_backup(
                 && entry.path().extension().and_then(|value| value.to_str()) == Some("sqlite3")
         })
         .map(|entry| entry.path())
-        .collect::<Vec<_>>();
-    backups.sort();
-    let remove_count = backups.len().saturating_sub(5);
-    for old in backups.into_iter().take(remove_count) {
-        if old.parent() == Some(root.as_path()) {
-            std::fs::remove_file(old)?;
-        }
+        .collect())
+}
+
+fn backup_inventory(root: &Path) -> Result<BackupInventory, ServiceError> {
+    backup_database_files(root)?.into_iter().try_fold(
+        BackupInventory::default(),
+        |mut inventory, file| {
+            inventory.count = inventory.count.saturating_add(1);
+            inventory.bytes = inventory
+                .bytes
+                .saturating_add(std::fs::metadata(file)?.len());
+            Ok(inventory)
+        },
+    )
+}
+
+fn sqlite_sidecar_path(database: &Path, suffix: &str) -> PathBuf {
+    let mut sidecar = database.as_os_str().to_os_string();
+    sidecar.push(suffix);
+    PathBuf::from(sidecar)
+}
+
+fn optional_file_len(file: &Path) -> Result<u64, std::io::Error> {
+    match std::fs::metadata(file) {
+        Ok(metadata) => Ok(metadata.len()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(error) => Err(error),
     }
-    sync_directory(&root)?;
+}
+
+fn remove_backup_sidecar(root: &Path, sidecar: PathBuf) -> Result<(), ServiceError> {
+    if sidecar.parent() != Some(root) || !sidecar.exists() {
+        return Ok(());
+    }
+    let metadata = std::fs::symlink_metadata(&sidecar)?;
+    if metadata.is_file() && !metadata.file_type().is_symlink() {
+        std::fs::remove_file(sidecar)?;
+    }
     Ok(())
+}
+
+fn elapsed_millis(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 fn toml_string(value: &str) -> String {
@@ -14982,6 +15124,146 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn verified_backup_is_recoverable_and_records_copy_and_retention_telemetry() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("base.txt"), "base\n").unwrap();
+        git(&repository, &["add", "base.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+        let service = TollgateService::open(temporary.path().join("support"))
+            .await
+            .unwrap();
+        let initialized = service
+            .initialize_repository_with_options(&repository, Some("true".into()), false)
+            .await
+            .unwrap();
+        let runtime = service.runtime(initialized.state.id).await.unwrap();
+        let backup_root = runtime.git.common_dir.join("tollgate/backups");
+        std::fs::create_dir_all(&backup_root).unwrap();
+        for index in 0..5 {
+            let old = if index == 0 {
+                backup_root.join("migration-v2-old.sqlite3")
+            } else {
+                backup_root.join(format!("000000000{index}-old.sqlite3"))
+            };
+            std::fs::write(&old, format!("old-{index}")).unwrap();
+            if index == 0 {
+                std::fs::write(sqlite_sidecar_path(&old, "-shm"), "sidecar").unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+
+        create_verified_backup(&service, &runtime).await.unwrap();
+
+        let records = runtime.store.completed_operation_records("backup").unwrap();
+        let (expected, observed) = records.last().unwrap();
+        assert_eq!(expected["retained_backup_count_before"], 5);
+        assert!(expected["pre_admission_page_count"].as_u64().unwrap() > 0);
+        assert_eq!(observed["method"], "sqlite-online-backup");
+        assert!(observed["pages_copied"].as_u64().unwrap() > 0);
+        assert!(observed["bytes_copied"].as_u64().unwrap() > 0);
+        assert_eq!(observed["retained_backup_count_after"], 5);
+        assert_eq!(observed["removed_backup_count"], 1);
+        let oldest = backup_root.join("migration-v2-old.sqlite3");
+        assert!(!oldest.exists());
+        assert!(!sqlite_sidecar_path(&oldest, "-shm").exists());
+
+        let destination = PathBuf::from(observed["path"].as_str().unwrap());
+        let restored = RepositoryStore::open(destination).unwrap();
+        restored.quick_integrity_check().unwrap();
+        assert_eq!(
+            restored.repository_state().unwrap().id,
+            initialized.state.id
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_completes_a_published_backup_intent_and_releases_its_reservation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        let support = temporary.path().join("support");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("base.txt"), "base\n").unwrap();
+        git(&repository, &["add", "base.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+        let service = TollgateService::open(support.clone()).await.unwrap();
+        let initialized = service
+            .initialize_repository_with_options(&repository, Some("true".into()), false)
+            .await
+            .unwrap();
+        let runtime = service.runtime(initialized.state.id).await.unwrap();
+        let root = runtime.git.common_dir.join("tollgate/backups");
+        std::fs::create_dir_all(&root).unwrap();
+        let command_id = CommandId::new();
+        let temporary_backup = root.join(".interrupted.sqlite3.tmp");
+        let destination = root.join("interrupted.sqlite3");
+        let evidence = BackupEvidence {
+            repository_id: initialized.state.id,
+            temporary: temporary_backup.clone(),
+            destination: destination.clone(),
+            allowance: 1,
+            pre_admission_database_bytes: 0,
+            pre_admission_wal_bytes: 0,
+            pre_admission_page_size: 0,
+            pre_admission_page_count: 0,
+            pre_admission_freelist_pages: 0,
+            retained_backup_count_before: 0,
+            retained_backup_bytes_before: 0,
+        };
+        runtime
+            .store
+            .prepare_operation(initialized.state.id, "backup", command_id, &evidence)
+            .unwrap();
+        service
+            .reserve_runtime_volume(&runtime, command_id, &runtime.git.common_dir, 1)
+            .await
+            .unwrap();
+        let volume = nix::sys::statvfs::statvfs(&runtime.git.common_dir).unwrap();
+        let volume_id = format!("fs-{:x}", volume.filesystem_id());
+        assert_eq!(
+            runtime.store.active_volume_reservation(&volume_id).unwrap(),
+            1
+        );
+        runtime.store.backup_to(&temporary_backup).unwrap();
+        std::fs::File::open(&temporary_backup)
+            .unwrap()
+            .sync_all()
+            .unwrap();
+        std::fs::rename(&temporary_backup, &destination).unwrap();
+        sync_directory(&root).unwrap();
+        drop(runtime);
+        drop(service);
+
+        let reopened = TollgateService::open(support).await.unwrap();
+        let runtime = reopened.runtime(initialized.state.id).await.unwrap();
+        assert!(
+            runtime
+                .store
+                .unfinished_operations(&["backup"])
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            runtime.store.active_volume_reservation(&volume_id).unwrap(),
+            0
+        );
+        let records = runtime.store.completed_operation_records("backup").unwrap();
+        assert_eq!(
+            records.last().unwrap().1["recovery"],
+            "published-backup-verified"
+        );
+        let restored = RepositoryStore::open(destination).unwrap();
+        restored.quick_integrity_check().unwrap();
+        assert_eq!(
+            restored.repository_state().unwrap().id,
+            initialized.state.id
+        );
+    }
+
+    #[tokio::test]
     async fn authorized_queued_candidate_reuses_healthy_idle_slot_above_cache_hard_limit() {
         let temporary = tempfile::tempdir().unwrap();
         let repository = temporary.path().join("repository");
@@ -15925,6 +16207,17 @@ mod tests {
             assert!(tokio::time::Instant::now() < deadline);
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
+        let backup_observed = loop {
+            let runtime = service.runtime(initialized.state.id).await.unwrap();
+            let records = runtime.store.completed_operation_records("backup").unwrap();
+            if let Some((_, observed)) = records.last() {
+                break observed.clone();
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        };
+        assert_eq!(backup_observed["method"], "sqlite-online-backup");
+        assert!(backup_observed["pages_copied"].as_u64().unwrap() > 0);
         assert!(feature.exists());
         assert_eq!(git(&feature, &["rev-parse", "HEAD"]), source);
         assert_eq!(
