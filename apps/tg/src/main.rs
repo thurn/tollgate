@@ -14,6 +14,7 @@ use tollgate_ipc::{
 };
 use tollgate_service::{
     AppSnapshot, ArtifactPage, DiagnoseResult, ItemWaitStatus, QueueItemView, RepositorySnapshot,
+    UnavailableRepository,
 };
 use uuid::Uuid;
 
@@ -1730,14 +1731,21 @@ async fn select_repository(
 ) -> anyhow::Result<RepositorySnapshot> {
     let snapshot = client.snapshot().await?;
     if let Some(id) = selected {
-        return snapshot
+        if let Some(repository) = snapshot
             .repositories
             .into_iter()
             .find(|repository| repository.state.id == id)
-            .ok_or_else(|| anyhow!("repository {id} is not registered"));
-    }
-    if snapshot.repositories.len() == 1 {
-        return Ok(snapshot.repositories.into_iter().next().unwrap());
+        {
+            return Ok(repository);
+        }
+        if let Some(repository) = snapshot
+            .unavailable_repositories
+            .iter()
+            .find(|repository| repository.id == id)
+        {
+            return Err(unavailable_repository_error(repository));
+        }
+        return Err(anyhow!("repository {id} is not registered"));
     }
     let current = std::env::current_dir()
         .ok()
@@ -1749,10 +1757,40 @@ async fn select_repository(
     }) {
         return Ok(repository.clone());
     }
+    if let Some(repository) = snapshot.unavailable_repositories.iter().find(|repository| {
+        current
+            .as_ref()
+            .is_some_and(|cwd| cwd.starts_with(&repository.path))
+    }) {
+        return Err(unavailable_repository_error(repository));
+    }
+    if snapshot.repositories.len() == 1 {
+        return Ok(snapshot.repositories.into_iter().next().unwrap());
+    }
     Err(anyhow!(
         "select a repository with --repository <ID> ({} registered)",
         snapshot.repositories.len()
     ))
+}
+
+fn unavailable_repository_error(repository: &UnavailableRepository) -> anyhow::Error {
+    anyhow!(IpcRequestError(StructuredError {
+        code: "repository-blocked".into(),
+        message: format!(
+            "repository {} at {} is unavailable: {} Recovery: {}",
+            repository.id,
+            repository.path.display(),
+            repository.error,
+            repository.recovery_action
+        ),
+        retryable: false,
+        details: Some(serde_json::json!({
+            "repository_id": repository.id,
+            "path": repository.path,
+            "error": repository.error,
+            "recovery_action": repository.recovery_action,
+        })),
+    }))
 }
 
 async fn wait_for_item(
@@ -2288,6 +2326,7 @@ fn classify_exit(error: &anyhow::Error) -> u8 {
                 | "unpromoted-source-ancestor"
                 | "candidate-terminal"
                 | "revision-conflict"
+                | "repository-blocked"
         )
     {
         return 4;
@@ -2316,6 +2355,33 @@ mod tests {
     #[test]
     fn missing_tested_oid_is_rendered_as_unavailable() {
         assert_eq!(oid_value(&serde_json::Value::Null), "—");
+    }
+
+    #[test]
+    fn unavailable_repository_error_preserves_path_and_recovery() {
+        let repository = UnavailableRepository {
+            id: "019ffe40-a60d-7722-a369-2635222d1203".parse().unwrap(),
+            name: "damaged".into(),
+            path: PathBuf::from("/tmp/damaged"),
+            error: "repository resource `logs` is unavailable at /tmp/damaged/.git/tollgate/logs"
+                .into(),
+            recovery_action: "Restore the resource, then restart Tollgate.".into(),
+        };
+
+        let message = unavailable_repository_error(&repository).to_string();
+
+        assert!(message.contains("019ffe40-a60d-7722-a369-2635222d1203"));
+        assert!(message.contains("/tmp/damaged"));
+        assert!(message.contains("resource `logs`"));
+        assert!(message.contains("Restore the resource, then restart Tollgate."));
+        let error = unavailable_repository_error(&repository);
+        let structured = error.downcast_ref::<IpcRequestError>().unwrap();
+        assert_eq!(structured.0.code, "repository-blocked");
+        assert_eq!(
+            structured.0.details.as_ref().unwrap()["path"],
+            "/tmp/damaged"
+        );
+        assert_eq!(classify_exit(&error), 4);
     }
 
     #[test]

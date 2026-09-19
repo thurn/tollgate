@@ -128,6 +128,12 @@ pub enum ServiceError {
         state: QueueItemState,
         reason: String,
     },
+    #[error("repository resource `{role}` is unavailable at {}: {reason}", path.display())]
+    RepositoryResourceUnavailable {
+        role: String,
+        path: PathBuf,
+        reason: String,
+    },
     #[error("internal service invariant failed: {0}")]
     Invariant(String),
     #[error("I/O error: {0}")]
@@ -4447,16 +4453,33 @@ impl TollgateService {
     }
 
     pub async fn snapshot(&self) -> Result<AppSnapshot, ServiceError> {
-        let ids = self
+        let runtimes = self
             .runtimes
             .read()
             .await
-            .keys()
-            .copied()
+            .values()
+            .cloned()
             .collect::<Vec<_>>();
         let mut repositories = Vec::new();
-        for id in ids {
-            repositories.push(self.repository_snapshot(id).await?);
+        let mut unavailable_repositories = self.unavailable.read().await.clone();
+        for runtime in runtimes {
+            let (id, name) = {
+                let data = runtime.data.lock();
+                (data.state.id, data.state.name.clone())
+            };
+            match self.repository_snapshot(id).await {
+                Ok(repository) => repositories.push(repository),
+                Err(error) => {
+                    unavailable_repositories.retain(|repository| repository.id != id);
+                    unavailable_repositories.push(UnavailableRepository {
+                        id,
+                        name,
+                        path: runtime.git.worktree_root.clone(),
+                        error: error.to_string(),
+                        recovery_action: "Preserve repository-local Tollgate state, restore the reported resource or remove the stale registration, then restart Tollgate and run Doctor.".into(),
+                    });
+                }
+            }
         }
         repositories.sort_by(|left, right| {
             left.state
@@ -4464,12 +4487,18 @@ impl TollgateService {
                 .to_lowercase()
                 .cmp(&right.state.name.to_lowercase())
         });
+        unavailable_repositories.sort_by(|left, right| {
+            left.name
+                .to_lowercase()
+                .cmp(&right.name.to_lowercase())
+                .then_with(|| left.id.cmp(&right.id))
+        });
         let environment = self.environment.read().await;
         Ok(AppSnapshot {
             version: env!("CARGO_PKG_VERSION").into(),
             generated_at: OffsetDateTime::now_utc(),
             repositories,
-            unavailable_repositories: self.unavailable.read().await.clone(),
+            unavailable_repositories,
             environment: EnvironmentView {
                 snapshot_id: environment.id.clone(),
                 fingerprint: environment.fingerprint.clone(),
@@ -15064,8 +15093,13 @@ fn observe_volumes(runtime: &RepositoryRuntime) -> Result<Vec<VolumeView>, Servi
     ];
     let mut volumes = BTreeMap::<String, VolumeView>::new();
     for (path, role) in paths {
-        let state = nix::sys::statvfs::statvfs(path)
-            .map_err(|error| ServiceError::Invariant(error.to_string()))?;
+        let state = nix::sys::statvfs::statvfs(path).map_err(|error| {
+            ServiceError::RepositoryResourceUnavailable {
+                role: role.into(),
+                path: path.to_owned(),
+                reason: error.to_string(),
+            }
+        })?;
         let id = format!("fs-{:x}", state.filesystem_id());
         let available_bytes =
             u64::from(state.blocks_available()).saturating_mul(state.fragment_size());
@@ -15713,6 +15747,69 @@ mod tests {
                 RepositoryExecutionState::Blocked
             ))
         ));
+    }
+
+    #[tokio::test]
+    async fn snapshot_isolates_a_repository_with_a_missing_runtime_resource() {
+        let temporary = tempfile::tempdir().unwrap();
+        let damaged_repository = temporary.path().join("damaged");
+        let healthy_repository = temporary.path().join("healthy");
+        for repository in [&damaged_repository, &healthy_repository] {
+            std::fs::create_dir(repository).unwrap();
+            git(repository, &["init", "-b", USER_BRANCH]);
+            std::fs::write(repository.join("base.txt"), "base\n").unwrap();
+            git(repository, &["add", "base.txt"]);
+            git(repository, &["commit", "-m", "base"]);
+        }
+        let service = TollgateService::open(temporary.path().join("support"))
+            .await
+            .unwrap();
+        let damaged = service
+            .initialize_repository_with_options(&damaged_repository, Some("true".into()), false)
+            .await
+            .unwrap();
+        let healthy = service
+            .initialize_repository_with_options(&healthy_repository, Some("true".into()), false)
+            .await
+            .unwrap();
+        let runtime = service.runtime(damaged.state.id).await.unwrap();
+        let missing_logs = runtime.logs_root.clone();
+        std::fs::remove_dir(&missing_logs).unwrap();
+
+        let error = service
+            .repository_snapshot(damaged.state.id)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            &error,
+            ServiceError::RepositoryResourceUnavailable { role, path, .. }
+                if role == "logs" && path == &missing_logs
+        ));
+        assert!(
+            error
+                .to_string()
+                .contains(&missing_logs.display().to_string())
+        );
+
+        let snapshot = service.snapshot().await.unwrap();
+        assert_eq!(snapshot.repositories.len(), 1);
+        assert_eq!(snapshot.repositories[0].state.id, healthy.state.id);
+        let unavailable = snapshot
+            .unavailable_repositories
+            .iter()
+            .find(|repository| repository.id == damaged.state.id)
+            .unwrap();
+        assert_eq!(
+            unavailable.path,
+            std::fs::canonicalize(damaged_repository).unwrap()
+        );
+        assert!(unavailable.error.contains("resource `logs`"));
+        assert!(
+            unavailable
+                .error
+                .contains(&missing_logs.display().to_string())
+        );
+        assert!(unavailable.recovery_action.contains("stale registration"));
     }
 
     #[tokio::test]
