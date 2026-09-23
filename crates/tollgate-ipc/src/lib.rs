@@ -225,6 +225,9 @@ pub enum IpcCommand {
         repository_id: RepositoryId,
         item_id: QueueItemId,
     },
+    RepositoryDeliveryContext {
+        repository_id: RepositoryId,
+    },
     Initialize {
         path: String,
         run: Option<String>,

@@ -75,7 +75,7 @@ metadata: authorization and retry preserve it, promotion leaves its source workt
 available, and JSON status reports `"cleanup_policy": "retain-worktree"`.
 
 In JSON mode, `tg status <candidate-id>` returns only that candidate's detailed
-status through a candidate-specific service read. Omitting the ID retains the
+status through a candidate-specific service read. It also reports `local_master.status`, `policy_enabled`, `contains_tested`, and the observed local-master OID. `needs-attention` means local master lacks the tested integration commit even if remote push succeeded; `disabled` reflects an explicit sync opt-out. Use candidate status after a blocking wait to verify this independent outcome. Omitting the ID retains the
 repository-wide snapshot used to inspect the current speculative queue and its
 generation prefixes.
 

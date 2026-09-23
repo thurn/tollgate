@@ -13,8 +13,8 @@ use tollgate_ipc::{
     MAX_CONTROL_PAYLOAD, MAX_LOG_PAYLOAD, PROTOCOL_VERSION, StructuredError, verify_peer_uid,
 };
 use tollgate_service::{
-    AppSnapshot, ArtifactPage, DiagnoseResult, ItemWaitStatus, QueueItemView, RepositorySnapshot,
-    UnavailableRepository,
+    AppSnapshot, ArtifactPage, DiagnoseResult, ItemWaitStatus, QueueItemView,
+    RepositoryDeliveryContext, RepositorySnapshot, UnavailableRepository,
 };
 use uuid::Uuid;
 
@@ -608,10 +608,35 @@ async fn run(cli: Cli) -> anyhow::Result<u8> {
                         })
                         .await?,
                 )?;
+                let local_master = match client
+                    .request(IpcCommand::RepositoryDeliveryContext {
+                        repository_id: view.item.repository_id,
+                    })
+                    .await
+                {
+                    Ok(value) => {
+                        let context: RepositoryDeliveryContext = serde_json::from_value(value)?;
+                        candidate_local_master_status(&context, &view).await
+                    }
+                    Err(error) => serde_json::json!({
+                        "status": "unknown",
+                        "policy_enabled": null,
+                        "contains_tested": null,
+                        "master_oid": null,
+                        "reason": format!("Cannot inspect repository policy: {error}"),
+                    }),
+                };
                 if cli.json {
-                    println!("{}", serde_json::to_string_pretty(&view)?);
+                    println!("{}", candidate_status_json(&view, local_master.clone())?);
                 } else {
                     print_item_status(&view);
+                    println!(
+                        "  local master  {}",
+                        local_master["status"].as_str().unwrap_or("unknown")
+                    );
+                    if let Some(reason) = local_master["reason"].as_str() {
+                        println!("  reason        {reason}");
+                    }
                 }
             } else {
                 let repository = select_repository(&mut client, cli.repository).await?;
@@ -1984,6 +2009,128 @@ fn print_status(repository: &RepositorySnapshot, id: Option<QueueItemId>) {
     );
 }
 
+fn candidate_status_json(
+    view: &QueueItemView,
+    local_master: serde_json::Value,
+) -> anyhow::Result<String> {
+    let mut value = serde_json::to_value(view)?;
+    value["local_master"] = local_master;
+    Ok(serde_json::to_string_pretty(&value)?)
+}
+
+fn local_master_sync_status(
+    enabled: bool,
+    state: tollgate_domain::QueueItemState,
+    contains_tested: bool,
+) -> &'static str {
+    use tollgate_domain::QueueItemState as State;
+    if !enabled {
+        "disabled"
+    } else if state != State::Promoted {
+        if state.is_terminal() {
+            "not-applicable"
+        } else {
+            "pending"
+        }
+    } else if contains_tested {
+        "synchronized"
+    } else {
+        "needs-attention"
+    }
+}
+
+fn local_master_missing_tested_status(
+    enabled: bool,
+    state: tollgate_domain::QueueItemState,
+) -> &'static str {
+    use tollgate_domain::QueueItemState as State;
+    if !enabled {
+        "disabled"
+    } else if state == State::Promoted {
+        "unknown"
+    } else if state.is_terminal() {
+        "not-applicable"
+    } else {
+        "pending"
+    }
+}
+
+async fn candidate_local_master_status(
+    context: &RepositoryDeliveryContext,
+    view: &QueueItemView,
+) -> serde_json::Value {
+    let enabled = context.sync_user_master;
+    if view.item.state == tollgate_domain::QueueItemState::ExternallyIntegrated {
+        return serde_json::json!({
+            "status": "not-applicable",
+            "policy_enabled": enabled,
+            "contains_tested": null,
+            "master_oid": null,
+            "reason": "Candidate source was integrated externally; Tollgate did not promote this tested result",
+        });
+    }
+    if view.item.state != tollgate_domain::QueueItemState::Promoted {
+        return serde_json::json!({
+            "status": local_master_missing_tested_status(enabled, view.item.state),
+            "policy_enabled": enabled,
+            "contains_tested": null,
+            "master_oid": null,
+            "reason": null,
+        });
+    }
+    let Some(tested) = view
+        .generation
+        .as_ref()
+        .map(|generation| &generation.tested_oid)
+    else {
+        return serde_json::json!({
+            "status": local_master_missing_tested_status(enabled, view.item.state),
+            "policy_enabled": enabled,
+            "contains_tested": null,
+            "master_oid": null,
+            "reason": "No tested integration commit is available",
+        });
+    };
+    let observed = async {
+        let git = GitRepository::discover(&context.path).await?;
+        let master = git.resolve_oid(USER_BRANCH_REF).await?;
+        anyhow::Ok((git, master))
+    }
+    .await;
+    let (git, master) = match observed {
+        Ok(value) => value,
+        Err(error) => {
+            return serde_json::json!({
+                "status": if enabled { "unknown" } else { "disabled" },
+                "policy_enabled": enabled,
+                "contains_tested": null,
+                "master_oid": null,
+                "reason": format!("Cannot inspect local master: {error}"),
+            });
+        }
+    };
+    match git.is_ancestor(tested, &master).await {
+        Ok(contains) => serde_json::json!({
+            "status": local_master_sync_status(enabled, view.item.state, contains),
+            "policy_enabled": enabled,
+            "contains_tested": contains,
+            "master_oid": master,
+            "reason": if enabled && matches!(view.item.state, tollgate_domain::QueueItemState::Promoted) && !contains {
+                Some("local master does not contain the tested integration commit")
+            } else {
+                None
+            },
+        }),
+        Err(error) => serde_json::json!({
+            "status": if enabled { "unknown" } else { "disabled" },
+            "policy_enabled": enabled,
+            "contains_tested": null,
+            "master_oid": master,
+            "reason": format!("Cannot inspect tested commit ancestry: {error}"),
+        }),
+    }
+}
+
 fn print_item_status(view: &QueueItemView) {
     println!(
         "{}\n  state       {:?}\n  authority   {}\n  source      {}\n  tested      {}\n  generation  {}\n  evidence    {}",
@@ -2605,6 +2752,145 @@ mod tests {
         assert!(args.replay);
         assert!(!args.no_replay);
         assert!(Cli::try_parse_from(["tg", "diagnose", id, "--replay", "--no-replay"]).is_err());
+    }
+
+    #[test]
+    fn candidate_json_reports_local_master_without_repository_history() {
+        let id = "019ffe40-a60d-7722-a369-2635222d1203";
+        let repository = repository_with_candidate(id);
+        let view = &repository.queue[0];
+        let value: serde_json::Value = serde_json::from_str(
+            &candidate_status_json(
+                view,
+                serde_json::json!({
+                    "status": "needs-attention",
+                    "policy_enabled": true,
+                    "contains_tested": false,
+                }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(value["item"]["id"], id);
+        assert_eq!(value["local_master"]["status"], "needs-attention");
+        assert!(value.get("queue").is_none());
+    }
+
+    #[test]
+    fn candidate_local_master_status_distinguishes_policy_and_dirty_checkout() {
+        use tollgate_domain::QueueItemState as State;
+        assert_eq!(
+            local_master_sync_status(true, State::Promoted, false),
+            "needs-attention"
+        );
+        assert_eq!(
+            local_master_sync_status(true, State::Promoted, true),
+            "synchronized"
+        );
+        assert_eq!(
+            local_master_sync_status(false, State::Promoted, false),
+            "disabled"
+        );
+        assert_eq!(
+            local_master_sync_status(true, State::Running, false),
+            "pending"
+        );
+        assert_eq!(
+            local_master_sync_status(true, State::ExternallyIntegrated, false),
+            "not-applicable"
+        );
+        assert_eq!(
+            local_master_missing_tested_status(true, State::Constructing),
+            "pending"
+        );
+        assert_eq!(
+            local_master_missing_tested_status(true, State::MergeConflict),
+            "not-applicable"
+        );
+        assert_eq!(
+            local_master_missing_tested_status(true, State::Promoted),
+            "unknown"
+        );
+    }
+
+    #[tokio::test]
+    async fn candidate_local_master_status_reads_real_git_containment() {
+        fn git(directory: &std::path::Path, args: &[&str]) {
+            let output = std::process::Command::new("git")
+                .current_dir(directory)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "Tollgate Test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                .env("GIT_COMMITTER_NAME", "Tollgate Test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path();
+        git(path, &["init", "-b", "master"]);
+        std::fs::write(path.join("file.txt"), "base\n").unwrap();
+        git(path, &["add", "file.txt"]);
+        git(path, &["commit", "-m", "base"]);
+        let repository = GitRepository::discover(path).await.unwrap();
+        let base = repository.resolve_oid(USER_BRANCH_REF).await.unwrap();
+        let mut view = repository_with_candidate("019ffe40-a60d-7722-a369-2635222d1203")
+            .queue
+            .remove(0);
+        view.item.state = tollgate_domain::QueueItemState::Promoted;
+        view.generation = Some(tollgate_domain::ValidationGeneration {
+            id: "019ffe40-a60d-7722-a369-2635222d1210".parse().unwrap(),
+            item_id: view.item.id,
+            anchored_base_oid: base.clone(),
+            ordered_item_ids: vec![view.item.id],
+            ordered_source_oids: vec![base.clone()],
+            prefix_oids: vec![base.clone()],
+            expected_parent_oid: base.clone(),
+            tested_oid: base.clone(),
+            configuration_digest: "config".into(),
+            step_graph_digest: "steps".into(),
+            engine_epoch: 1,
+            identity_digest: "identity".into(),
+            invalidated_by: None,
+        });
+        let mut context = RepositoryDeliveryContext {
+            path: path.to_string_lossy().into_owned(),
+            sync_user_master: true,
+        };
+        let synchronized = candidate_local_master_status(&context, &view).await;
+        assert_eq!(synchronized["status"], "synchronized");
+        assert_eq!(synchronized["contains_tested"], true);
+
+        git(path, &["switch", "-c", "feature"]);
+        std::fs::write(path.join("file.txt"), "next\n").unwrap();
+        git(path, &["commit", "-am", "next"]);
+        view.generation.as_mut().unwrap().tested_oid =
+            repository.resolve_oid("HEAD").await.unwrap();
+        git(path, &["switch", "master"]);
+        let attention = candidate_local_master_status(&context, &view).await;
+        assert_eq!(attention["status"], "needs-attention");
+        assert_eq!(attention["contains_tested"], false);
+        context.sync_user_master = false;
+        assert_eq!(
+            candidate_local_master_status(&context, &view).await["status"],
+            "disabled"
+        );
+
+        context.sync_user_master = true;
+        view.generation.as_mut().unwrap().tested_oid =
+            tollgate_domain::GitOid::from_hex("ffffffffffffffffffffffffffffffffffffffff").unwrap();
+        let missing = candidate_local_master_status(&context, &view).await;
+        assert_eq!(missing["status"], "unknown");
+        assert_eq!(missing["master_oid"]["bytes"], base.to_hex());
+        view.item.state = tollgate_domain::QueueItemState::Failed;
+        let failed = candidate_local_master_status(&context, &view).await;
+        assert_eq!(failed["status"], "not-applicable");
+        assert!(failed["contains_tested"].is_null());
     }
 
     #[test]

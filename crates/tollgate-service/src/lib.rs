@@ -159,6 +159,12 @@ pub struct AppSnapshot {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RepositoryDeliveryContext {
+    pub path: String,
+    pub sync_user_master: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ItemWaitStatus {
     pub item: QueueItem,
     pub repository_execution_state: RepositoryExecutionState,
@@ -5064,6 +5070,18 @@ impl TollgateService {
             .find(|item| item.id == item_id)
             .ok_or(ServiceError::ItemNotFound(item_id))?;
         Ok(queue_item_view(&data, item))
+    }
+
+    pub async fn repository_delivery_context(
+        &self,
+        repository_id: RepositoryId,
+    ) -> Result<RepositoryDeliveryContext, ServiceError> {
+        let runtime = self.runtime(repository_id).await?;
+        let data = runtime.data.lock();
+        Ok(RepositoryDeliveryContext {
+            path: data.state.path.clone(),
+            sync_user_master: data.config.sync_user_master,
+        })
     }
 
     pub async fn item_details_by_id(
@@ -22052,6 +22070,12 @@ run = "true"
         let details = service.item_details_by_id(None, a.item_id).await.unwrap();
         assert_eq!(details.item.id, a.item_id);
         assert_eq!(details.item.repository_id, initialized.state.id);
+        let context = service
+            .repository_delivery_context(initialized.state.id)
+            .await
+            .unwrap();
+        assert_eq!(context.path, initialized.state.path);
+        assert!(context.sync_user_master);
         let revision = service
             .repository_snapshot(initialized.state.id)
             .await

@@ -1916,7 +1916,18 @@ impl GitRepository {
                 &descendant.to_hex(),
             ])
             .await?;
-        Ok(status.success())
+        match status.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => Err(GitError::Command {
+                command: format!(
+                    "git merge-base --is-ancestor {} {}",
+                    ancestor.to_hex(),
+                    descendant.to_hex()
+                ),
+                stderr: format!("exit status: {status}"),
+            }),
+        }
     }
 
     async fn git<I, S>(&self, args: I) -> Result<Vec<u8>, GitError>
@@ -2178,6 +2189,25 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8_lossy(&output.stdout).trim().into()
+    }
+
+    #[tokio::test]
+    async fn ancestry_distinguishes_non_ancestor_from_missing_object() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path();
+        git(repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("file.txt"), "base\n").unwrap();
+        git(repository, &["add", "file.txt"]);
+        git(repository, &["commit", "-m", "base"]);
+        let base = GitOid::from_hex(&git(repository, &["rev-parse", "HEAD"])).unwrap();
+        std::fs::write(repository.join("file.txt"), "next\n").unwrap();
+        git(repository, &["commit", "-am", "next"]);
+        let next = GitOid::from_hex(&git(repository, &["rev-parse", "HEAD"])).unwrap();
+        let missing = GitOid::from_hex("ffffffffffffffffffffffffffffffffffffffff").unwrap();
+        let adapter = GitRepository::discover(repository).await.unwrap();
+        assert!(adapter.is_ancestor(&base, &next).await.unwrap());
+        assert!(!adapter.is_ancestor(&next, &base).await.unwrap());
+        assert!(adapter.is_ancestor(&missing, &next).await.is_err());
     }
 
     #[tokio::test]

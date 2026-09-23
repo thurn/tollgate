@@ -18,3 +18,6 @@ tollgate-git = { path = "../../crates/tollgate-git" }
 tollgate-ipc = { path = "../../crates/tollgate-ipc" }
 tollgate-service = { path = "../../crates/tollgate-service" }
 uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
