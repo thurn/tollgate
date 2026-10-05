@@ -7,6 +7,7 @@ mod ids;
 mod model;
 mod oid;
 mod queue;
+mod release;
 mod state;
 
 pub use command::*;
@@ -16,4 +17,5 @@ pub use ids::*;
 pub use model::*;
 pub use oid::*;
 pub use queue::*;
+pub use release::*;
 pub use state::*;

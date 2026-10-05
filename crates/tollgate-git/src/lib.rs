@@ -1588,6 +1588,31 @@ impl GitRepository {
         Ok(())
     }
 
+    /// A `release` advance: moves `release` from `expected_release` to `new` and leaves `staging`
+    /// where it is, verifying in the same ref transaction that `staging` still holds
+    /// `expected_staging`.
+    pub async fn compare_and_swap_release(
+        &self,
+        expected_release: &GitOid,
+        expected_staging: &GitOid,
+        new: &GitOid,
+    ) -> Result<(), GitError> {
+        self.ensure_integration_not_checked_out().await?;
+        self.update_refs(&format!(
+            "update {RELEASE_REF} {new} {expected_release}\nverify {INTEGRATION_REF} {expected_staging}\n",
+            new = new.to_hex(),
+            expected_release = expected_release.to_hex(),
+            expected_staging = expected_staging.to_hex(),
+        ))
+        .await?;
+        if self.release_oid().await? != *new || self.integration_oid().await? != *expected_staging {
+            return Err(GitError::InvalidOutput(
+                "release CAS result mismatch".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Applies `update-ref --stdin` instructions as one atomic ref transaction.
     async fn update_refs(&self, instructions: &str) -> Result<(), GitError> {
         use tokio::io::AsyncWriteExt;
@@ -2540,6 +2565,27 @@ mod tests {
             .unwrap();
         assert_eq!(adapter.integration_oid().await.unwrap(), third);
         assert_eq!(adapter.release_oid().await.unwrap(), base);
+
+        // A release advance moves `release` alone and verifies `staging`.
+        assert!(
+            adapter
+                .compare_and_swap_release(&base, &next, &next)
+                .await
+                .is_err()
+        );
+        assert!(
+            adapter
+                .compare_and_swap_release(&next, &third, &next)
+                .await
+                .is_err()
+        );
+        assert_eq!(adapter.release_oid().await.unwrap(), base);
+        adapter
+            .compare_and_swap_release(&base, &third, &next)
+            .await
+            .unwrap();
+        assert_eq!(adapter.integration_oid().await.unwrap(), third);
+        assert_eq!(adapter.release_oid().await.unwrap(), next);
     }
 
     #[tokio::test]

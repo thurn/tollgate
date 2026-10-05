@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod release;
 pub mod storage;
 
 use std::{
@@ -15,6 +16,9 @@ use std::{
 use directories::ProjectDirs;
 use globset::{Glob, GlobSetBuilder};
 use parking_lot::Mutex;
+#[cfg(test)]
+use release::ReleaseFault;
+use release::{PUSH_BLOCKED, REMOTE_PREFLIGHT_MISMATCH};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use time::{Duration, OffsetDateTime};
@@ -689,6 +693,9 @@ pub struct CandidateAuthorizationResult {
     pub validation_complete: bool,
     pub evidence_reused: bool,
     pub authorized_at: OffsetDateTime,
+    /// The candidate was approved with `--release-fix`.
+    #[serde(default)]
+    pub release_fix: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -801,6 +808,17 @@ struct RepositoryRuntime {
     /// inside the promotion mutation lock.
     release_trigger_passes: AtomicU64,
     release_trigger_lock_violations: AtomicU64,
+    /// Serializes `release` advances with `tg push`, `tg pull`, and `tg reconcile`. An advance
+    /// holds it across its network steps, which run outside the mutation lock, so none of those
+    /// commands observes a push in flight. Lock order: `release_advance`, then `mutation`.
+    release_advance: tokio::sync::Mutex<()>,
+    /// Set when a release advance pass is owed; cleared by the pass that runs.
+    release_advance_requested: AtomicBool,
+    release_advance_passes: AtomicU64,
+    /// Test hook: the durable boundary at which the next release advance stops as if the
+    /// process crashed there.
+    #[cfg(test)]
+    release_fault: Mutex<Option<(ReleaseFault, bool)>>,
     scheduler_epoch: AtomicU64,
     dispatching: Mutex<HashSet<QueueItemId>>,
     execution_changed: Notify,
@@ -2228,6 +2246,8 @@ impl TollgateService {
             active_window_floor: 3,
             active_window_ceiling: 20,
             remote_enabled: config.remote.enabled,
+            release_block_reasons: Vec::new(),
+            promotion_pause: None,
         };
         store.initialize_repository_with_configuration(
             &state,
@@ -2504,6 +2524,9 @@ impl TollgateService {
             .release_trigger_requested
             .store(true, Ordering::Release);
         self.spawn_requested_release_trigger(id, &runtime);
+        // Resumes an owed release push and advances `release` to a certificate that landed
+        // before the restart.
+        self.spawn_release_advance(id, &runtime);
         Ok(id)
     }
 
@@ -2578,6 +2601,8 @@ impl TollgateService {
         self.reconcile_artifact_intents(runtime).await?;
         step("promotion-intent").await?;
         self.reconcile_promotion_intent(runtime).await?;
+        step("release-intents").await?;
+        self.reconcile_release_intents(runtime).await?;
         step("remote-intents").await?;
         self.reconcile_remote_intents(runtime).await?;
         step("master").await?;
@@ -2832,8 +2857,15 @@ impl TollgateService {
         // Reconciliation aligned both refs at `observed` before preparing its intent. Completing it
         // clears every external-movement block, so both refs must still be there; otherwise the
         // blocks startup recorded stay for another explicit reconcile.
+        // A reconciliation under a release stage adopted `release` separately.
+        let adopted_release: Option<GitOid> = evidence
+            .get("adopted_release")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()?;
+        let expected_release = adopted_release.clone().unwrap_or_else(|| observed.clone());
         let current = ObservedTollgateRefs::read(&runtime.git).await?;
-        if current.staging != observed || current.release != observed {
+        if current.staging != observed || current.release != expected_release {
             runtime.store.set_intent_state(
                 command_id,
                 IntentState::NeedsAttention,
@@ -2855,7 +2887,18 @@ impl TollgateService {
             .ok_or_else(|| ServiceError::Invariant("reconcile omitted request digest".into()))?;
         let changed_base = persisted != observed;
         let mut state = runtime.data.lock().state.clone();
-        if state.staging_oid != observed {
+        if let Some(adopted_release) = &adopted_release {
+            let staging_changed = state.staging_oid != observed;
+            if staging_changed || &state.release_oid != adopted_release {
+                state.staging_oid = observed.clone();
+                state.release_oid = adopted_release.clone();
+                self.refresh_release_projection(runtime, &mut state).await?;
+            }
+            if staging_changed {
+                state.queue_revision += 1;
+            }
+            state.release_block_reasons.clear();
+        } else if state.staging_oid != observed {
             state.set_staging_and_release(observed.clone());
             state.queue_revision += 1;
         }
@@ -2895,6 +2938,10 @@ impl TollgateService {
             self.finish_source_cleanup(runtime, item).await?;
         }
         Self::abandon_remote_intents(&runtime)?;
+        Self::abandon_release_advances(
+            runtime,
+            &serde_json::json!({"recovery": "abandoned-by-reconcile"}),
+        )?;
         let affected = if changed_base {
             self.rebuild_after_base_adoption(runtime, &observed).await?
         } else {
@@ -4511,6 +4558,36 @@ impl TollgateService {
     async fn reconcile_master(&self, runtime: &Arc<RepositoryRuntime>) -> Result<(), ServiceError> {
         let observed_staging = runtime.git.integration_oid().await?;
         let observed_release = runtime.git.release_oid().await?;
+        // With release-stage steps, an external fast-forward of `release` alone that stays
+        // within `staging` is an uncertified adoption, not a block.
+        let (staged, persisted_staging, persisted_release) = {
+            let data = runtime.data.lock();
+            (
+                data.config.has_release_stage(),
+                data.state.staging_oid.clone(),
+                data.state.release_oid.clone(),
+            )
+        };
+        let observed = ObservedTollgateRefs {
+            staging: observed_staging.clone(),
+            release: observed_release.clone(),
+        };
+        if staged
+            && observed_staging == persisted_staging
+            && observed_release != persisted_release
+            && self
+                .release_fast_forward_within_staging(runtime, &persisted_release, &observed)
+                .await?
+        {
+            return self
+                .adopt_uncertified_release(
+                    runtime,
+                    &observed_release,
+                    "while Tollgate was stopped",
+                    Actor::Recovery,
+                )
+                .await;
+        }
         let state = {
             let mut data = runtime.data.lock();
             let moved_staging = observed_staging != data.state.staging_oid;
@@ -5514,6 +5591,11 @@ impl TollgateService {
             release_trigger_requested: AtomicBool::new(false),
             release_trigger_passes: AtomicU64::new(0),
             release_trigger_lock_violations: AtomicU64::new(0),
+            release_advance: tokio::sync::Mutex::new(()),
+            release_advance_requested: AtomicBool::new(false),
+            release_advance_passes: AtomicU64::new(0),
+            #[cfg(test)]
+            release_fault: Mutex::new(None),
             scheduler_epoch: AtomicU64::new(0),
             dispatching: Mutex::new(HashSet::new()),
             execution_changed: Notify::new(),
@@ -7201,6 +7283,7 @@ impl TollgateService {
             current_generation_id: None,
             buildset_id: None,
             certificate_id: None,
+            release_fix: false,
         };
         runtime
             .store
@@ -7335,12 +7418,38 @@ impl TollgateService {
         expected_revision: u64,
         command_id: CommandId,
     ) -> Result<CandidateAuthorizationResult, ServiceError> {
+        self.authorize_candidate_with_options(
+            repository_id,
+            item_id,
+            expected_revision,
+            false,
+            command_id,
+        )
+        .await
+    }
+
+    /// Grants promotion authority to a candidate and its active dependencies. With
+    /// `release_fix` (`tg approve --release-fix`) they are also marked as the fix for a red
+    /// release: they move ahead of every other candidate and the `max_release_lag` pause never
+    /// holds them back.
+    pub async fn authorize_candidate_with_options(
+        self: &Arc<Self>,
+        repository_id: RepositoryId,
+        item_id: QueueItemId,
+        expected_revision: u64,
+        release_fix: bool,
+        command_id: CommandId,
+    ) -> Result<CandidateAuthorizationResult, ServiceError> {
         let runtime = self.runtime(repository_id).await?;
-        let request_digest = command_digest(&serde_json::json!({
+        let mut request = serde_json::json!({
             "repository_id": repository_id,
             "item_id": item_id,
             "expected_revision": expected_revision,
-        }))?;
+        });
+        if release_fix {
+            request["release_fix"] = serde_json::Value::Bool(true);
+        }
+        let request_digest = command_digest(&request)?;
         if let Some(response) = runtime.store.checked_command_response(
             command_id,
             "candidate-authorize",
@@ -7390,6 +7499,8 @@ impl TollgateService {
             retained_generations,
             retained_buildsets,
             retained_certificates,
+            closure_ids,
+            needs_release_fix,
         ) = {
             let data = runtime.data.lock();
             if data.state.execution_state != RepositoryExecutionState::Active {
@@ -7522,15 +7633,27 @@ impl TollgateService {
                     })
                     .take_while(|candidate| candidate.id != item_id)
                     .any(|candidate| {
-                        !candidate.promotion_authorized
-                            && !authorization_ids.contains(&candidate.id)
+                        // A release fix moves ahead of every candidate outside its closure that
+                        // is not a release fix itself; other authority only passes unauthorized
+                        // candidates.
+                        !authorization_ids.contains(&candidate.id)
+                            && if release_fix {
+                                !candidate.release_fix
+                            } else {
+                                !candidate.promotion_authorized
+                            }
                     }),
                 data.generations.clone(),
                 data.buildsets.clone(),
                 data.certificates.clone(),
+                authorization_ids.clone(),
+                release_fix
+                    && authorization_closure
+                        .iter()
+                        .any(|candidate| !candidate.release_fix),
             )
         };
-        if items_to_authorize.is_empty() && !needs_priority {
+        if items_to_authorize.is_empty() && !needs_priority && !needs_release_fix {
             let result = CandidateAuthorizationResult {
                 item_id,
                 already_authorized: true,
@@ -7544,6 +7667,7 @@ impl TollgateService {
                 validation_complete: item.state == QueueItemState::Ready,
                 evidence_reused: item.state == QueueItemState::Ready
                     && item.certificate_id.is_some(),
+                release_fix: item.release_fix,
                 authorized_at: item.promotion_authorized_at.ok_or_else(|| {
                     ServiceError::Invariant(
                         "authorized candidate is missing its authorization timestamp".into(),
@@ -7598,6 +7722,9 @@ impl TollgateService {
                 candidate.promotion_authorized_at = Some(authorized_at);
                 candidate.promotion_authorized_by = Some(command_id);
             }
+            if release_fix && closure_ids.contains(&candidate.id) {
+                candidate.release_fix = true;
+            }
         }
 
         let by_id = current
@@ -7630,6 +7757,10 @@ impl TollgateService {
             visiting.remove(&id);
             ordered.push(id);
             Ok(())
+        }
+        // Release fixes first, then other authorized candidates, then the rest.
+        for candidate in current.iter().filter(|candidate| candidate.release_fix) {
+            append_with_active_dependencies(candidate.id, &by_id, &mut ordered_ids, &mut visiting)?;
         }
         for candidate in current
             .iter()
@@ -7777,6 +7908,7 @@ impl TollgateService {
             validation_complete,
             evidence_reused,
             authorized_at,
+            release_fix: prioritized_item.release_fix,
         };
         retain_speculative_generations(&runtime, &generations).await?;
         let event = runtime.store.authorize_candidate(
@@ -7984,6 +8116,7 @@ impl TollgateService {
             current_generation_id: None,
             buildset_id: None,
             certificate_id: None,
+            release_fix: false,
         };
         runtime
             .store
@@ -8057,6 +8190,9 @@ impl TollgateService {
         command_id: CommandId,
     ) -> Result<RemoteSyncResult, ServiceError> {
         let runtime = self.runtime(repository_id).await?;
+        // No release push is in flight while the pull decides (lock order: release_advance,
+        // then mutation).
+        let _advance = runtime.release_advance.lock().await;
         let _mutation = runtime.mutation.lock().await;
         let (state, config) = {
             let data = runtime.data.lock();
@@ -8177,7 +8313,10 @@ impl TollgateService {
                 return Err(error.into());
             }
         };
-        if let Err(error) = block_externally_moved_refs(&runtime, &observed, "during `tg pull`") {
+        if let Err(error) = self
+            .verify_tollgate_refs(&runtime, &observed, "during `tg pull`")
+            .await
+        {
             runtime.store.set_intent_state(
                 command_id,
                 IntentState::NeedsAttention,
@@ -8185,9 +8324,13 @@ impl TollgateService {
             )?;
             return Err(error);
         }
+        // With release-stage steps an external fast-forward of `release` within `staging` was
+        // just adopted, so `release` is read again.
+        let observed_release = runtime.data.lock().state.release_oid.clone();
+        let staged = config.has_release_stage();
         let observed_local = observed.staging;
 
-        let mut next_state = state.clone();
+        let mut next_state = runtime.data.lock().state.clone();
         let mut affected = Vec::new();
         let (action, message) = if let Some(remote_oid) = remote.as_ref() {
             if remote_oid == &observed_local {
@@ -8212,9 +8355,16 @@ impl TollgateService {
                     }
                 };
                 if local_is_ancestor {
+                    // Both refs move to the remote OID in one transaction. `release` may trail
+                    // `staging` with release-stage steps; the remote already published every
+                    // commit up to its OID.
                     if let Err(error) = runtime
                         .git
-                        .compare_and_swap_integration(&observed_local, remote_oid)
+                        .compare_and_swap_staging_and_release(
+                            &observed_local,
+                            &observed_release,
+                            remote_oid,
+                        )
                         .await
                     {
                         let current = runtime.git.integration_oid().await.ok();
@@ -8264,6 +8414,15 @@ impl TollgateService {
                             "Local release is ahead by a non-divergent certified chain.".to_owned(),
                         )
                     } else {
+                        // A remote that fast-forwards `release` but not `staging` diverges from
+                        // the gated history as much as any other, so it also waits for an
+                        // explicit reconcile.
+                        let release_fast_forward = staged
+                            && observed_release != observed_local
+                            && runtime
+                                .git
+                                .is_ancestor(&observed_release, remote_oid)
+                                .await?;
                         next_state.execution_state = RepositoryExecutionState::Blocked;
                         if !next_state
                             .block_reasons
@@ -8272,7 +8431,11 @@ impl TollgateService {
                         {
                             next_state.block_reasons.push(BlockReason {
                         code: "remote-diverged".into(),
-                        message: "Local release and remote master have diverged; Tollgate did not merge or rebase them.".into(),
+                        message: if release_fast_forward {
+                            "Remote master fast-forwards release but not staging; Tollgate did not merge or rebase them.".into()
+                        } else {
+                            "Local release and remote master have diverged; Tollgate did not merge or rebase them.".into()
+                        },
                         recovery_action: "Inspect both exact tips and run `tg reconcile` after choosing the authoritative history.".into(),
                     });
                         }
@@ -8310,6 +8473,22 @@ impl TollgateService {
             affected_item_ids: affected.clone(),
             message,
         };
+        if staged && !matches!(action, RemoteSyncAction::Diverged) {
+            // The remote now contains every outstanding release promise, or was just observed
+            // inside certified history: release advances may retry their preflight.
+            next_state
+                .release_block_reasons
+                .retain(|reason| reason.code != REMOTE_PREFLIGHT_MISMATCH);
+            if matches!(action, RemoteSyncAction::AdoptedRemote) {
+                next_state
+                    .release_block_reasons
+                    .retain(|reason| reason.code != PUSH_BLOCKED);
+                Self::abandon_release_advances(
+                    &runtime,
+                    &serde_json::json!({"recovery": "superseded-by-pull", "remote": remote}),
+                )?;
+            }
+        }
         if matches!(action, RemoteSyncAction::AdoptedRemote) {
             runtime.data.lock().state = next_state.clone();
             let rebuilt = self
@@ -8343,6 +8522,15 @@ impl TollgateService {
         if matches!(action, RemoteSyncAction::AdoptedRemote) {
             self.spawn_eligible(repository_id, &runtime);
         }
+        if staged {
+            drop(_mutation);
+            drop(_advance);
+            runtime
+                .release_trigger_requested
+                .store(true, Ordering::Release);
+            self.spawn_requested_release_trigger(repository_id, &runtime);
+            self.spawn_release_advance(repository_id, &runtime);
+        }
         Ok(provisional)
     }
 
@@ -8352,6 +8540,9 @@ impl TollgateService {
         command_id: CommandId,
     ) -> Result<RemoteSyncResult, ServiceError> {
         let runtime = self.runtime(repository_id).await?;
+        // No release push is in flight while `tg push` publishes (lock order: release_advance,
+        // then mutation).
+        let _advance = runtime.release_advance.lock().await;
         let _mutation = runtime.mutation.lock().await;
         let (state, config) = {
             let data = runtime.data.lock();
@@ -8467,7 +8658,10 @@ impl TollgateService {
                 return Err(error.into());
             }
         };
-        if let Err(error) = block_externally_moved_refs(&runtime, &observed, "during `tg push`") {
+        if let Err(error) = self
+            .verify_tollgate_refs(&runtime, &observed, "during `tg push`")
+            .await
+        {
             runtime.store.set_intent_state(
                 command_id,
                 IntentState::Canceled,
@@ -8479,6 +8673,9 @@ impl TollgateService {
             )?;
             return Err(error);
         }
+        // With release-stage steps, `release` may have just adopted an external fast-forward.
+        let state = runtime.data.lock().state.clone();
+        let staged = config.has_release_stage();
         let action;
         let message;
         if remote.as_ref() == Some(&state.release_oid) {
@@ -8536,19 +8733,39 @@ impl TollgateService {
                     return Err(error.into());
                 }
             };
-            let promotion_edges = runtime.store.promotion_edges()?;
-            let mut expected_parent = remote_oid.as_bytes().to_vec();
-            let certified_chain = !outbound.is_empty()
-                && outbound.iter().all(|oid| {
-                    let found = promotion_edges.iter().any(|(old, promoted)| {
-                        old == &expected_parent && promoted.as_slice() == oid.as_bytes()
-                    });
-                    if found {
-                        expected_parent = oid.as_bytes().to_vec();
-                    }
-                    found
-                });
-            if !certified_chain || expected_parent.as_slice() != state.release_oid.as_bytes() {
+            let certified_chain = if staged {
+                // The remote follows `release` only (R4): `release` must be a release run's
+                // tested OID, and every commit after the remote one Tollgate promoted or adopted.
+                if !Self::release_certified(&runtime, &state.release_oid) {
+                    runtime.store.set_intent_state(
+                        command_id,
+                        IntentState::Canceled,
+                        &serde_json::json!({"uncertified_release": state.release_oid}),
+                    )?;
+                    return Err(ServiceError::Invariant(
+                        "local release is not the tested OID of a passed release run; the next passing release run advances and pushes it"
+                            .into(),
+                    ));
+                }
+                !outbound.is_empty()
+                    && outbound.last() == Some(&state.release_oid)
+                    && self.release_range_attributed(&runtime, remote_oid, &outbound)?
+            } else {
+                let promotion_edges = runtime.store.promotion_edges()?;
+                let mut expected_parent = remote_oid.as_bytes().to_vec();
+                !outbound.is_empty()
+                    && outbound.iter().all(|oid| {
+                        let found = promotion_edges.iter().any(|(old, promoted)| {
+                            old == &expected_parent && promoted.as_slice() == oid.as_bytes()
+                        });
+                        if found {
+                            expected_parent = oid.as_bytes().to_vec();
+                        }
+                        found
+                    })
+                    && expected_parent.as_slice() == state.release_oid.as_bytes()
+            };
+            if !certified_chain {
                 runtime.store.set_intent_state(
                     command_id,
                     IntentState::Canceled,
@@ -8676,6 +8893,16 @@ impl TollgateService {
             self.replace_item(&runtime, item.clone())?;
             self.finish_source_cleanup(&runtime, item).await?;
         }
+        if staged {
+            // The remote now holds `release`: every owed or blocked release push it contains is
+            // complete, and release advances may resume.
+            self.complete_published_release_advances(&runtime, &state.release_oid)
+                .await?;
+            let mut data = runtime.data.lock();
+            data.state.release_block_reasons.retain(|reason| {
+                reason.code != PUSH_BLOCKED && reason.code != REMOTE_PREFLIGHT_MISMATCH
+            });
+        }
         let mut completion_state = runtime.data.lock().state.clone();
         let event = runtime.store.complete_operation(
             &completion_state,
@@ -8692,6 +8919,11 @@ impl TollgateService {
         runtime.data.lock().state = completion_state;
         let _ = runtime.events.send(event);
         self.spawn_eligible(repository_id, &runtime);
+        if staged {
+            drop(_mutation);
+            drop(_advance);
+            self.spawn_release_advance(repository_id, &runtime);
+        }
         Ok(result)
     }
 
@@ -8728,6 +8960,9 @@ impl TollgateService {
         command_id: CommandId,
     ) -> Result<RemoteSyncResult, ServiceError> {
         let runtime = self.runtime(repository_id).await?;
+        // No release push is in flight while reconciliation abandons release promises (lock
+        // order: release_advance, then mutation).
+        let _advance = runtime.release_advance.lock().await;
         let _mutation = runtime.mutation.lock().await;
         let request_digest = command_digest(&serde_json::json!({
             "repository_id": repository_id,
@@ -8768,19 +9003,71 @@ impl TollgateService {
                 actual: state.queue_revision,
             });
         }
-        let observed = align_externally_moved_refs(&runtime.git, &state, &observed_staging).await?;
-        runtime.store.prepare_operation(
-            repository_id,
-            "reconcile",
-            command_id,
-            &serde_json::json!({
-                "request_digest": request_digest,
-                "persisted_master": state.staging_oid,
-                "observed_master": observed,
-            }),
-        )?;
+        let staged = runtime.data.lock().config.has_release_stage();
+        let mut evidence = serde_json::json!({
+            "request_digest": request_digest,
+            "persisted_master": state.staging_oid,
+        });
+        let (observed, adopted_release) = if staged {
+            // With release-stage steps `release` legitimately trails `staging`. Reconciliation
+            // adopts each ref where it is and never moves `release` toward `staging` without a
+            // release run; `release` must stay an ancestor of `staging` (R1).
+            let observed_release = runtime.git.release_oid().await?;
+            if observed_release != observed_staging
+                && !runtime
+                    .git
+                    .is_ancestor(&observed_release, &observed_staging)
+                    .await?
+            {
+                return Err(ServiceError::Invariant(format!(
+                    "release {} is not an ancestor of staging {}; move release to an ancestor of staging (normally the last released commit), then reconcile again",
+                    observed_release.short(),
+                    observed_staging.short()
+                )));
+            }
+            // Commits adopted into `staging` count as adopted for the release provenance rule
+            // (R2): the fast-forward from the persisted `staging`, or everything after the
+            // adopted `release` when `staging` was rewritten.
+            if state.staging_oid != observed_staging {
+                let adoption_from = if runtime
+                    .git
+                    .is_ancestor(&state.staging_oid, &observed_staging)
+                    .await?
+                {
+                    state.staging_oid.clone()
+                } else {
+                    observed_release.clone()
+                };
+                if adoption_from != observed_staging {
+                    evidence["adoption_from"] = serde_json::to_value(&adoption_from)?;
+                    evidence["adoption_to"] = serde_json::to_value(&observed_staging)?;
+                }
+            }
+            evidence["persisted_release"] = serde_json::to_value(&state.release_oid)?;
+            evidence["adopted_release"] = serde_json::to_value(&observed_release)?;
+            (observed_staging.clone(), observed_release)
+        } else {
+            let observed =
+                align_externally_moved_refs(&runtime.git, &state, &observed_staging).await?;
+            (observed.clone(), observed)
+        };
+        evidence["observed_master"] = serde_json::to_value(&observed)?;
+        runtime
+            .store
+            .prepare_operation(repository_id, "reconcile", command_id, &evidence)?;
         let changed_base = state.staging_oid != observed;
-        if changed_base {
+        if staged {
+            if changed_base || state.release_oid != adopted_release {
+                state.staging_oid = observed.clone();
+                state.release_oid = adopted_release.clone();
+                self.refresh_release_projection(&runtime, &mut state)
+                    .await?;
+            }
+            if changed_base {
+                state.queue_revision += 1;
+            }
+            state.release_block_reasons.clear();
+        } else if changed_base {
             state.set_staging_and_release(observed.clone());
             state.queue_revision += 1;
         }
@@ -8819,7 +9106,18 @@ impl TollgateService {
             remote_master: None,
             queue_revision: state.queue_revision,
             affected_item_ids: affected.clone(),
-            message: if changed_base {
+            message: if staged {
+                format!(
+                    "{} staging {} and kept release at {}; release advances only after a passing release run.",
+                    if changed_base {
+                        "Adopted the observed"
+                    } else {
+                        "Confirmed"
+                    },
+                    observed.short(),
+                    adopted_release.short()
+                )
+            } else if changed_base {
                 "Adopted the observed local release as an unvalidated external base and rebuilt active prefixes."
                     .into()
             } else {
@@ -8845,6 +9143,10 @@ impl TollgateService {
             self.finish_source_cleanup(&runtime, item).await?;
         }
         Self::abandon_remote_intents(&runtime)?;
+        Self::abandon_release_advances(
+            &runtime,
+            &serde_json::json!({"recovery": "abandoned-by-reconcile"}),
+        )?;
         if changed_base {
             let rebuilt = self
                 .rebuild_after_base_adoption(&runtime, &observed)
@@ -8864,7 +9166,7 @@ impl TollgateService {
             &request_digest,
             &result,
             "repository.reconciled",
-            &serde_json::json!({"adopted_master": observed}),
+            &serde_json::json!({"adopted_master": observed, "adopted_release": adopted_release}),
             Actor::Cli,
         )?;
         completed_state.event_sequence = event.sequence;
@@ -8873,6 +9175,15 @@ impl TollgateService {
         self.reconcile_approval_intents(&runtime).await?;
         self.spawn_eligible(repository_id, &runtime);
         drop(_mutation);
+        drop(_advance);
+        if staged {
+            // A trailing `release` needs a release run on the adopted tip.
+            runtime
+                .release_trigger_requested
+                .store(true, Ordering::Release);
+            self.spawn_requested_release_trigger(repository_id, &runtime);
+            self.spawn_release_advance(repository_id, &runtime);
+        }
         self.promote_ready(repository_id).await?;
         Ok(result)
     }
@@ -12171,6 +12482,8 @@ impl TollgateService {
             }
             let _ = runtime.events.send(event);
             drop(finalization_guard);
+            // A pass advances `release` to the new certificate; a failure can pause promotion.
+            self.spawn_release_advance(repository_id, &runtime);
             if let Err(error) = runtime
                 .git
                 .delete_source_ref(&item.source_ref, &item.source_oid)
@@ -13492,6 +13805,11 @@ impl TollgateService {
         let _mutation = runtime.mutation.lock().await;
         self.reconcile_promotion_intent(&runtime).await?;
         loop {
+            if runtime.data.lock().state.execution_state == RepositoryExecutionState::Active
+                && self.reconcile_promotion_pause(&runtime)?
+            {
+                return Ok(());
+            }
             let (mut item, generation, certificate, active_config, state) = {
                 let data = runtime.data.lock();
                 if data.state.execution_state != RepositoryExecutionState::Active {
@@ -13576,7 +13894,23 @@ impl TollgateService {
             )?;
             let observed_master = runtime.git.integration_oid().await?;
             let observed_release = runtime.git.release_oid().await?;
-            if observed_release != state.release_oid {
+            if observed_release != state.release_oid && active_config.has_release_stage() {
+                // A staging-only promotion verifies `release` at its observed OID. An external
+                // fast-forward of `release` within `staging` is adopted as uncertified first;
+                // any other movement blocks.
+                let observed = ObservedTollgateRefs {
+                    staging: observed_master.clone(),
+                    release: observed_release.clone(),
+                };
+                match self
+                    .verify_tollgate_refs(&runtime, &observed, "while Tollgate was running")
+                    .await
+                {
+                    Ok(()) => {}
+                    Err(ServiceError::Invariant(_)) => return Ok(()),
+                    Err(error) => return Err(error),
+                }
+            } else if observed_release != state.release_oid {
                 // The opt-out two-ref transaction requires `release` at its persisted OID, which
                 // equals `staging`'s. Block instead of retrying a CAS that cannot apply.
                 let blocked = {
@@ -14190,6 +14524,7 @@ impl TollgateService {
             .release_trigger_passes
             .fetch_add(1, Ordering::AcqRel);
         self.spawn_eligible(repository_id, &runtime);
+        self.spawn_release_advance(repository_id, &runtime);
         Ok(())
     }
 
@@ -14443,6 +14778,7 @@ impl TollgateService {
             current_generation_id: Some(generation.id),
             buildset_id: None,
             certificate_id: None,
+            release_fix: false,
         };
         Ok((item, generation))
     }
@@ -27367,7 +27703,7 @@ policy = "clone"
     }
 
     #[tokio::test]
-    async fn release_runs_coalesce_to_the_newest_staging_tip_without_moving_release() {
+    async fn release_runs_coalesce_to_the_newest_staging_tip_and_release_follows_them() {
         let temporary = tempfile::tempdir().unwrap();
         let gate = temporary.path().join("release-may-finish");
         let (service, id, repository) = staged_release_repository(
@@ -27464,6 +27800,7 @@ policy = "clone"
                     .iter()
                     .all(|view| view.item.state.is_terminal())
                     && event_kinds(&snapshot.history, "release.run-passed").len() == 2
+                    && snapshot.state.release_oid == tip_c
             })
             .await;
         for tip in [&tip_a, &tip_c] {
@@ -27489,15 +27826,17 @@ policy = "clone"
                 [("fast", "success"), ("full", "success")]
             );
         }
-        // `release` does not advance yet: staging runs ahead and the verdict stays pending.
-        assert_eq!(git(&repository, &["rev-parse", RELEASE_REF]), base.to_hex());
+        // `release` follows the passing runs to the newest tested tip and is green again.
+        assert_eq!(
+            git(&repository, &["rev-parse", RELEASE_REF]),
+            tip_c.to_hex()
+        );
         assert_eq!(
             git(&repository, &["rev-parse", INTEGRATION_REF]),
             tip_c.to_hex()
         );
-        assert_eq!(finished.state.release_oid, base);
-        assert_eq!(finished.state.release_lag.commits, 3);
-        assert_eq!(finished.state.release_state, ReleaseState::Pending);
+        assert_eq!(finished.state.release_lag.commits, 0);
+        assert_eq!(finished.state.release_state, ReleaseState::Green);
 
         let runtime = service.runtime(id).await.unwrap();
         assert_eq!(outstanding_release_intents(&runtime), 0);
@@ -27518,6 +27857,21 @@ policy = "clone"
         assert_eq!(last.payload["range"]["commits"], 3);
         assert_eq!(last.payload["notify"], false);
         assert!(event_kinds(&events, "release.run-failed").is_empty());
+        // Each advance moved `release` to a tested tip, never past one: to the first tip and
+        // then the newest, or straight to the newest when both certificates were waiting.
+        let advanced = event_kinds(&events, "release.advanced");
+        assert!(!advanced.is_empty() && advanced.len() <= 2, "{advanced:?}");
+        assert_eq!(
+            advanced.last().unwrap().payload["to"],
+            serde_json::json!(tip_c)
+        );
+        assert_eq!(advanced[0].payload["from"], serde_json::json!(base));
+        for event in &advanced {
+            assert!(
+                [serde_json::json!(tip_a), serde_json::json!(tip_c)].contains(&event.payload["to"])
+            );
+            assert_eq!(event.payload["push"], "disabled");
+        }
 
         // A release run is not retried as a queue item.
         let error = service
@@ -27655,6 +28009,9 @@ policy = "clone"
     #[tokio::test]
     async fn release_runs_select_steps_by_every_commit_in_the_unreleased_range() {
         let temporary = tempfile::tempdir().unwrap();
+        // The first tip's run holds until the second tip's run is queued, so `release` has not
+        // advanced past the first commit when the second run is anchored.
+        let gate = temporary.path().join("docs-check-may-finish");
         let (service, id, repository) = staged_release_repository(
             temporary.path(),
             &[],
@@ -27662,11 +28019,20 @@ policy = "clone"
                 ("feature-docs", "docs/guide.md", "guide\n"),
                 ("feature-src", "src/lib.rs", "fn main() {}\n"),
             ],
-            "\n[[step]]\nname = \"docs-check\"\nstage = \"release\"\nrun = \"true\"\nneeds = [\"fast\"]\ninclude = [\"docs/**\"]\n\n[[step]]\nname = \"src-check\"\nstage = \"release\"\nrun = \"true\"\nneeds = [\"fast\"]\ninclude = [\"src/**\"]\n",
+            &format!(
+                "\n[[step]]\nname = \"docs-check\"\nstage = \"release\"\nrun = \"while [ ! -f '{}' ]; do sleep 0.05; done\"\nneeds = [\"fast\"]\ninclude = [\"docs/**\"]\n\n[[step]]\nname = \"src-check\"\nstage = \"release\"\nrun = \"true\"\nneeds = [\"fast\"]\ninclude = [\"src/**\"]\n",
+                gate.display()
+            ),
         )
         .await;
+        let base = GitOid::from_hex(&git(&repository, &["rev-parse", RELEASE_REF])).unwrap();
         approve_and_promote(&service, id, "feature-docs").await;
         let tip = approve_and_promote(&service, id, "feature-src").await;
+        wait_for_release_snapshot(&service, id, "the tip's queued release run", |snapshot| {
+            !release_runs_for(snapshot, &tip).is_empty()
+        })
+        .await;
+        std::fs::write(&gate, "").unwrap();
         assert_eq!(
             git(
                 &repository,
@@ -27710,10 +28076,7 @@ policy = "clone"
             ]),
             "the batched range selects the union of both commits' paths"
         );
-        assert_eq!(
-            run.generation.as_ref().unwrap().anchored_base_oid,
-            snapshot.state.release_oid
-        );
+        assert_eq!(run.generation.as_ref().unwrap().anchored_base_oid, base);
     }
 
     #[tokio::test]
@@ -28854,5 +29217,768 @@ policy = "clone"
                 .any(|event| event.kind == format!("remote.{operation}-completed"));
             assert!(!completed);
         }
+    }
+
+    /// The `origin` remote of a staged-release fixture. Its update hook logs every OID pushed to
+    /// it and rejects pushes while `reject` exists.
+    struct ReleaseRemote {
+        path: PathBuf,
+        pushes: PathBuf,
+        reject: PathBuf,
+    }
+
+    impl ReleaseRemote {
+        fn master(&self) -> String {
+            remote_master(&self.path)
+        }
+
+        fn pushed(&self) -> Vec<String> {
+            std::fs::read_to_string(&self.pushes)
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_owned)
+                .collect()
+        }
+    }
+
+    /// A registered repository whose `origin` remote `master` equals `staging` and `release`,
+    /// with `features` branched from the base commit and `policy` (TOML after `version`) applied.
+    /// `push` enables the remote push.
+    async fn staged_release_repository_with_remote(
+        root: &Path,
+        features: &[(&str, &str, &str)],
+        push: bool,
+        policy: &str,
+    ) -> (
+        Arc<TollgateService>,
+        RepositoryId,
+        PathBuf,
+        ReleaseRemote,
+        GitOid,
+    ) {
+        use std::os::unix::fs::PermissionsExt;
+        let repository = root.join("repository");
+        let remote = root.join("remote.git");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("base.txt"), "base\n").unwrap();
+        git(&repository, &["add", "base.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+        for (name, path, content) in features {
+            release_feature(&repository, root, name, path, content);
+        }
+        git(
+            root,
+            &[
+                "init",
+                "--bare",
+                "-b",
+                USER_BRANCH,
+                remote.to_str().unwrap(),
+            ],
+        );
+        git(
+            &repository,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&repository, &["push", "origin", USER_BRANCH]);
+        let pushes = root.join("remote-pushes.log");
+        let reject = root.join("reject-remote-pushes");
+        let hook = remote.join("hooks/update");
+        std::fs::write(
+            &hook,
+            format!(
+                "#!/bin/sh\nif [ -f '{}' ]; then exit 1; fi\necho \"$3\" >> '{}'\n",
+                reject.display(),
+                pushes.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        git(&repository, &["switch", "--detach", USER_BRANCH]);
+        let service = TollgateService::open(root.join("support")).await.unwrap();
+        let initialized = service
+            .initialize_repository(&repository, Some("true".into()))
+            .await
+            .unwrap();
+        std::fs::write(
+            repository.join(".tollgate/config.toml"),
+            format!("version = 1\n\n[remote]\nenabled = {push}\n\n{policy}"),
+        )
+        .unwrap();
+        service
+            .apply_configuration(initialized.state.id, CommandId::new())
+            .await
+            .unwrap();
+        let base = initialized.state.staging_oid.clone();
+        (
+            service,
+            initialized.state.id,
+            repository,
+            ReleaseRemote {
+                path: remote,
+                pushes,
+                reject,
+            },
+            base,
+        )
+    }
+
+    /// A gate step and a release step that holds while `gate` is absent.
+    fn held_release_policy(gate: &Path) -> String {
+        format!(
+            "[[step]]\nname = \"fast\"\nrun = \"true\"\n\n[[step]]\nname = \"full\"\nstage = \"release\"\nrun = \"while [ ! -f '{}' ]; do sleep 0.05; done\"\n",
+            gate.display()
+        )
+    }
+
+    const PASSING_RELEASE_POLICY: &str = "[[step]]\nname = \"fast\"\nrun = \"true\"\n\n[[step]]\nname = \"full\"\nstage = \"release\"\nrun = \"true\"\n";
+
+    fn release_advance_intents(runtime: &RepositoryRuntime) -> Vec<IntentState> {
+        runtime
+            .store
+            .recoverable_operations(&[tollgate_store::RELEASE_ADVANCE_INTENT_KIND])
+            .unwrap()
+            .into_iter()
+            .map(|(_, _, _, state)| state)
+            .collect()
+    }
+
+    fn release_codes(state: &RepositoryState) -> Vec<&str> {
+        state
+            .release_block_reasons
+            .iter()
+            .map(|reason| reason.code.as_str())
+            .collect()
+    }
+
+    async fn wait_for_settled_release_advances(runtime: &RepositoryRuntime) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !release_advance_intents(runtime).is_empty() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "release advances never settled: {:?}",
+                release_advance_intents(runtime)
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
+    async fn wait_for_remote(remote: &ReleaseRemote, oid: &GitOid) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        while remote.master() != oid.to_hex() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "remote master stayed at {}",
+                remote.master()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn three_fast_promotions_release_once_and_push_only_the_newest_tested_oid() {
+        let temporary = tempfile::tempdir().unwrap();
+        let gate = temporary.path().join("gates-may-finish");
+        let (service, id, repository, remote, base) = staged_release_repository_with_remote(
+            temporary.path(),
+            &[
+                ("feature-a", "a.txt", "a\n"),
+                ("feature-b", "b.txt", "b\n"),
+                ("feature-c", "c.txt", "c\n"),
+            ],
+            true,
+            &format!(
+                "[resources]\nrepository_concurrency = 3\n\n[[step]]\nname = \"fast\"\nrun = \"while [ ! -f '{}' ]; do sleep 0.05; done\"\n\n[[step]]\nname = \"full\"\nstage = \"release\"\nrun = \"true\"\n",
+                gate.display()
+            ),
+        )
+        .await;
+        let mut items = Vec::new();
+        for branch in ["feature-a", "feature-b", "feature-c"] {
+            items.push(
+                service
+                    .approve(id, branch.into(), CommandId::new())
+                    .await
+                    .unwrap()
+                    .item_id,
+            );
+        }
+        wait_for_release_snapshot(&service, id, "all three gates to run", |snapshot| {
+            snapshot
+                .queue
+                .iter()
+                .filter(|view| view.item.state == QueueItemState::Running)
+                .count()
+                == 3
+        })
+        .await;
+        // The three gates finish while promotion is paused, so the three promotions land in
+        // quick succession in one promotion pass once it resumes.
+        service.set_paused(id, true).await.unwrap();
+        std::fs::write(&gate, "").unwrap();
+        wait_for_release_snapshot(&service, id, "all three gates to pass", |snapshot| {
+            items.iter().all(|item| {
+                snapshot
+                    .queue
+                    .iter()
+                    .any(|view| view.item.id == *item && view.item.state == QueueItemState::Ready)
+            })
+        })
+        .await;
+        service.set_paused(id, false).await.unwrap();
+        let mut tips = Vec::new();
+        for item in &items {
+            tips.push(wait_item_promoted(&service, id, *item).await);
+        }
+        let tip_c = tips[2].clone();
+        let released = wait_for_release_snapshot(
+            &service,
+            id,
+            "release to reach the newest tip",
+            |snapshot| snapshot.state.release_oid == tip_c,
+        )
+        .await;
+        wait_for_remote(&remote, &tip_c).await;
+        let runtime = service.runtime(id).await.unwrap();
+        wait_for_settled_release_advances(&runtime).await;
+
+        // `staging` advanced three times, each promotion on the previous one.
+        assert_eq!(released.state.staging_oid, tip_c);
+        let events = runtime.store.events_after(0, 10_000).unwrap();
+        let promoted = event_kinds(&events, "promotion.completed");
+        assert_eq!(promoted.len(), 3);
+        assert_eq!(
+            git(
+                &repository,
+                &["rev-parse", &format!("{}^", tips[0].to_hex())]
+            ),
+            base.to_hex()
+        );
+        assert_eq!(
+            git(
+                &repository,
+                &["rev-parse", &format!("{}^", tips[2].to_hex())]
+            ),
+            tips[1].to_hex()
+        );
+        // One coalesced release run tested the newest tip, and `release` advanced once, to it.
+        assert_eq!(
+            released.release_runs.len(),
+            1,
+            "{:?}",
+            released.release_runs
+        );
+        assert_eq!(released.release_runs[0].item.source_oid, tip_c);
+        assert_eq!(
+            released.release_runs[0].item.state,
+            QueueItemState::CheckPassed
+        );
+        let advanced = event_kinds(&events, "release.advanced");
+        assert_eq!(advanced.len(), 1);
+        assert_eq!(advanced[0].payload["from"], serde_json::json!(base));
+        assert_eq!(advanced[0].payload["to"], serde_json::json!(tip_c));
+        assert_eq!(advanced[0].payload["commits"], 3);
+        let pushed = event_kinds(&events, "release.pushed");
+        assert_eq!(pushed.len(), 1);
+        assert_eq!(pushed[0].payload["lease"], serde_json::json!(base));
+        // The remote received only that OID.
+        assert_eq!(remote.pushed(), vec![tip_c.to_hex()]);
+        assert_eq!(
+            git(&repository, &["rev-parse", RELEASE_REF]),
+            tip_c.to_hex()
+        );
+        assert_eq!(released.state.release_state, ReleaseState::Green);
+        assert!(release_advance_intents(&runtime).is_empty());
+    }
+
+    #[tokio::test]
+    async fn max_release_lag_pauses_promotion_until_a_release_fix_lands() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (service, id, repository) = staged_release_repository(
+            temporary.path(),
+            &[],
+            &[
+                ("feature-break", "broken.txt", "broken\n"),
+                ("feature-one", "one.txt", "one\n"),
+                ("feature-two", "two.txt", "two\n"),
+                ("feature-fix", "fixed.txt", "fixed\n"),
+            ],
+            "\n[resources]\nmax_release_lag = 1\n\n[[step]]\nname = \"full\"\nstage = \"release\"\nrun = \"test ! -f broken.txt || test -f fixed.txt\"\n",
+        )
+        .await;
+        let broken = approve_and_promote(&service, id, "feature-break").await;
+        wait_for_release_snapshot(&service, id, "the first release run to fail", |snapshot| {
+            release_runs_for(snapshot, &broken)
+                .iter()
+                .any(|view| view.item.state == QueueItemState::CheckFailed)
+        })
+        .await;
+        // One unreleased commit is within the limit, so this promotion proceeds.
+        let one = approve_and_promote(&service, id, "feature-one").await;
+        wait_for_release_snapshot(&service, id, "the second release run to fail", |snapshot| {
+            release_runs_for(snapshot, &one)
+                .iter()
+                .any(|view| view.item.state == QueueItemState::CheckFailed)
+        })
+        .await;
+        // Two unreleased commits after a failed release run: the next promotion waits while
+        // its gate validation still completes.
+        let two = service
+            .approve(id, "feature-two".into(), CommandId::new())
+            .await
+            .unwrap()
+            .item_id;
+        let paused = wait_for_release_snapshot(&service, id, "promotion to pause", |snapshot| {
+            snapshot.state.promotion_pause.is_some()
+                && snapshot
+                    .queue
+                    .iter()
+                    .any(|view| view.item.id == two && view.item.state == QueueItemState::Ready)
+        })
+        .await;
+        assert_eq!(
+            paused.state.promotion_pause.as_ref().unwrap().code,
+            "release-lag"
+        );
+        assert_eq!(paused.state.release_lag.commits, 2);
+        assert_eq!(paused.state.release_state, ReleaseState::Failing);
+        assert_eq!(
+            paused.state.execution_state,
+            RepositoryExecutionState::Active
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert_eq!(
+            service.item_status(id, two).await.unwrap().state,
+            QueueItemState::Ready
+        );
+        assert_eq!(
+            git(&repository, &["rev-parse", INTEGRATION_REF]),
+            one.to_hex()
+        );
+        let runtime = service.runtime(id).await.unwrap();
+        let events = runtime.store.events_after(0, 10_000).unwrap();
+        let paused_events = event_kinds(&events, "promotion.paused");
+        assert_eq!(paused_events.len(), 1);
+        assert_eq!(paused_events[0].payload["notify"], true);
+        assert_eq!(paused_events[0].payload["item_id"], serde_json::json!(two));
+
+        // The fix, approved as a release fix, moves ahead of the paused candidate and lands.
+        let fix = service
+            .submit_candidate(id, "feature-fix".into(), CommandId::new())
+            .await
+            .unwrap()
+            .item_id;
+        let revision = service
+            .repository_snapshot(id)
+            .await
+            .unwrap()
+            .state
+            .queue_revision;
+        let authorized = service
+            .authorize_candidate_with_options(id, fix, revision, true, CommandId::new())
+            .await
+            .unwrap();
+        assert!(authorized.release_fix);
+        let fixed = wait_item_promoted(&service, id, fix).await;
+        assert_eq!(
+            git(&repository, &["rev-parse", &format!("{}^", fixed.to_hex())]),
+            one.to_hex()
+        );
+        assert!(
+            service
+                .item_details(id, fix)
+                .await
+                .unwrap()
+                .item
+                .release_fix
+        );
+        // The fix's passing release run advances `release`, which lifts the pause.
+        let two_tip = wait_item_promoted(&service, id, two).await;
+        assert_eq!(
+            git(
+                &repository,
+                &["rev-parse", &format!("{}^", two_tip.to_hex())]
+            ),
+            fixed.to_hex()
+        );
+        let finished = wait_for_release_snapshot(&service, id, "release to catch up", |snapshot| {
+            snapshot.state.release_oid == two_tip
+        })
+        .await;
+        assert_eq!(finished.state.promotion_pause, None);
+        let events = runtime.store.events_after(0, 10_000).unwrap();
+        let resumed = event_kinds(&events, "promotion.resumed");
+        assert!(!resumed.is_empty());
+        assert!(
+            resumed
+                .iter()
+                .any(|event| event.payload["release_fix"] == true),
+            "the release fix bypassed the pause: {resumed:?}"
+        );
+        // `release` never held an uncertified tip: it moved from the base straight to the fix
+        // or later.
+        for event in event_kinds(&events, "release.advanced") {
+            assert_ne!(event.payload["to"], serde_json::json!(broken));
+            assert_ne!(event.payload["to"], serde_json::json!(one));
+        }
+    }
+
+    #[tokio::test]
+    async fn release_advance_recovers_from_a_crash_at_every_durable_boundary() {
+        for (fault, push) in [
+            (ReleaseFault::BeforeIntent, true),
+            (ReleaseFault::AfterIntent, true),
+            (ReleaseFault::AfterCas, true),
+            (ReleaseFault::AfterLocalAdvance, true),
+            (ReleaseFault::AfterPush, true),
+            (ReleaseFault::BeforeIntent, false),
+            (ReleaseFault::AfterIntent, false),
+            (ReleaseFault::AfterCas, false),
+        ] {
+            let temporary = tempfile::tempdir().unwrap();
+            let (service, id, repository, remote, base) = staged_release_repository_with_remote(
+                temporary.path(),
+                &[("feature-a", "a.txt", "a\n")],
+                push,
+                PASSING_RELEASE_POLICY,
+            )
+            .await;
+            let runtime = service.runtime(id).await.unwrap();
+            *runtime.release_fault.lock() = Some((fault, false));
+            let tip = approve_and_promote(&service, id, "feature-a").await;
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+            while !runtime.release_fault.lock().is_some_and(|(_, fired)| fired) {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "{fault:?} never fired"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            // The durable state the crash leaves behind.
+            let persisted = runtime.store.repository_state().unwrap();
+            let real_release = git(&repository, &["rev-parse", RELEASE_REF]);
+            let intents = release_advance_intents(&runtime);
+            match fault {
+                ReleaseFault::BeforeIntent => {
+                    assert!(intents.is_empty());
+                    assert_eq!(real_release, base.to_hex());
+                    assert_eq!(persisted.release_oid, base);
+                }
+                ReleaseFault::AfterIntent => {
+                    assert_eq!(intents, vec![IntentState::Prepared]);
+                    assert_eq!(real_release, base.to_hex());
+                    assert_eq!(persisted.release_oid, base);
+                }
+                ReleaseFault::AfterCas => {
+                    assert_eq!(intents, vec![IntentState::Prepared]);
+                    assert_eq!(real_release, tip.to_hex());
+                    assert_eq!(persisted.release_oid, base);
+                }
+                ReleaseFault::AfterLocalAdvance => {
+                    assert_eq!(intents, vec![IntentState::ExternalApplied]);
+                    assert_eq!(real_release, tip.to_hex());
+                    assert_eq!(persisted.release_oid, tip);
+                    assert_eq!(remote.master(), base.to_hex());
+                }
+                ReleaseFault::AfterPush => {
+                    assert_eq!(intents, vec![IntentState::ExternalApplied]);
+                    assert_eq!(persisted.release_oid, tip);
+                    assert_eq!(remote.master(), tip.to_hex());
+                }
+            }
+            drop(runtime);
+            service.shutdown().await.unwrap();
+            drop(service);
+
+            let recovered = TollgateService::open(temporary.path().join("support"))
+                .await
+                .unwrap();
+            let settled =
+                wait_for_release_snapshot(&recovered, id, "release to recover", |snapshot| {
+                    snapshot.state.release_oid == tip
+                })
+                .await;
+            if push {
+                wait_for_remote(&remote, &tip).await;
+            }
+            let runtime = recovered.runtime(id).await.unwrap();
+            wait_for_settled_release_advances(&runtime).await;
+            assert_eq!(
+                settled.state.execution_state,
+                RepositoryExecutionState::Active,
+                "{fault:?}: {:?}",
+                settled.state.block_reasons
+            );
+            assert!(settled.state.release_block_reasons.is_empty());
+            assert_eq!(settled.state.release_state, ReleaseState::Green);
+            assert_eq!(git(&repository, &["rev-parse", RELEASE_REF]), tip.to_hex());
+            assert_eq!(
+                git(&repository, &["rev-parse", INTEGRATION_REF]),
+                tip.to_hex()
+            );
+            // Exactly one advance and, with pushing, exactly one push of the tested OID.
+            let events = runtime.store.events_after(0, 10_000).unwrap();
+            let advanced = event_kinds(&events, "release.advanced");
+            assert_eq!(advanced.len(), 1, "{fault:?}: {advanced:?}");
+            assert_eq!(advanced[0].payload["to"], serde_json::json!(tip));
+            assert_eq!(
+                advanced[0].payload["recovered"],
+                fault == ReleaseFault::AfterCas,
+                "{fault:?}"
+            );
+            if push {
+                assert_eq!(remote.pushed(), vec![tip.to_hex()], "{fault:?}");
+                assert_eq!(event_kinds(&events, "release.pushed").len(), 1, "{fault:?}");
+            } else {
+                assert!(remote.pushed().is_empty());
+                assert_eq!(remote.master(), base.to_hex());
+            }
+            recovered.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_blocked_release_push_holds_release_while_staging_promotes_until_tg_push() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (service, id, repository, remote, base) = staged_release_repository_with_remote(
+            temporary.path(),
+            &[("feature-a", "a.txt", "a\n"), ("feature-b", "b.txt", "b\n")],
+            true,
+            PASSING_RELEASE_POLICY,
+        )
+        .await;
+        std::fs::write(&remote.reject, "").unwrap();
+        let tip_a = approve_and_promote(&service, id, "feature-a").await;
+        let blocked =
+            wait_for_release_snapshot(&service, id, "the release push to block", |snapshot| {
+                release_codes(&snapshot.state).contains(&"push-blocked")
+            })
+            .await;
+        assert_eq!(blocked.state.release_oid, tip_a);
+        assert_eq!(
+            blocked.state.execution_state,
+            RepositoryExecutionState::Active
+        );
+        assert_eq!(remote.master(), base.to_hex());
+        let runtime = service.runtime(id).await.unwrap();
+        assert_eq!(
+            release_advance_intents(&runtime),
+            vec![IntentState::NeedsAttention]
+        );
+        let events = runtime.store.events_after(0, 10_000).unwrap();
+        let push_blocked = event_kinds(&events, "release.push-blocked");
+        assert_eq!(push_blocked[0].payload["notify"], true);
+
+        // `staging` promotions continue; the newer certificate waits behind the owed push.
+        let tip_b = approve_and_promote(&service, id, "feature-b").await;
+        wait_for_release_snapshot(&service, id, "the second release run to pass", |snapshot| {
+            release_runs_for(snapshot, &tip_b)
+                .iter()
+                .any(|view| view.item.state == QueueItemState::CheckPassed)
+        })
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let held = service.repository_snapshot(id).await.unwrap().state;
+        assert_eq!(held.staging_oid, tip_b);
+        assert_eq!(held.release_oid, tip_a);
+        assert_eq!(
+            git(&repository, &["rev-parse", RELEASE_REF]),
+            tip_a.to_hex()
+        );
+        assert_eq!(remote.master(), base.to_hex());
+
+        // `tg push` publishes the certified `release`, completes the owed push, and releases
+        // the held advance, which then pushes the newer tip.
+        std::fs::remove_file(&remote.reject).unwrap();
+        let pushed = service.push(id, CommandId::new()).await.unwrap();
+        assert!(matches!(pushed.action, RemoteSyncAction::Pushed));
+        wait_for_release_snapshot(&service, id, "release to reach the newer tip", |snapshot| {
+            snapshot.state.release_oid == tip_b && snapshot.state.release_block_reasons.is_empty()
+        })
+        .await;
+        wait_for_remote(&remote, &tip_b).await;
+        assert_eq!(remote.pushed(), vec![tip_a.to_hex(), tip_b.to_hex()]);
+        wait_for_settled_release_advances(&runtime).await;
+    }
+
+    #[tokio::test]
+    async fn pull_follows_the_staged_rule_while_release_trails() {
+        for remote_parent in ["staging", "release"] {
+            let temporary = tempfile::tempdir().unwrap();
+            let gate = temporary.path().join("release-may-finish");
+            let (service, id, repository, remote, base) = staged_release_repository_with_remote(
+                temporary.path(),
+                &[("feature-a", "a.txt", "a\n")],
+                false,
+                &held_release_policy(&gate),
+            )
+            .await;
+            let tip = approve_and_promote(&service, id, "feature-a").await;
+
+            // Remote master equals `release`, behind `staging`: no inbound update, and `release`
+            // is not expected to equal `staging`.
+            let ahead = service.pull(id, CommandId::new()).await.unwrap();
+            assert!(
+                matches!(ahead.action, RemoteSyncAction::LocalAhead),
+                "{ahead:?}"
+            );
+            let state = service.repository_snapshot(id).await.unwrap().state;
+            assert_eq!(state.staging_oid, tip);
+            assert_eq!(state.release_oid, base);
+            assert_eq!(state.execution_state, RepositoryExecutionState::Active);
+
+            let parent = if remote_parent == "staging" {
+                &tip
+            } else {
+                &base
+            };
+            let external = external_commit(&repository, parent, "remote");
+            git(
+                &repository,
+                &[
+                    "push",
+                    "origin",
+                    &format!("{}:refs/heads/master", external.to_hex()),
+                ],
+            );
+            let pulled = service.pull(id, CommandId::new()).await.unwrap();
+            let state = service.repository_snapshot(id).await.unwrap().state;
+            if remote_parent == "staging" {
+                // A strict fast-forward of `staging` moves both refs to the remote OID.
+                assert!(matches!(pulled.action, RemoteSyncAction::AdoptedRemote));
+                assert_eq!(state.staging_oid, external);
+                assert_eq!(state.release_oid, external);
+                assert_eq!(state.release_state, ReleaseState::Green);
+                assert_eq!(
+                    git(&repository, &["rev-parse", RELEASE_REF]),
+                    external.to_hex()
+                );
+                assert_eq!(
+                    git(&repository, &["rev-parse", INTEGRATION_REF]),
+                    external.to_hex()
+                );
+            } else {
+                // A fast-forward of `release` that is not one of `staging` waits for reconcile.
+                assert!(matches!(pulled.action, RemoteSyncAction::Diverged));
+                assert_eq!(block_codes(&state), vec!["remote-diverged"]);
+                assert_eq!(state.staging_oid, tip);
+                assert_eq!(state.release_oid, base);
+            }
+            assert_eq!(remote.master(), external.to_hex());
+            service.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_under_a_release_stage_never_moves_release_to_staging() {
+        let temporary = tempfile::tempdir().unwrap();
+        let gate = temporary.path().join("release-may-finish");
+        let (service, id, repository, _remote, base) = staged_release_repository_with_remote(
+            temporary.path(),
+            &[("feature-a", "a.txt", "a\n")],
+            false,
+            &held_release_policy(&gate),
+        )
+        .await;
+        let tip = approve_and_promote(&service, id, "feature-a").await;
+        let reconciled = service.reconcile(id, CommandId::new()).await.unwrap();
+        assert!(matches!(
+            reconciled.action,
+            RemoteSyncAction::ReconciledLocal
+        ));
+        let state = service.repository_snapshot(id).await.unwrap().state;
+        assert_eq!(state.staging_oid, tip);
+        assert_eq!(state.release_oid, base);
+        assert_eq!(state.release_lag.commits, 1);
+        assert_eq!(git(&repository, &["rev-parse", RELEASE_REF]), base.to_hex());
+
+        // An external fast-forward of `staging` is adopted with `release` left in place, and
+        // its commits count as adopted when the next release run certifies them.
+        let external = external_commit(&repository, &tip, "external");
+        git(
+            &repository,
+            &["update-ref", INTEGRATION_REF, &external.to_hex()],
+        );
+        service.reconcile(id, CommandId::new()).await.unwrap();
+        let state = service.repository_snapshot(id).await.unwrap().state;
+        assert_eq!(state.staging_oid, external);
+        assert_eq!(state.release_oid, base);
+        assert_eq!(state.execution_state, RepositoryExecutionState::Active);
+        assert_eq!(git(&repository, &["rev-parse", RELEASE_REF]), base.to_hex());
+
+        std::fs::write(&gate, "").unwrap();
+        wait_for_release_snapshot(
+            &service,
+            id,
+            "release to reach the adopted tip",
+            |snapshot| snapshot.state.release_oid == external,
+        )
+        .await;
+        let runtime = service.runtime(id).await.unwrap();
+        let events = runtime.store.events_after(0, 10_000).unwrap();
+        for event in event_kinds(&events, "release.advanced") {
+            // Every advance targeted a tested tip.
+            assert!(
+                [serde_json::json!(tip), serde_json::json!(external)]
+                    .contains(&event.payload["to"])
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn external_release_movement_is_adopted_only_as_a_fast_forward_within_staging() {
+        let temporary = tempfile::tempdir().unwrap();
+        let support = temporary.path().join("support");
+        let gate = temporary.path().join("release-may-finish");
+        let (service, id, repository, remote, base) = staged_release_repository_with_remote(
+            temporary.path(),
+            &[("feature-a", "a.txt", "a\n"), ("feature-b", "b.txt", "b\n")],
+            true,
+            &held_release_policy(&gate),
+        )
+        .await;
+        let tip_a = approve_and_promote(&service, id, "feature-a").await;
+        let tip_b = approve_and_promote(&service, id, "feature-b").await;
+
+        // While Tollgate runs: an external fast-forward of `release` inside `staging` is an
+        // uncertified adoption, and `tg push` refuses to publish it.
+        git(&repository, &["update-ref", RELEASE_REF, &tip_a.to_hex()]);
+        service.pull(id, CommandId::new()).await.unwrap();
+        let state = service.repository_snapshot(id).await.unwrap().state;
+        assert_eq!(state.release_oid, tip_a);
+        assert_eq!(state.staging_oid, tip_b);
+        assert_eq!(state.execution_state, RepositoryExecutionState::Active);
+        assert!(service.push(id, CommandId::new()).await.is_err());
+        assert_eq!(remote.master(), base.to_hex());
+        let state = service.repository_snapshot(id).await.unwrap().state;
+        assert_eq!(state.execution_state, RepositoryExecutionState::Active);
+        let runtime = service.runtime(id).await.unwrap();
+        let adopted = runtime.store.events_after(0, 10_000).unwrap();
+        let adopted = event_kinds(&adopted, "release.adopted-uncertified");
+        assert_eq!(adopted.len(), 1);
+        assert_eq!(adopted[0].payload["to"], serde_json::json!(tip_a));
+        drop(runtime);
+        service.shutdown().await.unwrap();
+        drop(service);
+
+        // While stopped: another fast-forward within `staging` is adopted at startup.
+        git(&repository, &["update-ref", RELEASE_REF, &tip_b.to_hex()]);
+        let reopened = TollgateService::open(support.clone()).await.unwrap();
+        let state = reopened.repository_snapshot(id).await.unwrap().state;
+        assert_eq!(state.release_oid, tip_b);
+        assert_eq!(state.execution_state, RepositoryExecutionState::Active);
+        reopened.shutdown().await.unwrap();
+        drop(reopened);
+
+        // Anything else blocks for `tg reconcile`.
+        let outside = external_commit(&repository, &base, "outside");
+        git(&repository, &["update-ref", RELEASE_REF, &outside.to_hex()]);
+        let blocked = TollgateService::open(support).await.unwrap();
+        let state = blocked.repository_snapshot(id).await.unwrap().state;
+        assert_eq!(state.execution_state, RepositoryExecutionState::Blocked);
+        assert_eq!(block_codes(&state), vec!["external-release-movement"]);
+        assert_eq!(state.release_oid, tip_b);
+        blocked.shutdown().await.unwrap();
     }
 }

@@ -53,6 +53,7 @@
         "expected_queue_revision": { "type": ["integer", "null"], "minimum": 0 },
         "expected_observed_master": { "type": ["object", "null"] },
         "cold": { "type": "boolean" },
+        "release_fix": { "type": "boolean", "description": "authorize-candidate: the candidate fixes a red release and bypasses the max_release_lag pause." },
         "all_slots": { "type": "boolean" },
         "pinned": { "type": "boolean" },
         "step": { "type": ["string", "null"] },

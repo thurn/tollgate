@@ -52,6 +52,14 @@ pub struct RepositoryState {
     pub active_window_floor: u16,
     pub active_window_ceiling: u16,
     pub remote_enabled: bool,
+    /// Conditions that hold back `release` advances without blocking the repository:
+    /// `push-blocked` (a release push failed or diverged after the local advance) and
+    /// `remote-preflight-mismatch` (the remote is not in Tollgate-certified history below the
+    /// release target). `staging` promotions continue meanwhile.
+    pub release_block_reasons: Vec<BlockReason>,
+    /// Set while promotion to `staging` waits on `max_release_lag` (`release-lag`); gate
+    /// validation continues.
+    pub promotion_pause: Option<BlockReason>,
 }
 
 impl RepositoryState {
@@ -172,6 +180,10 @@ struct PersistedRepositoryState {
     active_window_floor: u16,
     active_window_ceiling: u16,
     remote_enabled: bool,
+    #[serde(default)]
+    release_block_reasons: Vec<BlockReason>,
+    #[serde(default)]
+    promotion_pause: Option<BlockReason>,
 }
 
 impl From<PersistedRepositoryState> for RepositoryState {
@@ -200,6 +212,8 @@ impl From<PersistedRepositoryState> for RepositoryState {
             active_window_floor: state.active_window_floor,
             active_window_ceiling: state.active_window_ceiling,
             remote_enabled: state.remote_enabled,
+            release_block_reasons: state.release_block_reasons,
+            promotion_pause: state.promotion_pause,
         }
     }
 }
@@ -268,6 +282,10 @@ pub struct QueueItem {
     pub current_generation_id: Option<ValidationGenerationId>,
     pub buildset_id: Option<BuildsetId>,
     pub certificate_id: Option<CertificateId>,
+    /// Approved with `tg approve --release-fix`: the candidate fixes a red release, so the
+    /// `max_release_lag` pause never holds it back.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub release_fix: bool,
 }
 
 const fn default_promotion_authorized() -> bool {
@@ -551,7 +569,26 @@ mod tests {
         assert_eq!(state.release_oid.to_hex(), "b".repeat(40));
         assert_eq!(state.release_state, ReleaseState::Pending);
         assert!(!state.opt_out_equivalence_holds());
-        assert_eq!(serde_json::to_value(&state).unwrap(), value);
+        // State persisted before release blocks and promotion pauses existed decodes with
+        // neither and encodes both explicitly.
+        assert!(state.release_block_reasons.is_empty());
+        assert_eq!(state.promotion_pause, None);
+        let mut expected = value.clone();
+        expected["release_block_reasons"] = serde_json::json!([]);
+        expected["promotion_pause"] = serde_json::Value::Null;
+        assert_eq!(serde_json::to_value(&state).unwrap(), expected);
+        let held = RepositoryState {
+            release_block_reasons: vec![BlockReason {
+                code: "push-blocked".into(),
+                message: "message".into(),
+                recovery_action: "action".into(),
+            }],
+            ..state
+        };
+        let round_trip =
+            serde_json::from_value::<RepositoryState>(serde_json::to_value(&held).unwrap())
+                .unwrap();
+        assert_eq!(round_trip, held);
     }
 
     #[test]

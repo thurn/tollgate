@@ -31,6 +31,13 @@ pub const ARTIFACT_PRUNE_BATCH_KIND: &str = "artifact-prune-batch";
 /// durable `release.run-requested` intent the release trigger settles.
 pub const RELEASE_RUN_INTENT_KIND: &str = "release-run";
 
+/// Operation-intent kind of one `release` advance (staged-release-design.md 9): the release
+/// intent (expected old `release`, new OID, release certificate) together with the frozen push
+/// of the new OID when pushing is enabled. It is `prepared` before the local compare-and-swap,
+/// `external-applied` once `release` advanced locally while the push is still owed, `completed`
+/// once the advance (and push) finished, and `needs-attention` while push-blocked.
+pub const RELEASE_ADVANCE_INTENT_KIND: &str = "release-advance";
+
 /// What one release trigger did with the outstanding release-run intents.
 pub struct ReleaseTrigger<'a> {
     /// The repository projection to persist.
@@ -2173,6 +2180,75 @@ impl RepositoryStore {
         Ok(event)
     }
 
+    /// Moves one unfinished release-advance intent to `to` and persists `state` with one event, in
+    /// a single transaction. The local half of an advance completes here (`external-applied` when
+    /// a frozen push is still owed, `completed` otherwise), and so does the push half
+    /// (`completed`, or `needs-attention` when push-blocked). Exactly one unfinished intent must
+    /// match, so a transition never resurrects an intent another operation already settled.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_release_advance(
+        &self,
+        state: &RepositoryState,
+        command_id: CommandId,
+        to: IntentState,
+        observed: &serde_json::Value,
+        actor: Actor,
+        event_kind: &str,
+        payload: serde_json::Value,
+    ) -> Result<DomainEvent, StoreError> {
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
+            "UPDATE operation_intents SET state=?2, observed_json=?3, updated_at=?4 WHERE command_id=?1 AND kind=?5 AND state IN ('prepared','external-applied','needs-attention')",
+            params![command_id.to_string(), to.as_str(), encode(observed)?, now(), RELEASE_ADVANCE_INTENT_KIND],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::Integrity(format!(
+                "release advance {command_id} is not unfinished"
+            )));
+        }
+        if matches!(
+            to,
+            IntentState::Completed | IntentState::Canceled | IntentState::NeedsAttention
+        ) {
+            transaction.execute(
+                "UPDATE volume_reservations SET active=0 WHERE intent_id IN (SELECT intent_id FROM operation_intents WHERE command_id=?1)",
+                [command_id.to_string()],
+            )?;
+        }
+        let persisted_sequence: i64 = transaction.query_row(
+            "SELECT event_sequence FROM repository_state WHERE repository_id=?1",
+            [state.id.to_string()],
+            |row| row.get(0),
+        )?;
+        let sequence =
+            state
+                .event_sequence
+                .max(u64::try_from(persisted_sequence).map_err(|_| {
+                    StoreError::Integrity("repository event sequence is negative".into())
+                })?)
+                + 1;
+        let mut persisted_state = state.clone();
+        persisted_state.event_sequence = sequence;
+        transaction.execute(
+            "UPDATE repository_state SET state_json=?2, queue_revision=?3, event_sequence=?4, updated_at=?5 WHERE repository_id=?1",
+            params![state.id.to_string(), self.encode_state(&persisted_state)?, state.queue_revision as i64, sequence as i64, now()],
+        )?;
+        let event = DomainEvent {
+            id: EventId::new(),
+            repository_id: state.id,
+            sequence,
+            actor,
+            command_id: Some(command_id),
+            kind: event_kind.into(),
+            payload,
+            created_at: OffsetDateTime::now_utc(),
+        };
+        insert_event(&transaction, &event)?;
+        transaction.commit()?;
+        Ok(event)
+    }
+
     pub fn append_event(&self, event: &DomainEvent) -> Result<(), StoreError> {
         let mut connection = self.connection.lock();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -3127,6 +3203,8 @@ mod tests {
             active_window_floor: 3,
             active_window_ceiling: 20,
             remote_enabled: false,
+            release_block_reasons: Vec::new(),
+            promotion_pause: None,
         }
     }
 
@@ -3153,6 +3231,8 @@ mod tests {
             active_window_floor: 3,
             active_window_ceiling: 20,
             remote_enabled: false,
+            release_block_reasons: Vec::new(),
+            promotion_pause: None,
         };
         store.initialize_repository(&state).unwrap();
         assert_eq!(store.repository_state().unwrap(), state);
@@ -3185,6 +3265,8 @@ mod tests {
             active_window_floor: 3,
             active_window_ceiling: 20,
             remote_enabled: false,
+            release_block_reasons: Vec::new(),
+            promotion_pause: None,
         };
         store.initialize_repository(&state).unwrap();
         store
@@ -3237,6 +3319,8 @@ mod tests {
             active_window_floor: 3,
             active_window_ceiling: 20,
             remote_enabled: false,
+            release_block_reasons: Vec::new(),
+            promotion_pause: None,
         };
         store.initialize_repository(&state).unwrap();
         let first = CommandId::new();
@@ -3575,6 +3659,8 @@ mod tests {
             active_window_floor: 3,
             active_window_ceiling: 20,
             remote_enabled: false,
+            release_block_reasons: Vec::new(),
+            promotion_pause: None,
         };
         store.initialize_repository(&state).unwrap();
         store
@@ -3629,6 +3715,8 @@ mod tests {
             active_window_floor: 3,
             active_window_ceiling: 20,
             remote_enabled: false,
+            release_block_reasons: Vec::new(),
+            promotion_pause: None,
         };
         store.initialize_repository(&state).unwrap();
         let item_id = QueueItemId::new();
@@ -3678,6 +3766,7 @@ mod tests {
             current_generation_id: Some(generation.id),
             buildset_id: None,
             certificate_id: None,
+            release_fix: false,
         };
         let command_id = CommandId::new();
         store
@@ -3767,8 +3856,105 @@ mod tests {
             current_generation_id: Some(generation.id),
             buildset_id: None,
             certificate_id: None,
+            release_fix: false,
         };
         (item, generation)
+    }
+
+    #[test]
+    fn release_advances_settle_their_single_intent_with_the_projection_and_one_event() {
+        let store = RepositoryStore::open_in_memory().unwrap();
+        store.set_release_stage_configured(true);
+        let mut state = lagging_state("release-advance");
+        store.initialize_repository(&state).unwrap();
+        let command = CommandId::new();
+        store
+            .prepare_operation(
+                state.id,
+                RELEASE_ADVANCE_INTENT_KIND,
+                command,
+                &serde_json::json!({"new": state.staging_oid}),
+            )
+            .unwrap();
+        // The local advance: `release` reaches `staging` while the push is still owed.
+        state.release_oid = state.staging_oid.clone();
+        state.release_lag = ReleaseLag::default();
+        state.release_state = ReleaseState::Green;
+        let advanced = store
+            .record_release_advance(
+                &state,
+                command,
+                IntentState::ExternalApplied,
+                &serde_json::json!({"release": state.release_oid}),
+                Actor::App,
+                "release.advanced",
+                serde_json::json!({}),
+            )
+            .unwrap();
+        assert_eq!(advanced.sequence, state.event_sequence + 1);
+        assert_eq!(
+            store.repository_state().unwrap().release_oid,
+            state.release_oid
+        );
+        let unfinished = store
+            .recoverable_operations(&[RELEASE_ADVANCE_INTENT_KIND])
+            .unwrap();
+        assert_eq!(unfinished.len(), 1);
+        assert_eq!(unfinished[0].3, IntentState::ExternalApplied);
+        // A blocked push stays recoverable, then completes.
+        state.event_sequence = advanced.sequence;
+        let blocked = store
+            .record_release_advance(
+                &state,
+                command,
+                IntentState::NeedsAttention,
+                &serde_json::json!({"push": "blocked"}),
+                Actor::App,
+                "release.push-blocked",
+                serde_json::json!({}),
+            )
+            .unwrap();
+        assert_eq!(blocked.sequence, advanced.sequence + 1);
+        assert_eq!(
+            store
+                .recoverable_operations(&[RELEASE_ADVANCE_INTENT_KIND])
+                .unwrap()[0]
+                .3,
+            IntentState::NeedsAttention
+        );
+        store
+            .record_release_advance(
+                &state,
+                command,
+                IntentState::Completed,
+                &serde_json::json!({"remote": state.release_oid}),
+                Actor::App,
+                "release.pushed",
+                serde_json::json!({}),
+            )
+            .unwrap();
+        assert!(
+            store
+                .recoverable_operations(&[RELEASE_ADVANCE_INTENT_KIND])
+                .unwrap()
+                .is_empty()
+        );
+        // A settled intent never transitions again, and nothing is written.
+        let sequence = store.repository_state().unwrap().event_sequence;
+        assert!(
+            store
+                .record_release_advance(
+                    &state,
+                    command,
+                    IntentState::Completed,
+                    &serde_json::json!({}),
+                    Actor::App,
+                    "release.pushed",
+                    serde_json::json!({}),
+                )
+                .is_err()
+        );
+        assert_eq!(store.repository_state().unwrap().event_sequence, sequence);
     }
 
     #[test]
@@ -3916,6 +4102,8 @@ mod tests {
             active_window_floor: 3,
             active_window_ceiling: 20,
             remote_enabled: false,
+            release_block_reasons: Vec::new(),
+            promotion_pause: None,
         };
         store.initialize_repository(&state).unwrap();
         let item_id = QueueItemId::new();
@@ -3965,6 +4153,7 @@ mod tests {
             current_generation_id: Some(generation.id),
             buildset_id: None,
             certificate_id: None,
+            release_fix: false,
         };
         let command_id = CommandId::new();
         store

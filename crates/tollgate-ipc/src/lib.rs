@@ -16,7 +16,9 @@ pub const PROTOCOL_VERSION: u16 = 1;
 /// 2 replaced repository state's `integration_ref` and `master_oid` with `staging_ref` and
 /// `staging_oid` and added `release_ref`, `release_oid`, `release_lag`, and `release_state`.
 /// Version 3 added the `release` queue item kind and repository snapshots' `release_runs`.
-pub const SCHEMA_VERSION: u16 = 3;
+/// Version 4 added repository state's `release_block_reasons` and `promotion_pause`, queue items'
+/// `release_fix`, and the `release_fix` flag of candidate authorization.
+pub const SCHEMA_VERSION: u16 = 4;
 /// Structured error code for a handshake between a `tg` and an app whose `SCHEMA_VERSION`s differ.
 pub const SCHEMA_MISMATCH_CODE: &str = "schema-version-mismatch";
 pub const MAX_CONTROL_PAYLOAD: usize = 8 * 1024 * 1024;
@@ -296,6 +298,10 @@ pub enum IpcCommand {
         repository_id: RepositoryId,
         item_id: QueueItemId,
         expected_revision: u64,
+        /// `tg approve --release-fix`: the candidate fixes a red release and bypasses the
+        /// `max_release_lag` promotion pause.
+        #[serde(default)]
+        release_fix: bool,
         command_id: CommandId,
     },
     Check {

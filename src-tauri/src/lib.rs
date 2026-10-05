@@ -1291,10 +1291,17 @@ async fn execute_ipc_command(service: &Service, command: IpcCommand) -> IpcRespo
                 repository_id,
                 item_id,
                 expected_revision,
+                release_fix,
                 command_id,
             } => serde_json::to_value(
                 service
-                    .authorize_candidate(repository_id, item_id, expected_revision, command_id)
+                    .authorize_candidate_with_options(
+                        repository_id,
+                        item_id,
+                        expected_revision,
+                        release_fix,
+                        command_id,
+                    )
                     .await
                     .map_err(encode_service_error)?,
             )

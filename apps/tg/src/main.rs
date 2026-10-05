@@ -142,6 +142,11 @@ struct GateRevisionArgs {
     wait: bool,
     #[arg(long, help = "Preserve the source worktree and branch after promotion")]
     retain_worktree: bool,
+    #[arg(
+        long,
+        help = "`tg approve <candidate-id>` only: the candidate fixes a red release; it moves ahead of other candidates and is never held back by max_release_lag"
+    )]
+    release_fix: bool,
 }
 
 #[derive(Args)]
@@ -446,12 +451,18 @@ async fn run(cli: Cli) -> anyhow::Result<u8> {
                     "--retain-worktree is captured when a candidate is submitted and cannot be changed during authorization"
                 ));
             }
+            if candidate_id.is_none() && args.release_fix {
+                return Err(anyhow!(
+                    "--release-fix authorizes an existing candidate; submit the fix with `tg candidate`, then run `tg approve --release-fix <candidate-id>`"
+                ));
+            }
             let response = if let Some(item_id) = candidate_id {
                 client
                     .request(IpcCommand::AuthorizeCandidate {
                         repository_id: repository.state.id,
                         item_id,
                         expected_revision: repository.state.queue_revision,
+                        release_fix: args.release_fix,
                         command_id: CommandId::new(),
                     })
                     .await?
@@ -496,6 +507,11 @@ async fn run(cli: Cli) -> anyhow::Result<u8> {
                     oid_value(&value["tested_oid"]),
                     value["queue_revision"]
                 );
+                if value["release_fix"].as_bool() == Some(true) {
+                    println!(
+                        "  release fix  moves ahead of other candidates and bypasses max_release_lag"
+                    );
+                }
                 if let Some(items) = value["restarted_item_ids"].as_array()
                     && !items.is_empty()
                 {
@@ -530,6 +546,11 @@ async fn run(cli: Cli) -> anyhow::Result<u8> {
             }
         }
         TopCommand::Candidate(args) => {
+            if args.release_fix {
+                return Err(anyhow!(
+                    "--release-fix applies to `tg approve <candidate-id>`, not `tg candidate`"
+                ));
+            }
             let repository = select_repository(&mut client, cli.repository).await?;
             let response = client
                 .request(IpcCommand::Candidate {
@@ -1660,6 +1681,7 @@ async fn push_master(
                         repository_id: repository.state.id,
                         item_id,
                         expected_revision: repository.state.queue_revision,
+                        release_fix: false,
                         command_id: CommandId::new(),
                     })
                     .await?;
@@ -3175,7 +3197,13 @@ mod tests {
             };
             assert!(args.retain_worktree);
             assert_eq!(args.revision, "HEAD");
+            assert!(!args.release_fix);
         }
+        let parsed = Cli::try_parse_from(["tg", "approve", "--release-fix", "candidate"]).unwrap();
+        let TopCommand::Approve(args) = parsed.command else {
+            panic!("expected approve");
+        };
+        assert!(args.release_fix);
     }
 
     #[test]

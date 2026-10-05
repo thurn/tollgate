@@ -20,6 +20,7 @@ export interface RepositoryState {
   execution_state: RepositoryExecutionState; block_reasons: BlockReason[];
   active_configuration_digest: string; active_window: number; active_window_floor: number;
   active_window_ceiling: number; remote_enabled: boolean;
+  release_block_reasons: BlockReason[]; promotion_pause: BlockReason | null;
 }
 export interface SourceMetadata {
   subject: string; message_hash: string; author_name: string; author_email: string;
@@ -30,7 +31,7 @@ export interface QueueItem {
   metadata: SourceMetadata; state: QueueItemState; terminal_reason?: string; remote_state: RemoteState;
   cleanup_state: CleanupState; dependencies: string[]; retry_of_item_id?: string; promotion_authorized: boolean;
   promotion_authorized_at?: string; promotion_authorized_by?: string; current_generation_id?: string;
-  buildset_id?: string; certificate_id?: string;
+  buildset_id?: string; certificate_id?: string; release_fix?: boolean;
 }
 export interface ValidationGeneration {
   id: string; item_id: string; anchored_base_oid: GitOid; ordered_item_ids: string[];
