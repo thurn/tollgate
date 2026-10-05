@@ -708,6 +708,27 @@ impl GitRepository {
         Ok(paths)
     }
 
+    /// The union of the paths each first-parent commit in `base..tip` changed, so path filters
+    /// select every step any commit in the range needs. An empty range (for example `base` equal
+    /// to `tip`) selects by `tip`'s own changes.
+    pub async fn changed_paths_in_range(
+        &self,
+        base: &GitOid,
+        tip: &GitOid,
+    ) -> Result<Vec<String>, GitError> {
+        let mut commits = self.first_parent_commits_between(base, tip).await?;
+        if commits.is_empty() {
+            commits.push(tip.clone());
+        }
+        let mut paths = Vec::new();
+        for commit in &commits {
+            paths.extend(self.changed_paths(commit).await?);
+        }
+        paths.sort();
+        paths.dedup();
+        Ok(paths)
+    }
+
     pub async fn ignored_directories(&self, worktree: &Path) -> Result<Vec<PathBuf>, GitError> {
         let output = run_raw(
             &self.profile.executable,
@@ -1537,6 +1558,31 @@ impl GitRepository {
         if self.integration_oid().await? != *new || self.release_oid().await? != *new {
             return Err(GitError::InvalidOutput(
                 "staging and release CAS result mismatch".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Promotion for a repository with release-stage steps: moves `staging` from
+    /// `expected_staging` to `new` and leaves `release` where it is, verifying in the same ref
+    /// transaction that `release` still holds `expected_release`.
+    pub async fn compare_and_swap_staging(
+        &self,
+        expected_staging: &GitOid,
+        expected_release: &GitOid,
+        new: &GitOid,
+    ) -> Result<(), GitError> {
+        self.ensure_integration_not_checked_out().await?;
+        self.update_refs(&format!(
+            "update {INTEGRATION_REF} {new} {expected_staging}\nverify {RELEASE_REF} {expected_release}\n",
+            new = new.to_hex(),
+            expected_staging = expected_staging.to_hex(),
+            expected_release = expected_release.to_hex(),
+        ))
+        .await?;
+        if self.integration_oid().await? != *new || self.release_oid().await? != *expected_release {
+            return Err(GitError::InvalidOutput(
+                "staging CAS result mismatch".into(),
             ));
         }
         Ok(())
@@ -2442,6 +2488,95 @@ mod tests {
             .unwrap();
         assert_eq!(adapter.integration_oid().await.unwrap(), third);
         assert_eq!(adapter.release_oid().await.unwrap(), third);
+    }
+
+    #[tokio::test]
+    async fn staging_promotion_leaves_release_and_verifies_it() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("file.txt"), "base\n").unwrap();
+        git(&repository, &["add", "file.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+        let adapter = GitRepository::discover(&repository).await.unwrap();
+        let base = adapter
+            .initialize_integration_ref_from_master()
+            .await
+            .unwrap();
+        std::fs::write(repository.join("file.txt"), "next\n").unwrap();
+        git(&repository, &["commit", "-am", "next"]);
+        let next = adapter.resolve_oid(USER_BRANCH_REF).await.unwrap();
+        std::fs::write(repository.join("file.txt"), "third\n").unwrap();
+        git(&repository, &["commit", "-am", "third"]);
+        let third = adapter.resolve_oid(USER_BRANCH_REF).await.unwrap();
+
+        adapter
+            .compare_and_swap_staging(&base, &base, &next)
+            .await
+            .unwrap();
+        assert_eq!(adapter.integration_oid().await.unwrap(), next);
+        assert_eq!(adapter.release_oid().await.unwrap(), base);
+
+        // A release that no longer holds its expected OID fails the transaction.
+        assert!(
+            adapter
+                .compare_and_swap_staging(&next, &next, &third)
+                .await
+                .is_err()
+        );
+        assert_eq!(adapter.integration_oid().await.unwrap(), next);
+        assert_eq!(adapter.release_oid().await.unwrap(), base);
+        // So does a staging that moved.
+        assert!(
+            adapter
+                .compare_and_swap_staging(&base, &base, &third)
+                .await
+                .is_err()
+        );
+        adapter
+            .compare_and_swap_staging(&next, &base, &third)
+            .await
+            .unwrap();
+        assert_eq!(adapter.integration_oid().await.unwrap(), third);
+        assert_eq!(adapter.release_oid().await.unwrap(), base);
+    }
+
+    #[tokio::test]
+    async fn range_changed_paths_are_the_union_of_every_first_parent_commit() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path();
+        git(repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("base.txt"), "base\n").unwrap();
+        git(repository, &["add", "base.txt"]);
+        git(repository, &["commit", "-m", "base"]);
+        let base = GitOid::from_hex(&git(repository, &["rev-parse", "HEAD"])).unwrap();
+        std::fs::create_dir(repository.join("docs")).unwrap();
+        std::fs::write(repository.join("docs/guide.md"), "guide\n").unwrap();
+        git(repository, &["add", "docs/guide.md"]);
+        git(repository, &["commit", "-m", "docs"]);
+        let docs = GitOid::from_hex(&git(repository, &["rev-parse", "HEAD"])).unwrap();
+        std::fs::create_dir(repository.join("src")).unwrap();
+        std::fs::write(repository.join("src/lib.rs"), "fn main() {}\n").unwrap();
+        git(repository, &["add", "src/lib.rs"]);
+        git(repository, &["commit", "-m", "source"]);
+        let tip = GitOid::from_hex(&git(repository, &["rev-parse", "HEAD"])).unwrap();
+        let adapter = GitRepository::discover(repository).await.unwrap();
+
+        assert_eq!(adapter.changed_paths(&tip).await.unwrap(), ["src/lib.rs"]);
+        assert_eq!(
+            adapter.changed_paths_in_range(&base, &tip).await.unwrap(),
+            ["docs/guide.md", "src/lib.rs"]
+        );
+        assert_eq!(
+            adapter.changed_paths_in_range(&docs, &tip).await.unwrap(),
+            ["src/lib.rs"]
+        );
+        assert_eq!(
+            adapter.changed_paths_in_range(&tip, &tip).await.unwrap(),
+            ["src/lib.rs"],
+            "an empty range selects by the tip's own changes"
+        );
     }
 
     #[tokio::test]

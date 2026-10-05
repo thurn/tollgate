@@ -836,47 +836,9 @@ async fn monitor_failure_notifications(
                 .iter()
                 .filter(|event| event.sequence > starting_cursor)
             {
-                let state = event
-                    .payload
-                    .get("state")
-                    .and_then(serde_json::Value::as_str);
-                let remote = event
-                    .payload
-                    .get("remote_state")
-                    .and_then(serde_json::Value::as_str);
-                let reason = event
-                    .payload
-                    .get("terminal_reason")
-                    .and_then(serde_json::Value::as_str);
-                let user_master_sync_attention = event.kind == "user-master.sync-needs-attention";
-                let failure = matches!(
-                    state,
-                    Some("failed" | "check-failed" | "infrastructure-exhausted")
-                ) || remote == Some("push-blocked")
-                    || reason == Some("baseline-failing")
-                    || user_master_sync_attention;
-                if failure && notifications_enabled {
-                    let subject = event
-                        .payload
-                        .get("metadata")
-                        .and_then(|metadata| metadata.get("subject"))
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("A Tollgate validation needs attention");
-                    let body = reason.unwrap_or_else(|| {
-                        if user_master_sync_attention {
-                            event
-                                .payload
-                                .get("reason")
-                                .and_then(serde_json::Value::as_str)
-                                .unwrap_or("Certified promotion succeeded, but local master still needs a manual fast-forward")
-                        } else if remote == Some("push-blocked") {
-                            "Remote push failed"
-                        } else if state == Some("infrastructure-exhausted") {
-                            "Infrastructure retries were exhausted"
-                        } else {
-                            "Validation failed"
-                        }
-                    });
+                if notifications_enabled
+                    && let Some((subject, body)) = event_notification(&event.kind, &event.payload)
+                {
                     let _ = app
                         .notification()
                         .builder()
@@ -900,6 +862,152 @@ async fn monitor_failure_notifications(
                 }
             }
         }
+    }
+}
+
+/// The desktop notification one repository history event raises, as a subject and body.
+///
+/// Release runs notify through their outcome events only: `release.run-failed` once per failing
+/// streak (`notify`) and `release.run-passed` once on recovery (`recovered`). Their item updates
+/// never notify, so a red release streak raises one notification, not one per run.
+fn event_notification(kind: &str, payload: &serde_json::Value) -> Option<(String, String)> {
+    let text = |value: &serde_json::Value| value.as_str().map(str::to_owned);
+    let short = |value: &serde_json::Value| {
+        value
+            .as_str()
+            .map(|oid| oid.chars().take(12).collect::<String>())
+            .unwrap_or_else(|| "staging".into())
+    };
+    match kind {
+        "release.run-failed" => {
+            if payload.get("notify").and_then(serde_json::Value::as_bool) != Some(true) {
+                return None;
+            }
+            let steps = payload["failing_steps"]
+                .as_array()
+                .map(|steps| {
+                    steps
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .filter(|steps| !steps.is_empty());
+            let commits = payload["range"]["commits"].as_u64().unwrap_or(0);
+            return Some((
+                "Release run failed".into(),
+                format!(
+                    "{} covering {commits} unreleased commit(s){}",
+                    short(&payload["tested_oid"]),
+                    steps
+                        .map(|steps| format!("; failing steps: {steps}"))
+                        .unwrap_or_default()
+                ),
+            ));
+        }
+        "release.run-passed" => {
+            if payload
+                .get("recovered")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+            {
+                return None;
+            }
+            return Some((
+                "Release recovered".into(),
+                format!("{} passed the release stage", short(&payload["tested_oid"])),
+            ));
+        }
+        _ => {}
+    }
+    if payload.get("kind").and_then(serde_json::Value::as_str) == Some("release") {
+        return None;
+    }
+    let state = payload.get("state").and_then(serde_json::Value::as_str);
+    let remote = payload
+        .get("remote_state")
+        .and_then(serde_json::Value::as_str);
+    let reason = payload
+        .get("terminal_reason")
+        .and_then(serde_json::Value::as_str);
+    let user_master_sync_attention = kind == "user-master.sync-needs-attention";
+    let failure = matches!(
+        state,
+        Some("failed" | "check-failed" | "infrastructure-exhausted")
+    ) || remote == Some("push-blocked")
+        || reason == Some("baseline-failing")
+        || user_master_sync_attention;
+    if !failure {
+        return None;
+    }
+    let subject = payload
+        .get("metadata")
+        .and_then(|metadata| metadata.get("subject"))
+        .and_then(text)
+        .unwrap_or_else(|| "A Tollgate validation needs attention".into());
+    let body = reason.map(str::to_owned).unwrap_or_else(|| {
+        if user_master_sync_attention {
+            payload
+                .get("reason")
+                .and_then(text)
+                .unwrap_or_else(|| "Certified promotion succeeded, but local master still needs a manual fast-forward".into())
+        } else if remote == Some("push-blocked") {
+            "Remote push failed".into()
+        } else if state == Some("infrastructure-exhausted") {
+            "Infrastructure retries were exhausted".into()
+        } else {
+            "Validation failed".into()
+        }
+    });
+    Some((subject, body))
+}
+
+#[cfg(test)]
+mod notification_tests {
+    use super::event_notification;
+
+    fn event(kind: &str, payload: serde_json::Value) -> Option<(String, String)> {
+        event_notification(kind, &payload)
+    }
+
+    #[test]
+    fn release_runs_notify_once_per_failing_streak_and_once_on_recovery() {
+        let failed = |notify| {
+            event(
+                "release.run-failed",
+                serde_json::json!({
+                    "notify": notify,
+                    "tested_oid": "a".repeat(40),
+                    "range": {"commits": 2},
+                    "failing_steps": ["full"],
+                }),
+            )
+        };
+        assert!(failed(true).is_some());
+        assert!(failed(false).is_none());
+        let passed = |recovered| {
+            event(
+                "release.run-passed",
+                serde_json::json!({"recovered": recovered, "tested_oid": "b".repeat(40)}),
+            )
+        };
+        assert!(passed(true).is_some());
+        assert!(passed(false).is_none());
+        assert!(
+            event(
+                "queue.item-updated",
+                serde_json::json!({"kind": "release", "state": "check-failed"}),
+            )
+            .is_none(),
+            "a failed release run's item update does not notify on its own"
+        );
+        assert!(
+            event(
+                "queue.item-updated",
+                serde_json::json!({"kind": "independent-check", "state": "check-failed"}),
+            )
+            .is_some()
+        );
     }
 }
 

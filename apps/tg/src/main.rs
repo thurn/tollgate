@@ -819,7 +819,13 @@ async fn run(cli: Cli) -> anyhow::Result<u8> {
                 let active = snapshot
                     .repositories
                     .iter()
-                    .flat_map(|repository| repository.queue.iter().chain(&repository.checks))
+                    .flat_map(|repository| {
+                        repository
+                            .queue
+                            .iter()
+                            .chain(&repository.checks)
+                            .chain(&repository.release_runs)
+                    })
                     .find(|view| view.item.id == id)
                     .is_some_and(|view| {
                         matches!(
@@ -2454,6 +2460,7 @@ fn status_view(repository: &RepositorySnapshot, id: QueueItemId) -> Option<&Queu
         .queue
         .iter()
         .chain(&repository.checks)
+        .chain(&repository.release_runs)
         .chain(&repository.history_items)
         .find(|view| view.item.id == id)
 }

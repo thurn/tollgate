@@ -26,7 +26,7 @@ use tokio::{
     time::{Instant, timeout},
 };
 use tokio_util::sync::CancellationToken;
-use tollgate_config::{EffectiveCommand, EffectiveConfig, EffectiveStep};
+use tollgate_config::{EffectiveCommand, EffectiveConfig, EffectiveStep, StepStage};
 use tollgate_domain::{GitOid, RepairCommand, StepAttemptId, StepDiagnostic, StepId};
 use tollgate_scheduler::{GlobalScheduler, StepResources};
 use uuid::Uuid;
@@ -1073,6 +1073,7 @@ pub async fn run_buildset(
 ) -> Result<BuildsetResult, RunnerError> {
     run_buildset_scheduled(
         config,
+        StepStage::Gate,
         execution,
         changed_paths,
         cancellation,
@@ -1082,16 +1083,32 @@ pub async fn run_buildset(
     .await
 }
 
+/// Runs one buildset of `stage`: a gate run executes the gate-stage steps only, and a release
+/// run executes the release-stage steps plus the gate-stage steps they need
+/// ([`EffectiveConfig::run_steps`]). Steps outside the run are not part of the buildset and are
+/// never reported, not even as skipped. `changed_paths` selects steps by their path filters; a
+/// release run passes the union of its whole tested range. The "at least one applicable voting
+/// step" rule applies to gate runs only: a release run whose path filters select no voting step
+/// passes vacuously, because every applicable release-stage voting step passed.
 pub async fn run_buildset_scheduled(
     config: &EffectiveConfig,
+    stage: StepStage,
     execution: BuildsetExecution,
     changed_paths: &[String],
     cancellation: CancellationToken,
     scheduler: Option<Arc<GlobalScheduler>>,
     reusable_steps: HashMap<String, ReusableStepResult>,
 ) -> Result<BuildsetResult, RunnerError> {
-    let applicable = config
-        .applicable_steps(changed_paths)
+    let run_steps = config.run_steps(stage);
+    let applicable = run_steps
+        .iter()
+        .copied()
+        .filter_map(|step| match step.is_applicable(changed_paths) {
+            Ok(true) => Some(Ok(step)),
+            Ok(false) => None,
+            Err(error) => Some(Err(error)),
+        })
+        .collect::<Result<Vec<_>, _>>()
         .map_err(|error| RunnerError::Interrupted(error.to_string()))?;
     let applicable_names = applicable
         .iter()
@@ -1100,7 +1117,7 @@ pub async fn run_buildset_scheduled(
     let mut results = HashMap::new();
     let mut ordered = Vec::new();
     let mut reused = HashMap::new();
-    for step in &config.steps {
+    for step in run_steps.iter().copied() {
         if let Some(reusable) = reusable_steps.get(&step.name) {
             let name = step.name.clone();
             if applicable_names.contains(name.as_str())
@@ -1113,8 +1130,7 @@ pub async fn run_buildset_scheduled(
             }
         }
     }
-    let mut skipped = config
-        .steps
+    let mut skipped = run_steps
         .iter()
         .filter(|step| !applicable_names.contains(step.name.as_str()))
         .map(|step| step.name.clone())
@@ -1240,9 +1256,9 @@ pub async fn run_buildset_scheduled(
             ordered.push((name, result));
         }
     }
-    for step in config
-        .steps
+    for step in run_steps
         .iter()
+        .copied()
         .filter(|step| applicable_names.contains(step.name.as_str()))
     {
         if verify_required_artifacts(step, &execution.slot_root, &execution.context).is_err() {
@@ -1252,13 +1268,11 @@ pub async fn run_buildset_scheduled(
             }
         }
     }
-    let applicable_voting = config
-        .steps
+    let applicable_voting = run_steps
         .iter()
         .any(|step| step.voting && applicable_names.contains(step.name.as_str()));
-    let voting_failed = (!config.allow_no_job && !applicable_voting)
-        || config
-            .steps
+    let voting_failed = (stage.is_gate() && !config.allow_no_job && !applicable_voting)
+        || run_steps
             .iter()
             .filter(|step| step.voting && applicable_names.contains(step.name.as_str()))
             .any(|step| {
@@ -1266,8 +1280,7 @@ pub async fn run_buildset_scheduled(
                     .get(&step.name)
                     .is_none_or(|class| *class != StepResultClass::Success)
             });
-    let warning = config
-        .steps
+    let warning = run_steps
         .iter()
         .filter(|step| !step.voting && applicable_names.contains(step.name.as_str()))
         .any(|step| {
@@ -1786,6 +1799,128 @@ printf '%s\n' '{"code":"BAD CODE","message":"unsafe","paths":["../escape"]}' > "
         );
     }
 
+    fn committed_slot(root: &Path) -> GitOid {
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .current_dir(root)
+                .env("GIT_AUTHOR_NAME", "Test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                .env("GIT_COMMITTER_NAME", "Test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?}");
+            String::from_utf8(output.stdout).unwrap()
+        };
+        git(&["init", "-q"]);
+        std::fs::write(root.join(".gitignore"), "*-ran\nlogs/\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "base"]);
+        GitOid::from_hex(git(&["rev-parse", "HEAD"]).trim()).unwrap()
+    }
+
+    fn slot_execution(root: &Path, tested_oid: GitOid) -> BuildsetExecution {
+        BuildsetExecution {
+            tested_oid,
+            slot_root: root.into(),
+            log_directory: root.join("logs"),
+            environment: std::env::vars().collect(),
+            context: BTreeMap::new(),
+        }
+    }
+
+    fn step_names(result: &BuildsetResult) -> Vec<&str> {
+        result.steps.iter().map(|(name, _)| name.as_str()).collect()
+    }
+
+    #[tokio::test]
+    async fn gate_runs_skip_release_steps_and_release_runs_rerun_only_needed_gate_steps() {
+        let config = EffectiveConfig::parse(
+            "version=1\n[[step]]\nname=\"setup\"\nrun=\"touch setup-ran\"\n[[step]]\nname=\"fast\"\nrun=\"touch fast-ran\"\nneeds=[\"setup\"]\n[[step]]\nname=\"full\"\nstage=\"release\"\nrun=\"test -f setup-ran && touch full-ran\"\nneeds=[\"setup\"]\n",
+        )
+        .unwrap();
+
+        let gate_slot = tempfile::tempdir().unwrap();
+        let gate_oid = committed_slot(gate_slot.path());
+        let gate = run_buildset_scheduled(
+            &config,
+            StepStage::Gate,
+            slot_execution(gate_slot.path(), gate_oid),
+            &[],
+            CancellationToken::new(),
+            None,
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+        assert!(gate.passed);
+        assert_eq!(step_names(&gate), ["setup", "fast"]);
+        assert!(gate.skipped.is_empty(), "{:?}", gate.skipped);
+        assert!(!gate_slot.path().join("full-ran").exists());
+
+        let release_slot = tempfile::tempdir().unwrap();
+        let release_oid = committed_slot(release_slot.path());
+        let release = run_buildset_scheduled(
+            &config,
+            StepStage::Release,
+            slot_execution(release_slot.path(), release_oid),
+            &[],
+            CancellationToken::new(),
+            None,
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+        assert!(release.passed);
+        assert_eq!(step_names(&release), ["setup", "full"]);
+        assert!(release.skipped.is_empty(), "{:?}", release.skipped);
+        assert!(!release_slot.path().join("fast-ran").exists());
+        assert!(release_slot.path().join("full-ran").exists());
+    }
+
+    #[tokio::test]
+    async fn release_runs_select_steps_by_the_changed_range_and_pass_when_none_apply() {
+        let config = EffectiveConfig::parse(
+            "version=1\n[[step]]\nname=\"base\"\nrun=\"true\"\n[[step]]\nname=\"fast\"\nrun=\"true\"\nneeds=[\"base\"]\n[[step]]\nname=\"full\"\nstage=\"release\"\nrun=\"touch full-ran\"\ninclude=[\"src/**\"]\n",
+        )
+        .unwrap();
+
+        let unrelated = tempfile::tempdir().unwrap();
+        let oid = committed_slot(unrelated.path());
+        let result = run_buildset_scheduled(
+            &config,
+            StepStage::Release,
+            slot_execution(unrelated.path(), oid),
+            &["docs/readme.md".into()],
+            CancellationToken::new(),
+            None,
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+        assert!(result.passed, "no applicable release step passes vacuously");
+        assert!(result.steps.is_empty());
+        assert_eq!(result.skipped, ["full"]);
+
+        let related = tempfile::tempdir().unwrap();
+        let oid = committed_slot(related.path());
+        let result = run_buildset_scheduled(
+            &config,
+            StepStage::Release,
+            slot_execution(related.path(), oid),
+            &["docs/readme.md".into(), "src/lib.rs".into()],
+            CancellationToken::new(),
+            None,
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+        assert!(result.passed);
+        assert_eq!(step_names(&result), ["full"]);
+        assert!(related.path().join("full-ran").exists());
+    }
+
     #[tokio::test]
     async fn explicitly_unconnected_roots_can_run_concurrently() {
         let temporary = tempfile::tempdir().unwrap();
@@ -1967,6 +2102,7 @@ needs=["a","b"]
         cancellation.cancel();
         let result = run_buildset_scheduled(
             &config,
+            StepStage::Gate,
             BuildsetExecution {
                 tested_oid: GitOid::from_hex("0000000000000000000000000000000000000000").unwrap(),
                 slot_root: temporary.path().into(),

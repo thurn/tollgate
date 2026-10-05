@@ -4,7 +4,10 @@ use std::{
     collections::HashSet,
     io::Read,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -23,6 +26,22 @@ pub type PromotionEdge = (Vec<u8>, Vec<u8>);
 
 /// Operation-intent kind for one batch of artifact pruning.
 pub const ARTIFACT_PRUNE_BATCH_KIND: &str = "artifact-prune-batch";
+
+/// Operation-intent kind a `staging` promotion records when release-stage steps exist: the
+/// durable `release.run-requested` intent the release trigger settles.
+pub const RELEASE_RUN_INTENT_KIND: &str = "release-run";
+
+/// What one release trigger did with the outstanding release-run intents.
+pub struct ReleaseTrigger<'a> {
+    /// The repository projection to persist.
+    pub state: &'a RepositoryState,
+    /// Release runs retired before queueing, each with its terminal projection.
+    pub retired: &'a [QueueItem],
+    /// The release run queued for the newest `staging` tip, with its generation.
+    pub queued: Option<(&'a QueueItem, &'a ValidationGeneration)>,
+    /// Why the trigger settled the intents, recorded as their observed evidence.
+    pub outcome: serde_json::Value,
+}
 
 const ARTIFACT_COLUMNS: &str = "artifact_id, buildset_id, source_path, retained_path, hash, size, retention_state, created_at, expires_at";
 type ArtifactRow = (
@@ -110,6 +129,9 @@ pub enum StoreError {
 #[derive(Clone)]
 pub struct RepositoryStore {
     connection: Arc<Mutex<Connection>>,
+    /// Whether the active configuration has release-stage steps, which lets `release` trail
+    /// `staging`. The service sets it; persisted projections are checked against it.
+    release_stage: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -205,6 +227,7 @@ impl RepositoryStore {
         migrate(&connection, Some(&path))?;
         let store = Self {
             connection: Arc::new(Mutex::new(connection)),
+            release_stage: Arc::new(AtomicBool::new(false)),
         };
         store.quick_integrity_check()?;
         Ok(store)
@@ -224,7 +247,40 @@ impl RepositoryStore {
         migrate(&connection, None)?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
+            release_stage: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    /// Records whether the active configuration has release-stage steps. Without them the
+    /// repository is opt-out, and every persisted projection must keep `staging` and `release`
+    /// at the same OID with nothing unreleased; debug builds, and with them every test, check
+    /// that after each state transition. With them, `release` may trail `staging`, and the
+    /// projection must only agree with itself (`RepositoryState::release_projection_consistent`).
+    pub fn set_release_stage_configured(&self, configured: bool) {
+        self.release_stage.store(configured, Ordering::Release);
+    }
+
+    pub fn release_stage_configured(&self) -> bool {
+        self.release_stage.load(Ordering::Acquire)
+    }
+
+    /// Encodes the repository projection for its single durable row.
+    fn encode_state(&self, state: &RepositoryState) -> Result<String, StoreError> {
+        debug_assert!(
+            state.release_projection_consistent(),
+            "release projection inconsistent: staging {}, release {}, lag {:?}, state {:?}",
+            state.staging_oid,
+            state.release_oid,
+            state.release_lag,
+            state.release_state,
+        );
+        debug_assert!(
+            self.release_stage_configured() || state.opt_out_equivalence_holds(),
+            "opt-out equivalence violated: staging {} and release {} must be equal with nothing unreleased",
+            state.staging_oid,
+            state.release_oid,
+        );
+        encode(state)
     }
 
     pub fn quick_integrity_check(&self) -> Result<(), StoreError> {
@@ -250,7 +306,7 @@ impl RepositoryStore {
     }
 
     pub fn initialize_repository(&self, state: &RepositoryState) -> Result<(), StoreError> {
-        let json = encode_state(state)?;
+        let json = self.encode_state(state)?;
         self.connection.lock().execute(
             "INSERT INTO repository_state (repository_id, state_json, queue_revision, event_sequence, schema_version, engine_epoch, active_configuration_digest, updated_at)\n             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)\n             ON CONFLICT(repository_id) DO UPDATE SET state_json=excluded.state_json, queue_revision=excluded.queue_revision, event_sequence=excluded.event_sequence, engine_epoch=excluded.engine_epoch, active_configuration_digest=excluded.active_configuration_digest, updated_at=excluded.updated_at",
             params![state.id.to_string(), json, state.queue_revision as i64, state.event_sequence as i64, SCHEMA_VERSION, state.engine_epoch as i64, state.active_configuration_digest, now()],
@@ -268,7 +324,7 @@ impl RepositoryStore {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute(
             "INSERT INTO repository_state (repository_id, state_json, queue_revision, event_sequence, schema_version, engine_epoch, active_configuration_digest, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![state.id.to_string(), encode_state(state)?, state.queue_revision as i64, state.event_sequence as i64, SCHEMA_VERSION, state.engine_epoch as i64, state.active_configuration_digest, now()],
+            params![state.id.to_string(), self.encode_state(state)?, state.queue_revision as i64, state.event_sequence as i64, SCHEMA_VERSION, state.engine_epoch as i64, state.active_configuration_digest, now()],
         )?;
         transaction.execute(
             "INSERT INTO configuration_snapshots (digest, schema_version, canonical_bytes, step_graph_digest, activation_sequence, supersedes_digest) VALUES (?1, ?2, ?3, ?4, 0, NULL)",
@@ -302,7 +358,7 @@ impl RepositoryStore {
     pub fn update_repository_state(&self, state: &RepositoryState) -> Result<(), StoreError> {
         let changed = self.connection.lock().execute(
             "UPDATE repository_state SET state_json=?2, queue_revision=?3, event_sequence=?4, engine_epoch=?5, active_configuration_digest=?6, updated_at=?7 WHERE repository_id=?1",
-            params![state.id.to_string(), encode_state(state)?, state.queue_revision as i64, state.event_sequence as i64, state.engine_epoch as i64, state.active_configuration_digest, now()],
+            params![state.id.to_string(), self.encode_state(state)?, state.queue_revision as i64, state.event_sequence as i64, state.engine_epoch as i64, state.active_configuration_digest, now()],
         )?;
         if changed == 0 {
             return Err(StoreError::RepositoryMissing);
@@ -328,7 +384,7 @@ impl RepositoryStore {
         )?;
         transaction.execute(
             "UPDATE repository_state SET state_json=?2, queue_revision=?3, event_sequence=?4, active_configuration_digest=?5, updated_at=?6 WHERE repository_id=?1",
-            params![state.id.to_string(), encode_state(state)?, state.queue_revision as i64, state.event_sequence as i64, state.active_configuration_digest, now()],
+            params![state.id.to_string(), self.encode_state(state)?, state.queue_revision as i64, state.event_sequence as i64, state.active_configuration_digest, now()],
         )?;
         transaction.execute(
             "UPDATE operation_intents SET state='external-applied', observed_json=?2, updated_at=?3 WHERE repository_id=?1 AND command_id=?4 AND kind='config-apply' AND state='prepared'",
@@ -482,7 +538,7 @@ impl RepositoryStore {
         let mut persisted_state: RepositoryState = decode(&state_json)?;
         persisted_state.queue_revision = new_revision as u64;
         persisted_state.event_sequence = new_sequence as u64;
-        transaction.execute("UPDATE repository_state SET state_json=?2, queue_revision=?3, event_sequence=?4, updated_at=?5 WHERE repository_id=?1", params![item.repository_id.to_string(), encode_state(&persisted_state)?, new_revision, new_sequence, now()])?;
+        transaction.execute("UPDATE repository_state SET state_json=?2, queue_revision=?3, event_sequence=?4, updated_at=?5 WHERE repository_id=?1", params![item.repository_id.to_string(), self.encode_state(&persisted_state)?, new_revision, new_sequence, now()])?;
         transaction.execute("UPDATE operation_intents SET state='completed', observed_json=?2, updated_at=?3 WHERE repository_id=?1 AND command_id=?4 AND kind='approval' AND state='prepared'", params![item.repository_id.to_string(), encode(item)?, now(), command_id.to_string()])?;
         transaction.execute("UPDATE volume_reservations SET active=0 WHERE intent_id IN (SELECT intent_id FROM operation_intents WHERE command_id=?1)", [command_id.to_string()])?;
         let event = DomainEvent {
@@ -534,7 +590,7 @@ impl RepositoryStore {
         persisted_state.event_sequence = new_sequence as u64;
         transaction.execute(
             "UPDATE repository_state SET state_json=?2, queue_revision=?3, event_sequence=?4, updated_at=?5 WHERE repository_id=?1",
-            params![item.repository_id.to_string(), encode_state(&persisted_state)?, revision, new_sequence, now()],
+            params![item.repository_id.to_string(), self.encode_state(&persisted_state)?, revision, new_sequence, now()],
         )?;
         transaction.execute(
             "UPDATE operation_intents SET state='completed', observed_json=?2, updated_at=?3 WHERE repository_id=?1 AND command_id=?4 AND kind='approval' AND state='prepared'",
@@ -613,7 +669,7 @@ impl RepositoryStore {
         )?;
         let mut persisted_state = state.clone();
         persisted_state.event_sequence = sequence;
-        transaction.execute("UPDATE repository_state SET state_json=?2, queue_revision=?3, event_sequence=?4, updated_at=?5 WHERE repository_id=?1", params![state.id.to_string(), encode_state(&persisted_state)?, state.queue_revision as i64, sequence as i64, now()])?;
+        transaction.execute("UPDATE repository_state SET state_json=?2, queue_revision=?3, event_sequence=?4, updated_at=?5 WHERE repository_id=?1", params![state.id.to_string(), self.encode_state(&persisted_state)?, state.queue_revision as i64, sequence as i64, now()])?;
         let event = DomainEvent {
             id: EventId::new(),
             repository_id: state.id,
@@ -693,7 +749,7 @@ impl RepositoryStore {
         persisted_state.event_sequence = new_sequence as u64;
         transaction.execute(
             "UPDATE repository_state SET state_json=?2, queue_revision=?3, event_sequence=?4, updated_at=?5 WHERE repository_id=?1",
-            params![state.id.to_string(), encode_state(&persisted_state)?, new_revision, new_sequence, now()],
+            params![state.id.to_string(), self.encode_state(&persisted_state)?, new_revision, new_sequence, now()],
         )?;
         let event = DomainEvent {
             id: EventId::new(),
@@ -751,7 +807,7 @@ impl RepositoryStore {
         persisted_state.event_sequence = sequence;
         transaction.execute(
             "UPDATE repository_state SET state_json=?2, queue_revision=?3, event_sequence=?4, updated_at=?5 WHERE repository_id=?1",
-            params![state.id.to_string(), encode_state(&persisted_state)?, state.queue_revision as i64, sequence as i64, now()],
+            params![state.id.to_string(), self.encode_state(&persisted_state)?, state.queue_revision as i64, sequence as i64, now()],
         )?;
         let event = DomainEvent {
             id: EventId::new(),
@@ -915,7 +971,7 @@ impl RepositoryStore {
         persisted_state.event_sequence = sequence;
         transaction.execute(
             "UPDATE repository_state SET state_json=?2, event_sequence=?3, updated_at=?4 WHERE repository_id=?1",
-            params![state.id.to_string(), encode_state(&persisted_state)?, sequence as i64, now()],
+            params![state.id.to_string(), self.encode_state(&persisted_state)?, sequence as i64, now()],
         )?;
         transaction.execute(
             "UPDATE operation_intents SET state='completed', observed_json=?2, updated_at=?3 WHERE repository_id=?1 AND command_id=?4 AND kind='artifact' AND state IN ('prepared','external-applied')",
@@ -1143,7 +1199,7 @@ impl RepositoryStore {
         persisted_state.event_sequence = sequence;
         transaction.execute(
             "UPDATE repository_state SET state_json=?2, event_sequence=?3, updated_at=?4 WHERE repository_id=?1",
-            params![state.id.to_string(), encode_state(&persisted_state)?, sequence as i64, recorded_at],
+            params![state.id.to_string(), self.encode_state(&persisted_state)?, sequence as i64, recorded_at],
         )?;
         let completed = transaction.execute(
             "UPDATE operation_intents SET state='completed', observed_json=?2, updated_at=?3 WHERE repository_id=?1 AND command_id=?4 AND kind=?5 AND state IN ('prepared','external-applied')",
@@ -1219,7 +1275,7 @@ impl RepositoryStore {
         persisted_state.event_sequence = sequence;
         transaction.execute(
             "UPDATE repository_state SET state_json=?2, event_sequence=?3, updated_at=?4 WHERE repository_id=?1",
-            params![state.id.to_string(), encode_state(&persisted_state)?, sequence as i64, now()],
+            params![state.id.to_string(), self.encode_state(&persisted_state)?, sequence as i64, now()],
         )?;
         if let Some(intent_kind) = intent_kind {
             transaction.execute(
@@ -1357,7 +1413,7 @@ impl RepositoryStore {
         persisted_state.event_sequence = sequence;
         transaction.execute(
             "UPDATE repository_state SET state_json=?2, event_sequence=?3, updated_at=?4 WHERE repository_id=?1",
-            params![state.id.to_string(), encode_state(&persisted_state)?, sequence as i64, now()],
+            params![state.id.to_string(), self.encode_state(&persisted_state)?, sequence as i64, now()],
         )?;
         transaction.execute(
             "UPDATE operation_intents SET state='completed', observed_json=?2, updated_at=?3 WHERE repository_id=?1 AND command_id=?4 AND kind='cache-snapshot' AND state IN ('prepared','external-applied')",
@@ -1482,7 +1538,7 @@ impl RepositoryStore {
         persisted_state.event_sequence = sequence;
         transaction.execute(
             "UPDATE repository_state SET state_json=?2, event_sequence=?3, updated_at=?4 WHERE repository_id=?1",
-            params![state.id.to_string(), encode_state(&persisted_state)?, sequence as i64, now()],
+            params![state.id.to_string(), self.encode_state(&persisted_state)?, sequence as i64, now()],
         )?;
         transaction.execute(
             "UPDATE operation_intents SET state='completed', observed_json=?2, updated_at=?3 WHERE repository_id=?1 AND command_id=?4 AND kind='cache-purge' AND state IN ('prepared','external-applied')",
@@ -1655,7 +1711,7 @@ impl RepositoryStore {
         persisted_state.event_sequence = sequence;
         transaction.execute(
             "UPDATE repository_state SET state_json=?2, queue_revision=?3, event_sequence=?4, updated_at=?5 WHERE repository_id=?1",
-            params![state.id.to_string(), encode_state(&persisted_state)?, state.queue_revision as i64, sequence as i64, now()],
+            params![state.id.to_string(), self.encode_state(&persisted_state)?, state.queue_revision as i64, sequence as i64, now()],
         )?;
         transaction.execute(
             "UPDATE operation_intents SET state='completed', observed_json=?2, updated_at=?3 WHERE repository_id=?1 AND command_id=?4 AND kind=?5 AND state IN ('prepared','external-applied','needs-attention')",
@@ -1917,18 +1973,40 @@ impl RepositoryStore {
         .transpose()
     }
 
+    /// Completes a promotion: the source promotion edge, the promoted item, the new repository
+    /// projection, and the completed promotion intent, in one transaction. A promotion in a
+    /// repository with release-stage steps passes `release_run_request`, which records a durable
+    /// `release-run` intent in the same transaction; the release trigger settles it outside the
+    /// repository mutation lock, and recovery replays it.
     pub fn record_promotion(
         &self,
         state: &RepositoryState,
         item: &QueueItem,
         certificate: &PassCertificate,
         old_master: &[u8],
+        release_run_request: Option<CommandId>,
     ) -> Result<(), StoreError> {
         let mut connection = self.connection.lock();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(command_id) = release_run_request {
+            transaction.execute(
+                "INSERT INTO operation_intents (intent_id, repository_id, kind, state, command_id, expected_json, created_at, updated_at) VALUES (?1, ?2, ?3, 'prepared', ?4, ?5, ?6, ?6)",
+                params![
+                    uuid::Uuid::now_v7().to_string(),
+                    state.id.to_string(),
+                    RELEASE_RUN_INTENT_KIND,
+                    command_id.to_string(),
+                    encode(&serde_json::json!({
+                        "staging_oid": certificate.tested_oid,
+                        "promoted_item_id": item.id,
+                    }))?,
+                    now()
+                ],
+            )?;
+        }
         transaction.execute("INSERT OR REPLACE INTO source_promotions (item_id, source_oid, promoted_oid, old_master_oid, certificate_id, event_sequence) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", params![item.id.to_string(), item.source_oid.as_bytes(), certificate.tested_oid.as_bytes(), old_master, certificate.id.to_string(), state.event_sequence as i64])?;
         transaction.execute("UPDATE queue_items SET state=?2, remote_state=?3, cleanup_state=?4, item_json=?5, active=0 WHERE item_id=?1", params![item.id.to_string(), enum_json(&item.state)?, enum_json(&item.remote_state)?, enum_json(&item.cleanup_state)?, encode(item)?])?;
-        transaction.execute("UPDATE repository_state SET state_json=?2, queue_revision=?3, event_sequence=?4, updated_at=?5 WHERE repository_id=?1", params![state.id.to_string(), encode_state(state)?, state.queue_revision as i64, state.event_sequence as i64, now()])?;
+        transaction.execute("UPDATE repository_state SET state_json=?2, queue_revision=?3, event_sequence=?4, updated_at=?5 WHERE repository_id=?1", params![state.id.to_string(), self.encode_state(state)?, state.queue_revision as i64, state.event_sequence as i64, now()])?;
         transaction.execute("UPDATE operation_intents SET state='completed', observed_json=?2, updated_at=?3 WHERE repository_id=?1 AND kind='promotion' AND state IN ('prepared','external-applied')", params![state.id.to_string(), encode(item)?, now()])?;
         transaction.execute("UPDATE volume_reservations SET active=0 WHERE intent_id IN (SELECT intent_id FROM operation_intents WHERE repository_id=?1 AND kind='promotion' AND state='completed')", [state.id.to_string()])?;
         let event = DomainEvent {
@@ -1944,6 +2022,99 @@ impl RepositoryStore {
         insert_event(&transaction, &event)?;
         transaction.commit()?;
         Ok(())
+    }
+
+    /// Applies one release trigger in a single transaction: retires superseded release runs,
+    /// queues the new one with its generation, completes every outstanding release-run intent,
+    /// persists `trigger.state`, and appends one event per change: `release.run-superseded` for
+    /// each retired run and `release.run-queued` for the new one. Returns the appended events;
+    /// with no change, it only completes the intents.
+    pub fn record_release_trigger(
+        &self,
+        trigger: &ReleaseTrigger<'_>,
+    ) -> Result<Vec<DomainEvent>, StoreError> {
+        let state = trigger.state;
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let persisted_sequence: i64 = transaction.query_row(
+            "SELECT event_sequence FROM repository_state WHERE repository_id=?1",
+            [state.id.to_string()],
+            |row| row.get(0),
+        )?;
+        let mut sequence =
+            state
+                .event_sequence
+                .max(u64::try_from(persisted_sequence).map_err(|_| {
+                    StoreError::Integrity("repository event sequence is negative".into())
+                })?);
+        let mut events = Vec::new();
+        let mut push_event = |kind: &str, payload: serde_json::Value| {
+            sequence += 1;
+            events.push(DomainEvent {
+                id: EventId::new(),
+                repository_id: state.id,
+                sequence,
+                actor: Actor::App,
+                command_id: None,
+                kind: kind.into(),
+                payload,
+                created_at: OffsetDateTime::now_utc(),
+            });
+        };
+        for item in trigger.retired {
+            transaction.execute(
+                "UPDATE queue_items SET state=?2, remote_state=?3, cleanup_state=?4, current_generation_id=?5, item_json=?6, active=?7 WHERE item_id=?1",
+                params![item.id.to_string(), enum_json(&item.state)?, enum_json(&item.remote_state)?, enum_json(&item.cleanup_state)?, item.current_generation_id.map(|id| id.to_string()), encode(item)?, (!item.state.is_terminal()) as i64],
+            )?;
+            push_event(
+                "release.run-superseded",
+                serde_json::json!({
+                    "item": item,
+                    "superseded_target": item.source_oid,
+                    "reason": item.terminal_reason,
+                    "outcome": trigger.outcome,
+                }),
+            );
+        }
+        if let Some((item, generation)) = trigger.queued {
+            transaction.execute(
+                "INSERT INTO queue_items (item_id, repository_id, source_format, source_oid, enqueue_sequence, state, remote_state, cleanup_state, current_generation_id, item_json, active) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1)",
+                params![item.id.to_string(), item.repository_id.to_string(), format!("{:?}", item.source_oid.format).to_lowercase(), item.source_oid.as_bytes(), item.enqueue_sequence as i64, enum_json(&item.state)?, enum_json(&item.remote_state)?, enum_json(&item.cleanup_state)?, generation.id.to_string(), encode(item)?],
+            )?;
+            transaction.execute(
+                "INSERT INTO validation_generations (generation_id, item_id, identity_digest, tested_format, tested_oid, expected_parent_format, expected_parent_oid, configuration_digest, step_graph_digest, engine_epoch, generation_json, current) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1)",
+                params![generation.id.to_string(), generation.item_id.to_string(), generation.identity_digest, format!("{:?}", generation.tested_oid.format).to_lowercase(), generation.tested_oid.as_bytes(), format!("{:?}", generation.expected_parent_oid.format).to_lowercase(), generation.expected_parent_oid.as_bytes(), generation.configuration_digest, generation.step_graph_digest, generation.engine_epoch as i64, encode(generation)?],
+            )?;
+            push_event(
+                "release.run-queued",
+                serde_json::json!({
+                    "item": item,
+                    "tested_oid": generation.tested_oid,
+                    "range": {
+                        "from": generation.anchored_base_oid,
+                        "to": generation.tested_oid,
+                    },
+                    "outcome": trigger.outcome,
+                }),
+            );
+        }
+        transaction.execute(
+            "UPDATE operation_intents SET state='completed', observed_json=?2, updated_at=?3 WHERE repository_id=?1 AND kind=?4 AND state IN ('prepared','external-applied')",
+            params![state.id.to_string(), encode(&trigger.outcome)?, now(), RELEASE_RUN_INTENT_KIND],
+        )?;
+        if !events.is_empty() {
+            let mut persisted_state = state.clone();
+            persisted_state.event_sequence = sequence;
+            transaction.execute(
+                "UPDATE repository_state SET state_json=?2, queue_revision=?3, event_sequence=?4, updated_at=?5 WHERE repository_id=?1",
+                params![state.id.to_string(), self.encode_state(&persisted_state)?, state.queue_revision as i64, sequence as i64, now()],
+            )?;
+            for event in &events {
+                insert_event(&transaction, event)?;
+            }
+        }
+        transaction.commit()?;
+        Ok(events)
     }
 
     pub fn promoted_oid_bytes(&self, source_oid: &GitOid) -> Result<Option<Vec<u8>>, StoreError> {
@@ -1982,7 +2153,7 @@ impl RepositoryStore {
         persisted_state.event_sequence = state.event_sequence + 1;
         let changed = transaction.execute(
             "UPDATE repository_state SET state_json=?2, queue_revision=?3, event_sequence=?4, engine_epoch=?5, active_configuration_digest=?6, updated_at=?7 WHERE repository_id=?1",
-            params![state.id.to_string(), encode_state(&persisted_state)?, persisted_state.queue_revision as i64, persisted_state.event_sequence as i64, persisted_state.engine_epoch as i64, persisted_state.active_configuration_digest, now()],
+            params![state.id.to_string(), self.encode_state(&persisted_state)?, persisted_state.queue_revision as i64, persisted_state.event_sequence as i64, persisted_state.engine_epoch as i64, persisted_state.active_configuration_digest, now()],
         )?;
         if changed == 0 {
             return Err(StoreError::RepositoryMissing);
@@ -2834,19 +3005,6 @@ fn verify_sqlite_version(connection: &Connection) -> Result<(), StoreError> {
 fn encode(value: &impl Serialize) -> Result<String, StoreError> {
     Ok(serde_json::to_string(value)?)
 }
-/// Encodes the repository projection for its single durable row. Every repository is opt-out
-/// (no release-stage steps) until release runs exist, so every persisted projection must keep
-/// `staging` and `release` at the same OID; debug builds, and with them every test, check that
-/// opt-out equivalence holds after each state transition.
-fn encode_state(state: &RepositoryState) -> Result<String, StoreError> {
-    debug_assert!(
-        state.opt_out_equivalence_holds(),
-        "opt-out equivalence violated: staging {} and release {} must be equal with nothing unreleased",
-        state.staging_oid,
-        state.release_oid,
-    );
-    encode(state)
-}
 fn decode<T: DeserializeOwned>(value: &str) -> Result<T, StoreError> {
     Ok(serde_json::from_str(value)?)
 }
@@ -3549,6 +3707,190 @@ mod tests {
         ));
         assert!(store.queue_items().unwrap().is_empty());
         assert_eq!(store.unfinished_approvals().unwrap().len(), 1);
+    }
+
+    fn lagging_state(name: &str) -> RepositoryState {
+        let mut state = test_state(name);
+        state.staging_oid = oid(2);
+        state.release_lag = ReleaseLag {
+            commits: 1,
+            since: Some(OffsetDateTime::now_utc()),
+        };
+        state.release_state = ReleaseState::Pending;
+        state
+    }
+
+    fn release_run(state: &RepositoryState, sequence: u64) -> (QueueItem, ValidationGeneration) {
+        let item_id = QueueItemId::new();
+        let generation = ValidationGeneration::derive(
+            ValidationGenerationId::new(),
+            item_id,
+            state.release_oid.clone(),
+            vec![item_id],
+            vec![state.staging_oid.clone()],
+            vec![state.staging_oid.clone()],
+            state.release_oid.clone(),
+            state.staging_oid.clone(),
+            "digest".into(),
+            "release-steps".into(),
+            state.engine_epoch,
+        );
+        let item = QueueItem {
+            id: item_id,
+            repository_id: state.id,
+            kind: QueueItemKind::Release,
+            admission_sequence: Some(sequence),
+            enqueue_sequence: sequence,
+            source_oid: state.staging_oid.clone(),
+            source_ref: format!("refs/tollgate/sources/{item_id}"),
+            metadata: SourceMetadata {
+                subject: "tip".into(),
+                message_hash: "message".into(),
+                author_name: "Tollgate Test".into(),
+                author_email: "test@example.com".into(),
+                branch: None,
+                worktree_path: None,
+                signature_state: SignatureState::Unknown,
+                approved_at: OffsetDateTime::now_utc(),
+                purpose: Some("release".into()),
+            },
+            state: QueueItemState::Queued,
+            terminal_reason: None,
+            remote_state: RemoteState::Disabled,
+            cleanup_state: CleanupState::NotEligible,
+            cleanup_policy: CleanupPolicy::Automatic,
+            dependencies: Vec::new(),
+            retry_of_item_id: None,
+            promotion_authorized: false,
+            promotion_authorized_at: None,
+            promotion_authorized_by: None,
+            current_generation_id: Some(generation.id),
+            buildset_id: None,
+            certificate_id: None,
+        };
+        (item, generation)
+    }
+
+    #[test]
+    fn release_triggers_retire_queue_and_settle_every_intent_in_one_transaction() {
+        let store = RepositoryStore::open_in_memory().unwrap();
+        store.set_release_stage_configured(true);
+        let mut state = lagging_state("release-trigger");
+        store.initialize_repository(&state).unwrap();
+        for _ in 0..2 {
+            store
+                .prepare_operation(
+                    state.id,
+                    RELEASE_RUN_INTENT_KIND,
+                    CommandId::new(),
+                    &serde_json::json!({"staging_oid": state.staging_oid}),
+                )
+                .unwrap();
+        }
+        let (first, first_generation) = release_run(&state, 1);
+        let events = store
+            .record_release_trigger(&ReleaseTrigger {
+                state: &state,
+                retired: &[],
+                queued: Some((&first, &first_generation)),
+                outcome: serde_json::json!({"action": "queued"}),
+            })
+            .unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.kind.as_str())
+                .collect::<Vec<_>>(),
+            ["release.run-queued"]
+        );
+        assert_eq!(
+            events[0].payload["range"]["from"],
+            serde_json::json!(oid(1))
+        );
+        assert_eq!(events[0].payload["range"]["to"], serde_json::json!(oid(2)));
+        assert!(
+            store
+                .unfinished_operations(&[RELEASE_RUN_INTENT_KIND])
+                .unwrap()
+                .is_empty(),
+            "one trigger settles every outstanding intent"
+        );
+        state.event_sequence = events[0].sequence;
+        assert_eq!(store.repository_state().unwrap(), state);
+
+        state.staging_oid = oid(3);
+        state.release_lag.commits = 2;
+        store.update_repository_state(&state).unwrap();
+        store
+            .prepare_operation(
+                state.id,
+                RELEASE_RUN_INTENT_KIND,
+                CommandId::new(),
+                &serde_json::json!({"staging_oid": state.staging_oid}),
+            )
+            .unwrap();
+        let mut superseded = first.clone();
+        superseded.state = QueueItemState::Superseded;
+        superseded.terminal_reason = Some("superseded-by-newer-staging-tip".into());
+        let (second, second_generation) = release_run(&state, 2);
+        let events = store
+            .record_release_trigger(&ReleaseTrigger {
+                state: &state,
+                retired: std::slice::from_ref(&superseded),
+                queued: Some((&second, &second_generation)),
+                outcome: serde_json::json!({"action": "retargeted"}),
+            })
+            .unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.kind.as_str())
+                .collect::<Vec<_>>(),
+            ["release.run-superseded", "release.run-queued"]
+        );
+        assert_eq!(events[1].sequence, events[0].sequence + 1);
+        let items = store.queue_items().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].state, QueueItemState::Superseded);
+        assert_eq!(items[1].source_oid, oid(3));
+        assert!(
+            store
+                .unfinished_operations(&[RELEASE_RUN_INTENT_KIND])
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store.repository_state().unwrap().event_sequence,
+            events[1].sequence
+        );
+    }
+
+    #[test]
+    fn a_release_stage_lets_release_trail_staging_in_persisted_state() {
+        let store = RepositoryStore::open_in_memory().unwrap();
+        store.set_release_stage_configured(true);
+        let state = lagging_state("release-stage");
+        store.initialize_repository(&state).unwrap();
+        assert_eq!(store.repository_state().unwrap(), state);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "opt-out equivalence violated")]
+    fn opt_out_repositories_never_persist_a_trailing_release() {
+        let store = RepositoryStore::open_in_memory().unwrap();
+        let _ = store.initialize_repository(&lagging_state("opt-out"));
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "release projection inconsistent")]
+    fn persisted_release_projections_agree_with_the_refs() {
+        let store = RepositoryStore::open_in_memory().unwrap();
+        store.set_release_stage_configured(true);
+        let mut state = lagging_state("inconsistent");
+        state.release_state = ReleaseState::Green;
+        let _ = store.initialize_repository(&state);
     }
 
     #[test]

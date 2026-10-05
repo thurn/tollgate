@@ -4,7 +4,7 @@ export type QueueItemState =
   | "promoted-local-push-pending" | "promoted" | "externally-integrated" | "failed"
   | "merge-conflict" | "dependency-failed" | "canceled" | "superseded" | "infrastructure-exhausted"
   | "check-passed" | "check-failed";
-export type QueueItemKind = "gate" | "independent-check";
+export type QueueItemKind = "gate" | "independent-check" | "release";
 export type BuildsetState = "pending" | "preparing" | "running" | "passed" | "passed-with-warnings" | "failed" | "interrupted" | "canceled" | "invalidated" | "infrastructure-exhausted";
 export type RemoteState = "disabled" | "preflight-pending" | "ready" | "pushing" | "push-blocked" | "synchronized" | "abandoned";
 export type CleanupState = "not-eligible" | "pending" | "running" | "completed" | "needs-attention";
@@ -76,7 +76,7 @@ export interface SeedView { id: string; path: string; profile: string; generatio
 export interface ArtifactRecord { artifact_id: string; buildset_id: string; source_path: string; retained_path: string; hash: string; size: number; retention_state: "retained" | "pinned"; created_at: string; expires_at: string }
 export interface DiagnosticCheck { name: string; status: "healthy" | "attention"; detail: string; recovery_action?: string }
 export interface DoctorReport { repository_id: string; generated_at: string; checks: DiagnosticCheck[]; healthy: boolean; activation?: ActivatingRepository }
-export interface RepositorySnapshot { state: RepositoryState; observed_master_oid: GitOid; queue: QueueItemView[]; checks: QueueItemView[]; master_push?: QueueItemView; history_items: QueueItemView[]; history: DomainEvent[]; configuration: ConfigurationView; resources: ResourceView; slots: SlotView[]; seeds: SeedView[]; artifacts: ArtifactRecord[] }
+export interface RepositorySnapshot { state: RepositoryState; observed_master_oid: GitOid; queue: QueueItemView[]; checks: QueueItemView[]; release_runs?: QueueItemView[]; master_push?: QueueItemView; history_items: QueueItemView[]; history: DomainEvent[]; configuration: ConfigurationView; resources: ResourceView; slots: SlotView[]; seeds: SeedView[]; artifacts: ArtifactRecord[] }
 export interface EnvironmentView { snapshot_id: string; fingerprint: string; path: string; variable_count: number }
 export interface UnavailableRepository { id: string; name: string; path: string; error: string; recovery_action: string }
 export type ActivationPhase = "queued" | "opening" | "recovering" | "resuming";

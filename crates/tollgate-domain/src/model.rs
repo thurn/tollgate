@@ -13,6 +13,9 @@ pub enum QueueItemKind {
     #[default]
     Gate,
     IndependentCheck,
+    /// A release run: the release-stage steps on one exact `staging` OID. It never enters the
+    /// dependent gate queue and never promotes; it ends in `check-passed` or `check-failed`.
+    Release,
 }
 
 /// The ref every repository registered before staged release used as its single integration
@@ -23,8 +26,10 @@ pub const LEGACY_INTEGRATION_REF: &str = "refs/heads/release";
 ///
 /// `staging_ref` is the Tollgate-owned integration ref every promotion advances and new work
 /// bases on. `release_ref` is the Tollgate-owned ref the remote push publishes. A repository
-/// without release-stage steps (every repository until release runs exist) keeps both at the same
-/// OID: every promotion updates them together in one ref transaction (opt-out equivalence).
+/// without release-stage steps keeps both at the same OID: every promotion updates them together
+/// in one ref transaction (opt-out equivalence). A repository with release-stage steps promotes
+/// to `staging` alone, so `release` may trail it; `release_lag` and `release_state` then describe
+/// the unreleased range.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(from = "PersistedRepositoryState")]
 pub struct RepositoryState {
@@ -60,11 +65,57 @@ impl RepositoryState {
     }
 
     /// Opt-out equivalence: with no release-stage steps, `staging` and `release` name the same
-    /// OID and nothing is unreleased. Every repository is opt-out until release runs exist.
+    /// OID and nothing is unreleased.
     pub fn opt_out_equivalence_holds(&self) -> bool {
         self.staging_oid == self.release_oid
             && self.release_lag == ReleaseLag::default()
             && self.release_state == ReleaseState::Green
+    }
+
+    /// Whether `release` trails `staging`.
+    pub fn has_unreleased_commits(&self) -> bool {
+        self.staging_oid != self.release_oid
+    }
+
+    /// Recomputes `release_lag` and `release_state` from the number of first-parent commits on
+    /// `staging` that `release` does not contain and the verdict of the latest conclusive release
+    /// run. Nothing unreleased is green. Otherwise the state is failing when the latest release
+    /// run failed and pending when it passed or none has finished; `since` keeps the moment
+    /// `staging` first advanced past `release`, or starts now.
+    pub fn refresh_release_projection(
+        &mut self,
+        unreleased_commits: u64,
+        latest_release_run_failed: bool,
+        now: OffsetDateTime,
+    ) {
+        if !self.has_unreleased_commits() {
+            self.release_lag = ReleaseLag::default();
+            self.release_state = ReleaseState::Green;
+            return;
+        }
+        self.release_lag = ReleaseLag {
+            commits: unreleased_commits.max(1),
+            since: Some(self.release_lag.since.unwrap_or(now)),
+        };
+        self.release_state = if latest_release_run_failed {
+            ReleaseState::Failing
+        } else {
+            ReleaseState::Pending
+        };
+    }
+
+    /// The release projection agrees with the refs: `release` equal to `staging` is exactly no
+    /// lag and green; a trailing `release` has a positive lag with its start time and is pending
+    /// or failing. Every persisted state satisfies this whether or not the repository has
+    /// release-stage steps.
+    pub fn release_projection_consistent(&self) -> bool {
+        if self.has_unreleased_commits() {
+            self.release_lag.commits > 0
+                && self.release_lag.since.is_some()
+                && self.release_state != ReleaseState::Green
+        } else {
+            self.opt_out_equivalence_holds()
+        }
     }
 }
 
@@ -545,6 +596,45 @@ mod tests {
         assert_eq!(state.release_lag, ReleaseLag::default());
         assert_eq!(state.release_state, ReleaseState::Green);
         assert!(state.opt_out_equivalence_holds());
+    }
+
+    #[test]
+    fn release_projection_follows_lag_and_the_latest_release_verdict() {
+        let mut state = serde_json::from_value::<RepositoryState>(repository_state_json()).unwrap();
+        let started = OffsetDateTime::UNIX_EPOCH;
+        state.release_lag = ReleaseLag::default();
+        state.refresh_release_projection(2, false, started);
+        assert_eq!(state.release_lag.commits, 2);
+        assert_eq!(state.release_lag.since, Some(started));
+        assert_eq!(state.release_state, ReleaseState::Pending);
+        assert!(state.release_projection_consistent());
+
+        let later = started + time::Duration::hours(1);
+        state.refresh_release_projection(3, true, later);
+        assert_eq!(state.release_lag.commits, 3);
+        assert_eq!(
+            state.release_lag.since,
+            Some(started),
+            "lag keeps the moment staging first advanced past release"
+        );
+        assert_eq!(state.release_state, ReleaseState::Failing);
+        assert!(state.release_projection_consistent());
+
+        state.release_oid = state.staging_oid.clone();
+        state.refresh_release_projection(0, true, later);
+        assert!(state.opt_out_equivalence_holds());
+        assert!(state.release_projection_consistent());
+
+        let mut inconsistent =
+            serde_json::from_value::<RepositoryState>(repository_state_json()).unwrap();
+        assert!(
+            !inconsistent.release_projection_consistent(),
+            "lag without a start time"
+        );
+        inconsistent.release_lag.since = Some(started);
+        assert!(inconsistent.release_projection_consistent());
+        inconsistent.release_state = ReleaseState::Green;
+        assert!(!inconsistent.release_projection_consistent());
     }
 
     #[test]

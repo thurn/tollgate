@@ -550,22 +550,34 @@ impl EffectiveConfig {
             .collect()
     }
 
-    fn from_file(raw: ConfigFile) -> Result<Self, ConfigError> {
-        let config = Self::build(raw)?;
-        if let Some(step) = config.stage_steps(StepStage::Release).next() {
-            return Err(ConfigError::InvalidStep {
-                step: step.name.clone(),
-                message: "stage = \"release\" is not supported by this Tollgate version; \
-                          release-stage validation is not available yet"
-                    .into(),
-            });
-        }
-        Ok(config)
+    /// Whether the configuration declares a release stage. Without one, the
+    /// repository is opt-out: every promotion moves `staging` and `release`
+    /// together and no release run is ever queued.
+    pub fn has_release_stage(&self) -> bool {
+        self.release_step_graph_digest.is_some()
     }
 
-    /// Parse and validate every stage rule. `from_file` additionally rejects
-    /// release-stage steps, which this version cannot yet execute.
-    fn build(raw: ConfigFile) -> Result<Self, ConfigError> {
+    /// Steps one run of `stage` executes, in declaration order. A gate run
+    /// executes the gate-stage steps; a release run executes
+    /// [`Self::release_run_steps`].
+    pub fn run_steps(&self, stage: StepStage) -> Vec<&EffectiveStep> {
+        match stage {
+            StepStage::Gate => self.stage_steps(StepStage::Gate).collect(),
+            StepStage::Release => self.release_run_steps(),
+        }
+    }
+
+    /// The release-stage step graph digest a release run freezes, or the
+    /// gate-stage digest for a gate run.
+    pub fn run_step_graph_digest(&self, stage: StepStage) -> Option<&str> {
+        match stage {
+            StepStage::Gate => Some(&self.step_graph_digest),
+            StepStage::Release => self.release_step_graph_digest.as_deref(),
+        }
+    }
+
+    /// Parse and validate every stage rule.
+    fn from_file(raw: ConfigFile) -> Result<Self, ConfigError> {
         if raw.version != 1 {
             return Err(ConfigError::UnsupportedVersion(raw.version));
         }
@@ -1356,10 +1368,8 @@ mod tests {
     const LEGACY_SINGLE: &str = "version = 1\n[[step]]\nname = \"ci\"\nrun = \"./ci\"\n";
     const LEGACY_CHAIN: &str = "version = 1\nsync_user_master = false\n[resources]\nrepository_concurrency = 1\n[[step]]\nname = \"build\"\nrun = \"build\"\n[[step]]\nname = \"test\"\nargv = [\"cargo\", \"test\"]\nvoting = false\n[[step]]\nname = \"lint\"\nrun = \"lint\"\nneeds = []\n";
 
-    /// Parse with every stage rule but without the interim rejection of
-    /// release-stage steps.
     fn staged(input: &str) -> Result<EffectiveConfig, ConfigError> {
-        EffectiveConfig::build(toml::from_str(input)?)
+        EffectiveConfig::parse(input)
     }
 
     fn staged_pair(gate: &str, release: &str) -> EffectiveConfig {
@@ -1475,17 +1485,35 @@ mod tests {
     }
 
     #[test]
-    fn release_stage_steps_are_rejected_until_release_runs_exist() {
-        let input = "version = 1\n[[step]]\nname = \"fast\"\nrun = \"fast\"\n[[step]]\nname = \"full\"\nstage = \"release\"\nrun = \"full\"\n";
-        let error = EffectiveConfig::parse(input).unwrap_err();
-        assert!(
-            matches!(&error, ConfigError::InvalidStep { step, .. } if step == "full"),
-            "{error}"
+    fn release_stage_steps_are_accepted_and_select_the_release_run() {
+        let input = "version = 1\n[[step]]\nname = \"fast\"\nrun = \"fast\"\n[[step]]\nname = \"lint\"\nrun = \"lint\"\nneeds = []\n[[step]]\nname = \"full\"\nstage = \"release\"\nrun = \"full\"\nneeds = [\"fast\"]\n";
+        let config = EffectiveConfig::parse(input).unwrap();
+        assert!(config.has_release_stage());
+        assert_eq!(config.steps[2].stage, StepStage::Release);
+        let names = |steps: Vec<&EffectiveStep>| {
+            steps
+                .into_iter()
+                .map(|step| step.name.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(config.run_steps(StepStage::Gate)), ["fast", "lint"]);
+        assert_eq!(
+            names(config.run_steps(StepStage::Release)),
+            ["fast", "full"]
         );
-        assert!(error.to_string().contains("stage"), "{error}");
-        let config = staged(input).unwrap();
-        assert_eq!(config.steps[1].stage, StepStage::Release);
-        assert_eq!(config.steps[1].needs, ["fast"]);
+        assert_eq!(
+            config.run_step_graph_digest(StepStage::Release),
+            config.release_step_graph_digest.as_deref()
+        );
+        assert_eq!(
+            config.run_step_graph_digest(StepStage::Gate),
+            Some(config.step_graph_digest.as_str())
+        );
+
+        let opt_out = EffectiveConfig::parse(LEGACY_SINGLE).unwrap();
+        assert!(!opt_out.has_release_stage());
+        assert!(opt_out.run_steps(StepStage::Release).is_empty());
+        assert_eq!(opt_out.run_step_graph_digest(StepStage::Release), None);
         assert!(
             EffectiveConfig::parse(
                 "version = 1\n[[step]]\nname = \"ci\"\nrun = \"ci\"\nstage = \"nightly\"\n"

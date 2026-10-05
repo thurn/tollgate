@@ -88,6 +88,8 @@ impl QueueItemState {
             (S::Running, E::VotingFailed) => S::Failed,
             (S::Running, E::IndependentCheckPassed) => S::CheckPassed,
             (S::Running, E::IndependentCheckFailed) => S::CheckFailed,
+            (S::Running, E::ReleasePassed) => S::CheckPassed,
+            (S::Running, E::ReleaseFailed) => S::CheckFailed,
             (S::Ready, E::PromotionStarted) => S::Promoting,
             (S::Promoting, E::PromotionDeferred) => S::Ready,
             (S::Promoting, E::PromotedWithoutPush) => S::Promoted,
@@ -165,6 +167,10 @@ pub enum ItemEvent {
     PushAbandoned,
     IndependentCheckPassed,
     IndependentCheckFailed,
+    /// Every applicable voting step of a release run passed.
+    ReleasePassed,
+    /// A release run's voting step failed.
+    ReleaseFailed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

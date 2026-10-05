@@ -16,8 +16,11 @@ use tollgate_domain::{BuildsetId, RepositoryId, StepId};
 pub enum PriorityClass {
     GateHead = 0,
     Speculative = 1,
-    Independent = 2,
-    Maintenance = 3,
+    /// A release run on an exact `staging` OID: after speculative gate descendants, before
+    /// independent checks.
+    Release = 2,
+    Independent = 3,
+    Maintenance = 4,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -443,6 +446,34 @@ mod tests {
             affinity_score: 0,
         });
         assert_eq!(scheduler.next_buildset().unwrap().buildset_id, head);
+    }
+
+    #[test]
+    fn release_runs_follow_speculative_gate_work_and_precede_independent_checks() {
+        let scheduler = scheduler();
+        let repo = RepositoryId::new();
+        let enqueue = |priority| {
+            let buildset_id = BuildsetId::new();
+            scheduler.enqueue(DispatchRequest {
+                repository_id: repo,
+                buildset_id,
+                priority,
+                queue_position: 0,
+                repository_weight: 1,
+                affinity_score: 0,
+            });
+            buildset_id
+        };
+        let independent = enqueue(PriorityClass::Independent);
+        let release = enqueue(PriorityClass::Release);
+        let speculative = enqueue(PriorityClass::Speculative);
+        let order = std::iter::from_fn(|| {
+            let next = scheduler.next_buildset()?;
+            scheduler.state.lock().admitted_buildsets = 0;
+            Some(next.buildset_id)
+        })
+        .collect::<Vec<_>>();
+        assert_eq!(order, [speculative, release, independent]);
     }
 
     #[tokio::test]
