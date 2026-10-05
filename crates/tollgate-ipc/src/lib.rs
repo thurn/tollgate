@@ -12,6 +12,10 @@ use uuid::Uuid;
 
 pub const MAGIC: [u8; 4] = *b"TGL1";
 pub const PROTOCOL_VERSION: u16 = 1;
+/// Version of the JSON payload contract (`--json` output, IPC responses, and UI bindings). Version
+/// 2 replaced repository state's `integration_ref` and `master_oid` with `staging_ref` and
+/// `staging_oid` and added `release_ref`, `release_oid`, `release_lag`, and `release_state`.
+pub const SCHEMA_VERSION: u16 = 2;
 pub const MAX_CONTROL_PAYLOAD: usize = 8 * 1024 * 1024;
 pub const MAX_LOG_PAYLOAD: usize = 1024 * 1024;
 const HEADER_SIZE: usize = 28;

@@ -11,8 +11,11 @@ export type CleanupState = "not-eligible" | "pending" | "running" | "completed" 
 
 export interface GitOid { format: "sha1" | "sha256"; bytes: string }
 export interface BlockReason { code: string; message: string; recovery_action: string }
+export type ReleaseState = "green" | "pending" | "failing";
+export interface ReleaseLag { commits: number; since: string | null }
 export interface RepositoryState {
-  id: string; name: string; path: string; integration_ref: string; master_oid: GitOid;
+  id: string; name: string; path: string; staging_ref: string; staging_oid: GitOid;
+  release_ref: string; release_oid: GitOid; release_lag: ReleaseLag; release_state: ReleaseState;
   queue_revision: number; event_sequence: number; engine_epoch: number;
   execution_state: RepositoryExecutionState; block_reasons: BlockReason[];
   active_configuration_digest: string; active_window: number; active_window_floor: number;

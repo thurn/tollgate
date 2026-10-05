@@ -26,8 +26,8 @@ use tokio_util::sync::CancellationToken;
 use tollgate_config::{CachePolicy, EffectiveConfig, EffectiveStep};
 use tollgate_domain::*;
 use tollgate_git::{
-    FileIdentity, GitError, GitRepository, INTEGRATION_BRANCH, INTEGRATION_REF, USER_BRANCH,
-    USER_BRANCH_REF, UserMasterSyncOutcome,
+    FileIdentity, GitError, GitRepository, INTEGRATION_BRANCH, INTEGRATION_REF, RELEASE_BRANCH,
+    RELEASE_REF, USER_BRANCH, USER_BRANCH_REF, UserMasterSyncOutcome, is_reserved_branch,
 };
 use tollgate_runner::apfs::{CloneManifest, force_clone_file, force_clone_tree, verify_clone_tree};
 use tollgate_runner::{
@@ -1403,6 +1403,147 @@ fn current_queue_prefix_oid(data: &RuntimeData) -> GitOid {
     current_queue_prefix_from(&data.state, &data.items, &data.generations)
 }
 
+/// Block codes for a checked-out Tollgate-owned branch, one per branch.
+const TOLLGATE_REF_CHECKED_OUT_CODES: [&str; 2] = ["staging-checked-out", "release-checked-out"];
+
+fn tollgate_ref_checked_out_reason(branch: &str, path: &str, then: &str) -> BlockReason {
+    BlockReason {
+        code: format!("{branch}-checked-out"),
+        message: format!("Tollgate-owned branch `{branch}` is checked out at {path}"),
+        recovery_action: format!(
+            "Switch that worktree back to the user-owned `master` branch or another feature branch, then {then}."
+        ),
+    }
+}
+
+/// The Tollgate ref user-owned local `master` follows under `sync_user_master`.
+fn user_master_sync_target<'state>(
+    config: &EffectiveConfig,
+    state: &'state RepositoryState,
+) -> &'state GitOid {
+    match config.sync_user_master {
+        tollgate_config::SyncUserMaster::Release => &state.release_oid,
+        tollgate_config::SyncUserMaster::Staging | tollgate_config::SyncUserMaster::Disabled => {
+            &state.staging_oid
+        }
+    }
+}
+
+/// Block codes for external movement of a Tollgate-owned ref; `tg reconcile` clears them.
+const EXTERNAL_MOVEMENT_CODES: [&str; 3] = [
+    "external-master-movement",
+    "external-staging-movement",
+    "external-release-movement",
+];
+
+/// Reconciliation of external ref movement adopts one observed OID for both Tollgate refs, which
+/// opt-out equivalence keeps equal:
+///
+/// - both refs at the same OID: adopt it;
+/// - only `staging` moved: adopt it and move `release` to it;
+/// - only `release` moved: adopt it and move `staging` to it;
+/// - both moved to different OIDs: refuse, because neither is clearly authoritative.
+///
+/// The lagging ref moves in the two-ref transaction with exact expected OIDs, before the
+/// reconciliation intent is prepared. A crash after it leaves both refs at the adopted OID, which
+/// the next reconcile adopts directly.
+async fn align_externally_moved_refs(
+    git: &GitRepository,
+    state: &RepositoryState,
+    observed_staging: &GitOid,
+) -> Result<GitOid, ServiceError> {
+    let observed_release = git.release_oid().await?;
+    if observed_release == *observed_staging {
+        return Ok(observed_release);
+    }
+    let adopted = if observed_release == state.release_oid {
+        observed_staging.clone()
+    } else if *observed_staging == state.staging_oid {
+        observed_release.clone()
+    } else {
+        return Err(ServiceError::Invariant(format!(
+            "staging moved externally to {} and release moved externally to {}; set both branches to the commit Tollgate should adopt, then reconcile again",
+            observed_staging.short(),
+            observed_release.short()
+        )));
+    };
+    git.compare_and_swap_staging_and_release(observed_staging, &observed_release, &adopted)
+        .await?;
+    Ok(adopted)
+}
+
+/// Blocks the repository because the Tollgate-owned `branch` moved to `observed` outside
+/// Tollgate. Its persisted OID is in `state`.
+fn push_external_movement_reason(
+    state: &mut RepositoryState,
+    branch: &str,
+    observed: &GitOid,
+    when: &str,
+) {
+    let persisted = if branch == RELEASE_BRANCH {
+        &state.release_oid
+    } else {
+        &state.staging_oid
+    };
+    let reason = BlockReason {
+        code: format!("external-{branch}-movement"),
+        message: format!(
+            "{branch} moved externally from {} to {} {when}",
+            persisted.short(),
+            observed.short()
+        ),
+        recovery_action: "Run a guided reconcile before dispatching or promoting queued work."
+            .into(),
+    };
+    state.execution_state = RepositoryExecutionState::Blocked;
+    state
+        .block_reasons
+        .retain(|existing| existing.code != reason.code);
+    state.block_reasons.push(reason);
+}
+
+/// Staged-release migration of a repository registered while `release` was its only Tollgate
+/// ref. Startup reconciliation runs it under the repository ownership lock, before recovery:
+///
+/// 1. create `staging` at the current `release` OID with an expected-nonexistent CAS;
+/// 2. re-anchor active generations to `staging`. Generations anchor to OIDs, never to a ref
+///    name, and `staging` starts at `release`'s OID, so no generation is invalidated or rebuilt;
+/// 3. record a `refs.staged-release-migrated` event in the same transaction that persists the
+///    new ref names.
+///
+/// Each step converges when repeated, so a migration interrupted by a crash completes at the next
+/// start. If `release` moved externally while Tollgate was stopped, `staging` starts at the moved
+/// OID and recovery's external-movement check blocks for `tg reconcile` as it would have before.
+async fn migrate_to_staged_release(
+    git: &GitRepository,
+    store: &RepositoryStore,
+    state: &mut RepositoryState,
+) -> Result<(), ServiceError> {
+    let staging = git.create_staging_from_release().await?;
+    let items = store.queue_items()?;
+    let reanchored_generation_ids = items
+        .iter()
+        .filter(|item| !item.state.is_terminal())
+        .filter_map(|item| item.current_generation_id)
+        .collect::<Vec<_>>();
+    state.staging_ref = INTEGRATION_REF.into();
+    state.release_ref = RELEASE_REF.into();
+    let event = store.record_state_event(
+        state,
+        Actor::Recovery,
+        "refs.staged-release-migrated",
+        serde_json::json!({
+            "staging_ref": INTEGRATION_REF,
+            "release_ref": RELEASE_REF,
+            "staging_oid": staging,
+            "persisted_integration_oid": state.staging_oid,
+            "reanchored_generation_ids": reanchored_generation_ids,
+        }),
+    )?;
+    state.event_sequence = event.sequence;
+    Ok(())
+}
+
 fn release_construction_failure(error: &GitError, release_oid: &GitOid) -> String {
     match error {
         GitError::SyntheticConflict {
@@ -1445,7 +1586,7 @@ fn current_queue_prefix_from(
         })
         .max_by_key(|(item, _)| item.enqueue_sequence)
         .map(|(_, generation)| generation.tested_oid.clone())
-        .unwrap_or_else(|| state.master_oid.clone())
+        .unwrap_or_else(|| state.staging_oid.clone())
 }
 
 fn active_prefix_dependencies(data: &RuntimeData, oid: &GitOid) -> Option<Vec<QueueItemId>> {
@@ -1964,7 +2105,7 @@ impl TollgateService {
         let config_text = read_or_migrate_configuration(&git, Some(&generated)).await?;
         let config = EffectiveConfig::parse(&config_text)?;
         mirror_legacy_configuration(&git, &config_text).await?;
-        let master_oid = git.integration_oid().await?;
+        let integrated_oid = git.integration_oid().await?;
         let repository_id = RepositoryId::new();
         let name = git
             .worktree_root
@@ -1974,11 +2115,15 @@ impl TollgateService {
             .to_owned();
         let mut execution_state = RepositoryExecutionState::Active;
         let mut block_reasons = Vec::new();
-        if let Err(GitError::IntegrationCheckedOut(path)) =
+        if let Err(GitError::IntegrationCheckedOut { branch, path }) =
             git.ensure_integration_not_checked_out().await
         {
             execution_state = RepositoryExecutionState::Blocked;
-            block_reasons.push(BlockReason { code: "release-checked-out".into(), message: format!("Tollgate's integration branch `release` is checked out at {path}"), recovery_action: "Switch that worktree back to the user-owned `master` branch or another feature branch, then resume the gate.".into() });
+            block_reasons.push(tollgate_ref_checked_out_reason(
+                branch,
+                &path,
+                "resume the gate",
+            ));
         }
         if let Some(error) = self.environment_error.read().await.clone() {
             execution_state = RepositoryExecutionState::Blocked;
@@ -1992,8 +2137,12 @@ impl TollgateService {
             id: repository_id,
             name: name.clone(),
             path: git.worktree_root.to_string_lossy().into_owned(),
-            integration_ref: INTEGRATION_REF.into(),
-            master_oid,
+            staging_ref: INTEGRATION_REF.into(),
+            staging_oid: integrated_oid.clone(),
+            release_ref: RELEASE_REF.into(),
+            release_oid: integrated_oid,
+            release_lag: ReleaseLag::default(),
+            release_state: ReleaseState::Green,
             queue_revision: 0,
             event_sequence: 0,
             engine_epoch: 1,
@@ -2135,9 +2284,9 @@ impl TollgateService {
         let mut state = store.repository_state()?;
         self.set_activation_progress(*key, ActivationPhase::Opening, "integration-refs")
             .await;
-        if state.integration_ref == USER_BRANCH_REF {
+        if state.staging_ref == USER_BRANCH_REF {
             git.migrate_integration_ref_from_master().await?;
-            state.integration_ref = INTEGRATION_REF.into();
+            state.staging_ref = LEGACY_INTEGRATION_REF.into();
             state
                 .block_reasons
                 .retain(|reason| reason.code != "master-checked-out");
@@ -2147,43 +2296,36 @@ impl TollgateService {
                 state.execution_state = RepositoryExecutionState::Active;
             }
             store.update_repository_state(&state)?;
-        } else if state.integration_ref != INTEGRATION_REF {
+        }
+        if state.staging_ref == LEGACY_INTEGRATION_REF {
+            migrate_to_staged_release(&git, &store, &mut state).await?;
+        } else if state.staging_ref != INTEGRATION_REF || state.release_ref != RELEASE_REF {
             return Err(ServiceError::Invariant(format!(
-                "unsupported integration ref `{}`; expected `{INTEGRATION_REF}`",
-                state.integration_ref
+                "unsupported Tollgate refs `{}` and `{}`; expected `{INTEGRATION_REF}` and `{RELEASE_REF}`",
+                state.staging_ref, state.release_ref
             )));
         }
-        match git.ensure_integration_not_checked_out().await {
-            Ok(()) => {
-                state
-                    .block_reasons
-                    .retain(|reason| reason.code != "release-checked-out");
-                if state.execution_state == RepositoryExecutionState::Blocked
-                    && state.block_reasons.is_empty()
-                {
-                    state.execution_state = RepositoryExecutionState::Active;
-                }
-                store.update_repository_state(&state)?;
-            }
-            Err(GitError::IntegrationCheckedOut(path)) => {
-                state.execution_state = RepositoryExecutionState::Blocked;
-                if !state
-                    .block_reasons
-                    .iter()
-                    .any(|reason| reason.code == "release-checked-out")
-                {
-                    state.block_reasons.push(BlockReason {
-                        code: "release-checked-out".into(),
-                        message: format!(
-                            "Tollgate's integration branch `release` is checked out at {path}"
-                        ),
-                        recovery_action: "Switch that worktree back to the user-owned `master` branch or another feature branch, then reopen Tollgate.".into(),
-                    });
-                }
-                store.update_repository_state(&state)?;
-            }
+        let checked_out = match git.ensure_integration_not_checked_out().await {
+            Ok(()) => None,
+            Err(GitError::IntegrationCheckedOut { branch, path }) => Some((branch, path)),
             Err(error) => return Err(error.into()),
+        };
+        state
+            .block_reasons
+            .retain(|reason| !TOLLGATE_REF_CHECKED_OUT_CODES.contains(&reason.code.as_str()));
+        if let Some((branch, path)) = checked_out {
+            state.execution_state = RepositoryExecutionState::Blocked;
+            state.block_reasons.push(tollgate_ref_checked_out_reason(
+                branch,
+                &path,
+                "reopen Tollgate",
+            ));
+        } else if state.execution_state == RepositoryExecutionState::Blocked
+            && state.block_reasons.is_empty()
+        {
+            state.execution_state = RepositoryExecutionState::Active;
         }
+        store.update_repository_state(&state)?;
         self.set_activation_progress(*key, ActivationPhase::Opening, "configuration")
             .await;
         prepare_configuration_root(&git).await?;
@@ -2621,19 +2763,19 @@ impl TollgateService {
             .ok_or_else(|| ServiceError::Invariant("reconcile omitted request digest".into()))?;
         let changed_base = persisted != observed;
         let mut state = runtime.data.lock().state.clone();
-        if state.master_oid != observed {
-            state.master_oid = observed.clone();
+        if state.staging_oid != observed {
+            state.set_staging_and_release(observed.clone());
             state.queue_revision += 1;
         }
         state.block_reasons.retain(|reason| {
-            !matches!(
-                reason.code.as_str(),
-                "external-master-movement"
-                    | "remote-diverged"
-                    | "remote-preflight-mismatch"
-                    | "ambiguous-pull-recovery"
-                    | "ambiguous-push-recovery"
-            )
+            !EXTERNAL_MOVEMENT_CODES.contains(&reason.code.as_str())
+                && !matches!(
+                    reason.code.as_str(),
+                    "remote-diverged"
+                        | "remote-preflight-mismatch"
+                        | "ambiguous-pull-recovery"
+                        | "ambiguous-push-recovery"
+                )
         });
         state.execution_state = if state.block_reasons.is_empty() {
             RepositoryExecutionState::Active
@@ -2718,7 +2860,7 @@ impl TollgateService {
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| ServiceError::Invariant("config apply omitted request digest".into()))?;
         let state = runtime.data.lock().state.clone();
-        self.rebuild_after_base_adoption(runtime, &state.master_oid)
+        self.rebuild_after_base_adoption(runtime, &state.staging_oid)
             .await?;
         let independent = runtime
             .data
@@ -2970,8 +3112,10 @@ impl TollgateService {
         if !path.is_absolute() {
             return Err("Prepared worktree path is not absolute".into());
         }
-        if matches!(branch, USER_BRANCH | INTEGRATION_BRANCH) {
-            return Err("Prepared removal targets a protected master or release branch".into());
+        if is_reserved_branch(branch) {
+            return Err(
+                "Prepared removal targets a protected master, staging, or release branch".into(),
+            );
         }
         if let Some(common_dir) = evidence.get("common_dir") {
             let common_dir: PathBuf = serde_json::from_value(common_dir.clone())
@@ -3273,7 +3417,7 @@ impl TollgateService {
                 serde_json::from_value(evidence.get("expected_oid").cloned().ok_or_else(
                     || ServiceError::Invariant("worktree removal omitted OID".into()),
                 )?)?;
-            if matches!(branch, USER_BRANCH | INTEGRATION_BRANCH) {
+            if is_reserved_branch(branch) {
                 return self.cancel_recovery_intent(
                     runtime,
                     command_id,
@@ -4250,24 +4394,31 @@ impl TollgateService {
     }
 
     async fn reconcile_master(&self, runtime: &Arc<RepositoryRuntime>) -> Result<(), ServiceError> {
-        let observed = runtime.git.integration_oid().await?;
-        let persisted = runtime.data.lock().state.master_oid.clone();
-        if observed == persisted {
-            return Ok(());
-        }
+        let observed_staging = runtime.git.integration_oid().await?;
+        let observed_release = runtime.git.release_oid().await?;
         let state = {
             let mut data = runtime.data.lock();
-            data.state.execution_state = RepositoryExecutionState::Blocked;
-            data.state.block_reasons.push(BlockReason {
-                code: "external-release-movement".into(),
-                message: format!(
-                    "release moved externally from {} to {} while Tollgate was stopped",
-                    persisted.short(),
-                    observed.short()
-                ),
-                recovery_action:
-                    "Run a guided reconcile before dispatching or promoting queued work.".into(),
-            });
+            let moved_staging = observed_staging != data.state.staging_oid;
+            let moved_release = observed_release != data.state.release_oid;
+            if !moved_staging && !moved_release {
+                return Ok(());
+            }
+            if moved_staging {
+                push_external_movement_reason(
+                    &mut data.state,
+                    INTEGRATION_BRANCH,
+                    &observed_staging,
+                    "while Tollgate was stopped",
+                );
+            }
+            if moved_release {
+                push_external_movement_reason(
+                    &mut data.state,
+                    RELEASE_BRANCH,
+                    &observed_release,
+                    "while Tollgate was stopped",
+                );
+            }
             data.state.clone()
         };
         runtime.store.update_repository_state(&state)?;
@@ -4288,7 +4439,7 @@ impl TollgateService {
             .construct_prefix(
                 &runtime.mirror,
                 &runtime.builder,
-                &state.master_oid,
+                &state.staging_oid,
                 &sources,
             )
             .await
@@ -4304,7 +4455,7 @@ impl TollgateService {
                     .construct_prefix(
                         &runtime.mirror,
                         &runtime.builder,
-                        &state.master_oid,
+                        &state.staging_oid,
                         &sources,
                     )
                     .await
@@ -4317,7 +4468,7 @@ impl TollgateService {
                             .map_err(|error| ServiceError::Invariant(error.to_string()))?;
                         item.terminal_reason = Some(release_construction_failure(
                             &standalone_error,
-                            &state.master_oid,
+                            &state.staging_oid,
                         ));
                         None
                     }
@@ -4348,7 +4499,7 @@ impl TollgateService {
         let generation = ValidationGeneration::derive(
             ValidationGenerationId::new(),
             item.id,
-            state.master_oid.clone(),
+            state.staging_oid.clone(),
             ordered_ids,
             sources,
             synthetic.iter().map(|commit| commit.oid.clone()).collect(),
@@ -4609,7 +4760,11 @@ impl TollgateService {
             if current_fetch_url != frozen_fetch_url
                 || (kind == "push" && current_push_url != frozen_push_url)
             {
-                let local = runtime.git.integration_oid().await?;
+                let local = if kind == "push" {
+                    runtime.git.release_oid().await?
+                } else {
+                    runtime.git.integration_oid().await?
+                };
                 self.block_remote_recovery(
                     runtime,
                     command_id,
@@ -4657,8 +4812,8 @@ impl TollgateService {
                         .await?
                 {
                     let mut state = runtime.data.lock().state.clone();
-                    if state.master_oid != observed_local {
-                        state.master_oid = observed_local.clone();
+                    if state.staging_oid != observed_local {
+                        state.set_staging_and_release(observed_local.clone());
                         state.queue_revision += 1;
                     }
                     let affected = evidence
@@ -4732,6 +4887,8 @@ impl TollgateService {
                 continue;
             }
 
+            // Pushes publish `release`.
+            let observed_release = runtime.git.release_oid().await?;
             let new_oid: GitOid =
                 serde_json::from_value(evidence.get("new_oid").cloned().ok_or_else(|| {
                     ServiceError::Invariant("push intent omitted new OID".into())
@@ -4777,7 +4934,7 @@ impl TollgateService {
                     let mut state = runtime.data.lock().state.clone();
                     let result = RemoteSyncResult {
                         action: RemoteSyncAction::Pushed,
-                        local_master: observed_local.clone(),
+                        local_master: observed_release.clone(),
                         remote_master: observed_remote.clone(),
                         queue_revision: state.queue_revision,
                         affected_item_ids: Vec::new(),
@@ -4816,8 +4973,8 @@ impl TollgateService {
                 .map(serde_json::from_value::<GitOid>)
                 .transpose()?
                 && observed_remote.as_ref() == Some(&expected_remote)
-                && (observed_local == expected_remote
-                    || (explicit_push && observed_local == new_oid))
+                && (observed_release == expected_remote
+                    || (explicit_push && observed_release == new_oid))
             {
                 runtime.store.set_intent_state(
                     command_id,
@@ -4826,7 +4983,7 @@ impl TollgateService {
                 )?;
                 continue;
             }
-            if observed_local == new_oid {
+            if observed_release == new_oid {
                 runtime.store.set_intent_state(
                     command_id,
                     IntentState::NeedsAttention,
@@ -4854,7 +5011,7 @@ impl TollgateService {
                 runtime,
                 command_id,
                 "ambiguous-push-recovery",
-                &observed_local,
+                &observed_release,
                 observed_remote.as_ref(),
             )?;
         }
@@ -5028,7 +5185,7 @@ impl TollgateService {
                 CleanupPolicy::RetainWorktree => CleanupState::NotEligible,
             };
             let mut state = runtime.data.lock().state.clone();
-            state.master_oid = observed_master;
+            state.set_staging_and_release(observed_master);
             state.queue_revision += 1;
             state.event_sequence += 1;
             state.active_configuration_digest = config.digest.clone();
@@ -5089,8 +5246,8 @@ impl TollgateService {
                             .find(|generation| generation.id == generation_id)
                     })
                 })
-                .is_some_and(|generation| generation.expected_parent_oid != data.state.master_oid);
-            active_head_is_stale.then(|| data.state.master_oid.clone())
+                .is_some_and(|generation| generation.expected_parent_oid != data.state.staging_oid);
+            active_head_is_stale.then(|| data.state.staging_oid.clone())
         };
         if let Some(promoted_base) = promoted_base {
             self.rebuild_after_base_adoption(runtime, &promoted_base)
@@ -6727,7 +6884,7 @@ impl TollgateService {
         };
         let unmerged_ancestors = runtime
             .git
-            .unmerged_first_parent_ancestors(&probe.parent_oid, &state.master_oid)
+            .unmerged_first_parent_ancestors(&probe.parent_oid, &state.staging_oid)
             .await?;
         let allow_unpromoted_source_ancestry = purpose.as_deref() == Some("push-master");
         if !allow_unpromoted_source_ancestry {
@@ -6737,7 +6894,7 @@ impl TollgateService {
                         .map_err(|error| ServiceError::Invariant(error.to_string()))?;
                     runtime
                         .git
-                        .is_ancestor(&promoted, &state.master_oid)
+                        .is_ancestor(&promoted, &state.staging_oid)
                         .await?
                 } else {
                     false
@@ -6745,7 +6902,7 @@ impl TollgateService {
                 if !satisfied {
                     return Err(ServiceError::UnpromotedSourceAncestor {
                         ancestor: ancestor.clone(),
-                        release_oid: state.master_oid.clone(),
+                        release_oid: state.staging_oid.clone(),
                     });
                 }
             }
@@ -6774,7 +6931,7 @@ impl TollgateService {
                     .map_err(|error| ServiceError::Invariant(error.to_string()))?;
                 if runtime
                     .git
-                    .is_ancestor(&promoted, &state.master_oid)
+                    .is_ancestor(&promoted, &state.staging_oid)
                     .await?
                 {
                     continue;
@@ -6787,14 +6944,14 @@ impl TollgateService {
             if historical_prefix {
                 return Err(ServiceError::StaleQueuePrefix {
                     source_parent_oid: probe.parent_oid.clone(),
-                    release_oid: state.master_oid.clone(),
+                    release_oid: state.staging_oid.clone(),
                     queue_revision: state.queue_revision,
                     current_prefix_oid,
                 });
             }
             return Err(ServiceError::UnknownSourceAncestor {
                 ancestor: ancestor.clone(),
-                release_oid: state.master_oid.clone(),
+                release_oid: state.staging_oid.clone(),
                 queue_revision: state.queue_revision,
                 current_prefix_oid,
             });
@@ -6933,7 +7090,7 @@ impl TollgateService {
                 let current_generations = runtime.store.generations()?;
                 return Err(ServiceError::StaleQueuePrefix {
                     source_parent_oid: probe.parent_oid,
-                    release_oid: current_state.master_oid.clone(),
+                    release_oid: current_state.staging_oid.clone(),
                     queue_revision: current_state.queue_revision,
                     current_prefix_oid: current_queue_prefix_from(
                         &current_state,
@@ -7003,7 +7160,7 @@ impl TollgateService {
         let observed_before_lock = runtime.git.integration_oid().await?;
         let (persisted_master, current_revision) = {
             let data = runtime.data.lock();
-            (data.state.master_oid.clone(), data.state.queue_revision)
+            (data.state.staging_oid.clone(), data.state.queue_revision)
         };
         if observed_before_lock != persisted_master {
             let refreshed = self
@@ -7049,7 +7206,7 @@ impl TollgateService {
                     data.state.execution_state,
                 ));
             }
-            if observed_master != data.state.master_oid {
+            if observed_master != data.state.staging_oid {
                 return Err(ServiceError::Invariant(
                     "release moved during candidate authorization; retry so Tollgate can invalidate and rebuild the affected validation".into(),
                 ));
@@ -7328,7 +7485,7 @@ impl TollgateService {
                     .construct_prefix(
                         &runtime.mirror,
                         &runtime.builder,
-                        &state.master_oid,
+                        &state.staging_oid,
                         &sources[..composable_len],
                     )
                     .await
@@ -7352,7 +7509,7 @@ impl TollgateService {
                 let desired_generation = ValidationGeneration::derive(
                     ValidationGenerationId::new(),
                     candidate.id,
-                    state.master_oid.clone(),
+                    state.staging_oid.clone(),
                     ordered_ids[..=index].to_vec(),
                     sources[..=index].to_vec(),
                     synthetic[..=index]
@@ -7740,7 +7897,7 @@ impl TollgateService {
             "remote": config.remote.name,
             "remote_fetch_url": remote_fetch_url,
             "branch": config.remote.branch,
-            "expected_local": state.master_oid,
+            "expected_local": state.staging_oid,
             "affected_item_ids": frozen_affected,
         });
         runtime
@@ -7829,7 +7986,7 @@ impl TollgateService {
                 return Err(error.into());
             }
         };
-        if observed_local != state.master_oid {
+        if observed_local != state.staging_oid {
             runtime.store.set_intent_state(
                 command_id,
                 IntentState::NeedsAttention,
@@ -7878,7 +8035,7 @@ impl TollgateService {
                     )?;
                         return Err(error.into());
                     }
-                    next_state.master_oid = remote_oid.clone();
+                    next_state.set_staging_and_release(remote_oid.clone());
                     next_state.queue_revision += 1;
                     next_state.block_reasons.retain(|reason| {
                         !matches!(
@@ -7960,7 +8117,7 @@ impl TollgateService {
         }
         let provisional = RemoteSyncResult {
             action: action.clone(),
-            local_master: next_state.master_oid.clone(),
+            local_master: next_state.staging_oid.clone(),
             remote_master: remote.clone(),
             queue_revision: next_state.queue_revision,
             affected_item_ids: affected.clone(),
@@ -7969,7 +8126,7 @@ impl TollgateService {
         if matches!(action, RemoteSyncAction::AdoptedRemote) {
             runtime.data.lock().state = next_state.clone();
             let rebuilt = self
-                .rebuild_after_base_adoption(&runtime, &next_state.master_oid)
+                .rebuild_after_base_adoption(&runtime, &next_state.staging_oid)
                 .await?;
             if rebuilt != affected {
                 return Err(ServiceError::Invariant(
@@ -7990,7 +8147,7 @@ impl TollgateService {
             &request_digest,
             &provisional,
             "remote.pull-completed",
-            &serde_json::json!({"local": next_state.master_oid, "remote": remote}),
+            &serde_json::json!({"local": next_state.staging_oid, "remote": remote}),
             Actor::Cli,
         )?;
         next_state.event_sequence = event.sequence;
@@ -8031,7 +8188,7 @@ impl TollgateService {
             "remote_fetch_url": remote_fetch_url,
             "remote_push_url": remote_push_url,
             "branch": config.remote.branch,
-            "new_oid": state.master_oid,
+            "new_oid": state.release_oid,
         });
         runtime
             .store
@@ -8113,7 +8270,7 @@ impl TollgateService {
         }
         let action;
         let message;
-        if remote.as_ref() == Some(&state.master_oid) {
+        if remote.as_ref() == Some(&state.release_oid) {
             action = RemoteSyncAction::UpToDate;
             message = "Remote master already equals local release.".to_owned();
         } else {
@@ -8128,7 +8285,11 @@ impl TollgateService {
                         .into(),
                 ));
             };
-            let ancestor = match runtime.git.is_ancestor(remote_oid, &state.master_oid).await {
+            let ancestor = match runtime
+                .git
+                .is_ancestor(remote_oid, &state.release_oid)
+                .await
+            {
                 Ok(ancestor) => ancestor,
                 Err(error) => {
                     runtime.store.set_intent_state(
@@ -8143,7 +8304,7 @@ impl TollgateService {
                 runtime.store.set_intent_state(
                     command_id,
                     IntentState::Canceled,
-                    &serde_json::json!({"remote": remote_oid, "local": state.master_oid}),
+                    &serde_json::json!({"remote": remote_oid, "local": state.release_oid}),
                 )?;
                 return Err(ServiceError::Invariant(
                     "remote master is not an ancestor of local release; leased push refused".into(),
@@ -8151,7 +8312,7 @@ impl TollgateService {
             }
             let outbound = match runtime
                 .git
-                .first_parent_commits_between(remote_oid, &state.master_oid)
+                .first_parent_commits_between(remote_oid, &state.release_oid)
                 .await
             {
                 Ok(outbound) => outbound,
@@ -8176,7 +8337,7 @@ impl TollgateService {
                     }
                     found
                 });
-            if !certified_chain || expected_parent.as_slice() != state.master_oid.as_bytes() {
+            if !certified_chain || expected_parent.as_slice() != state.release_oid.as_bytes() {
                 runtime.store.set_intent_state(
                     command_id,
                     IntentState::Canceled,
@@ -8193,7 +8354,7 @@ impl TollgateService {
                     &remote_push_url,
                     &config.remote.branch,
                     Some(remote_oid),
-                    &state.master_oid,
+                    &state.release_oid,
                 )
                 .await
                 .err();
@@ -8216,11 +8377,11 @@ impl TollgateService {
                             observed.as_ref(),
                             "push-error-reobservation",
                         )?;
-                        if observed.as_ref() == Some(&state.master_oid) {
+                        if observed.as_ref() == Some(&state.release_oid) {
                             runtime.store.set_intent_state(
                                 command_id,
                                 IntentState::ExternalApplied,
-                                &serde_json::json!({"remote": state.master_oid, "recovered_after_error": push_error.to_string()}),
+                                &serde_json::json!({"remote": state.release_oid, "recovered_after_error": push_error.to_string()}),
                             )?;
                         } else if observed.as_ref() == Some(remote_oid) {
                             runtime.store.set_intent_state(
@@ -8261,7 +8422,7 @@ impl TollgateService {
                 runtime.store.set_intent_state(
                     command_id,
                     IntentState::ExternalApplied,
-                    &serde_json::json!({"remote": state.master_oid}),
+                    &serde_json::json!({"remote": state.release_oid}),
                 )?;
             }
             action = RemoteSyncAction::Pushed;
@@ -8272,8 +8433,8 @@ impl TollgateService {
         }
         let result = RemoteSyncResult {
             action,
-            local_master: state.master_oid.clone(),
-            remote_master: Some(state.master_oid.clone()),
+            local_master: state.release_oid.clone(),
+            remote_master: Some(state.release_oid.clone()),
             queue_revision: state.queue_revision,
             affected_item_ids: Vec::new(),
             message,
@@ -8290,7 +8451,7 @@ impl TollgateService {
             self.sync_user_master_after_promotion(
                 &runtime,
                 pending.last().map(|item| item.id),
-                &state.master_oid,
+                user_master_sync_target(&config, &state),
                 Actor::Cli,
             )
             .await?;
@@ -8313,7 +8474,7 @@ impl TollgateService {
             &request_digest,
             &result,
             "remote.push-completed",
-            &serde_json::json!({"remote": state.master_oid, "barriers": "synchronized"}),
+            &serde_json::json!({"remote": state.release_oid, "barriers": "synchronized"}),
             Actor::Cli,
         )?;
         completion_state.event_sequence = event.sequence;
@@ -8370,10 +8531,10 @@ impl TollgateService {
         {
             return Ok(response);
         }
-        let observed = runtime.git.integration_oid().await?;
+        let observed_staging = runtime.git.integration_oid().await?;
         if expected_observed_master
             .as_ref()
-            .is_some_and(|expected| expected != &observed)
+            .is_some_and(|expected| expected != &observed_staging)
         {
             return Err(ServiceError::Invariant(
                 "reconciliation preview is stale because the observed master changed".into(),
@@ -8396,31 +8557,31 @@ impl TollgateService {
                 actual: state.queue_revision,
             });
         }
+        let observed = align_externally_moved_refs(&runtime.git, &state, &observed_staging).await?;
         runtime.store.prepare_operation(
             repository_id,
             "reconcile",
             command_id,
             &serde_json::json!({
                 "request_digest": request_digest,
-                "persisted_master": state.master_oid,
+                "persisted_master": state.staging_oid,
                 "observed_master": observed,
             }),
         )?;
-        let changed_base = state.master_oid != observed;
+        let changed_base = state.staging_oid != observed;
         if changed_base {
-            state.master_oid = observed.clone();
+            state.set_staging_and_release(observed.clone());
             state.queue_revision += 1;
         }
         state.block_reasons.retain(|reason| {
-            !matches!(
-                reason.code.as_str(),
-                "external-master-movement"
-                    | "external-release-movement"
-                    | "remote-diverged"
-                    | "remote-preflight-mismatch"
-                    | "ambiguous-pull-recovery"
-                    | "ambiguous-push-recovery"
-            )
+            !EXTERNAL_MOVEMENT_CODES.contains(&reason.code.as_str())
+                && !matches!(
+                    reason.code.as_str(),
+                    "remote-diverged"
+                        | "remote-preflight-mismatch"
+                        | "ambiguous-pull-recovery"
+                        | "ambiguous-push-recovery"
+                )
         });
         state.execution_state = if state.block_reasons.is_empty() {
             RepositoryExecutionState::Active
@@ -8553,7 +8714,7 @@ impl TollgateService {
                 "request_digest": request_digest,
                 "branch": branch,
                 "destination": destination,
-                "base": state.master_oid,
+                "base": state.staging_oid,
             }),
         )?;
         if let Some(parent) = destination.parent() {
@@ -8614,11 +8775,10 @@ impl TollgateService {
             ServiceError::Invariant("refusing to remove a detached worktree".into())
         })?;
         let oid = registration.head;
-        if path == runtime.git.worktree_root
-            || matches!(branch.as_str(), USER_BRANCH | INTEGRATION_BRANCH)
-        {
+        if path == runtime.git.worktree_root || is_reserved_branch(&branch) {
             return Err(ServiceError::Invariant(
-                "primary, master, or release worktrees cannot be removed by Tollgate".into(),
+                "primary, master, staging, or release worktrees cannot be removed by Tollgate"
+                    .into(),
             ));
         }
         let worktree = GitRepository::discover(&path).await?;
@@ -8753,7 +8913,7 @@ impl TollgateService {
                 "request_digest": request_digest,
                 "path": worktree.worktree_root,
                 "old_oid": old,
-                "master": runtime.data.lock().state.master_oid,
+                "master": runtime.data.lock().state.staging_oid,
             }),
         )?;
         let (old, new) = worktree.update_one_commit_feature().await?;
@@ -9085,7 +9245,7 @@ impl TollgateService {
             .construct_prefix(
                 &runtime.mirror,
                 &runtime.builder,
-                &state.master_oid,
+                &state.staging_oid,
                 &sources,
             )
             .await?;
@@ -9112,7 +9272,7 @@ impl TollgateService {
             let generation = ValidationGeneration::derive(
                 ValidationGenerationId::new(),
                 item.id,
-                state.master_oid.clone(),
+                state.staging_oid.clone(),
                 ordered_ids[..=index].to_vec(),
                 sources[..=index].to_vec(),
                 synthetic[..=index]
@@ -9415,7 +9575,7 @@ impl TollgateService {
                     .construct_prefix(
                         &runtime.mirror,
                         &runtime.builder,
-                        &state.master_oid,
+                        &state.staging_oid,
                         &sources,
                     )
                     .await?
@@ -9428,7 +9588,7 @@ impl TollgateService {
                 let generation = ValidationGeneration::derive(
                     ValidationGenerationId::new(),
                     item.id,
-                    state.master_oid.clone(),
+                    state.staging_oid.clone(),
                     item_ids[..=position].to_vec(),
                     sources[..=position].to_vec(),
                     chain[..=position]
@@ -9597,30 +9757,45 @@ impl TollgateService {
                     .into()
             }),
         );
-        let observed_master = runtime.git.integration_oid().await?;
-        let master_healthy = observed_master == state.master_oid;
+        let observed_staging = runtime.git.integration_oid().await?;
+        let staging_healthy = observed_staging == state.staging_oid;
         push(
-            "Authoritative release",
-            master_healthy,
+            "Authoritative staging",
+            staging_healthy,
             format!(
                 "observed {} · recorded {}",
-                observed_master.short(),
-                state.master_oid.short()
+                observed_staging.short(),
+                state.staging_oid.short()
             ),
-            (!master_healthy).then(|| "Run `tg reconcile` before resuming dispatch.".into()),
+            (!staging_healthy).then(|| "Run `tg reconcile` before resuming dispatch.".into()),
+        );
+        let observed_release = runtime.git.release_oid().await;
+        let release_healthy = observed_release.as_ref().ok() == Some(&state.release_oid);
+        push(
+            "Authoritative release",
+            release_healthy,
+            match &observed_release {
+                Ok(observed) => format!(
+                    "observed {} · recorded {}",
+                    observed.short(),
+                    state.release_oid.short()
+                ),
+                Err(error) => format!("unreadable: {error}"),
+            },
+            (!release_healthy).then(|| "Run `tg reconcile` before resuming dispatch.".into()),
         );
         let mirror_healthy = runtime
             .git
-            .mirror_tree_oid(&runtime.mirror, &state.master_oid)
+            .mirror_tree_oid(&runtime.mirror, &state.staging_oid)
             .await
             .is_ok();
         push(
             "Execution mirror",
             mirror_healthy,
             if mirror_healthy {
-                "Recorded release is reachable in the isolated execution mirror.".into()
+                "Recorded staging is reachable in the isolated execution mirror.".into()
             } else {
-                "Recorded release is not provable in the execution mirror.".into()
+                "Recorded staging is not provable in the execution mirror.".into()
             },
             (!mirror_healthy).then(|| {
                 "Recreate the mirror from authoritative retained refs before running CI.".into()
@@ -10050,7 +10225,7 @@ impl TollgateService {
         let checkout = slot
             .checkout_oid
             .clone()
-            .unwrap_or_else(|| runtime.data.lock().state.master_oid.clone());
+            .unwrap_or_else(|| runtime.data.lock().state.staging_oid.clone());
         let quarantine = runtime
             .slots_root
             .parent()
@@ -10489,7 +10664,7 @@ impl TollgateService {
                 checkout: slot
                     .checkout_oid
                     .clone()
-                    .unwrap_or_else(|| state.master_oid.clone()),
+                    .unwrap_or_else(|| state.staging_oid.clone()),
                 quarantine: quarantine_root.join(format!("slot-{}-{command_id}", slot.id)),
                 slot: slot.clone(),
             })
@@ -12314,7 +12489,7 @@ impl TollgateService {
             .construct_prefix(
                 &runtime.mirror,
                 &runtime.builder,
-                &state.master_oid,
+                &state.staging_oid,
                 &sources,
             )
             .await?;
@@ -12335,7 +12510,7 @@ impl TollgateService {
             let generation = ValidationGeneration::derive(
                 ValidationGenerationId::new(),
                 id,
-                state.master_oid.clone(),
+                state.staging_oid.clone(),
                 survivors[..=position].iter().map(|item| item.id).collect(),
                 survivors[..=position]
                     .iter()
@@ -12904,6 +13079,23 @@ impl TollgateService {
                     .await?,
             )?;
             let observed_master = runtime.git.integration_oid().await?;
+            let observed_release = runtime.git.release_oid().await?;
+            if observed_release != state.release_oid {
+                // The opt-out two-ref transaction requires `release` at its persisted OID, which
+                // equals `staging`'s. Block instead of retrying a CAS that cannot apply.
+                let blocked = {
+                    let mut data = runtime.data.lock();
+                    push_external_movement_reason(
+                        &mut data.state,
+                        RELEASE_BRANCH,
+                        &observed_release,
+                        "while Tollgate was running",
+                    );
+                    data.state.clone()
+                };
+                runtime.store.update_repository_state(&blocked)?;
+                return Ok(());
+            }
             if disk_config.digest != active_config.digest
                 || !certificate.validates(
                     &item,
@@ -12931,7 +13123,7 @@ impl TollgateService {
                         "remote_fetch_url": remote_fetch_url,
                         "remote_push_url": remote_push_url,
                         "branch": config.remote.branch,
-                        "expected_remote": observed_master,
+                        "expected_remote": observed_release,
                         "new_oid": certificate.tested_oid,
                         "item_id": item.id,
                     }),
@@ -12985,7 +13177,7 @@ impl TollgateService {
                     remote.as_ref(),
                     "promotion-preflight-fetch",
                 )?;
-                if remote.as_ref() != Some(&observed_master) {
+                if remote.as_ref() != Some(&observed_release) {
                     runtime.store.set_intent_state(
                         command_id,
                         IntentState::Canceled,
@@ -13038,7 +13230,7 @@ impl TollgateService {
                             .compare_and_swap_integration(&observed_master, remote_oid)
                             .await?;
                         let mut adopted = runtime.data.lock().state.clone();
-                        adopted.master_oid = remote_oid.clone();
+                        adopted.set_staging_and_release(remote_oid.clone());
                         adopted.queue_revision += 1;
                         let affected = runtime
                             .data
@@ -13228,7 +13420,7 @@ impl TollgateService {
                 CleanupPolicy::RetainWorktree => CleanupState::NotEligible,
             };
             let mut new_state = runtime.data.lock().state.clone();
-            new_state.master_oid = certificate.tested_oid.clone();
+            new_state.set_staging_and_release(certificate.tested_oid.clone());
             new_state.queue_revision += 1;
             new_state.event_sequence += 1;
             new_state.active_configuration_digest = config.digest.clone();
@@ -13271,7 +13463,7 @@ impl TollgateService {
                     .push_with_lease(
                         &remote_push_url,
                         &config.remote.branch,
-                        Some(&observed_master),
+                        Some(&observed_release),
                         &certificate.tested_oid,
                     )
                     .await
@@ -16729,7 +16921,7 @@ mod tests {
             .unwrap();
         runtime
             .git
-            .provision_slot(&runtime.mirror, &slot_path, &initialized.state.master_oid)
+            .provision_slot(&runtime.mirror, &slot_path, &initialized.state.staging_oid)
             .await
             .unwrap();
         runtime.data.lock().slots.insert(
@@ -16738,7 +16930,7 @@ mod tests {
                 id: slot_id,
                 path: slot_path,
                 state: "idle".into(),
-                checkout_oid: Some(initialized.state.master_oid.clone()),
+                checkout_oid: Some(initialized.state.staging_oid.clone()),
                 health: "healthy".into(),
                 last_used: None,
             },
@@ -16802,15 +16994,17 @@ mod tests {
             .initialize_repository_with_options(&repository, Some("false".into()), false)
             .await
             .unwrap();
-        assert_eq!(initialized.state.integration_ref, INTEGRATION_REF);
+        assert_eq!(initialized.state.staging_ref, INTEGRATION_REF);
+        assert_eq!(initialized.state.release_ref, RELEASE_REF);
         assert_eq!(
             git(&repository, &["branch", "--show-current"]),
             USER_BRANCH_REF.trim_start_matches("refs/heads/")
         );
-        assert_eq!(
-            git(&repository, &["rev-parse", INTEGRATION_REF]),
-            git(&repository, &["rev-parse", USER_BRANCH_REF])
-        );
+        let master = git(&repository, &["rev-parse", USER_BRANCH_REF]);
+        assert_eq!(git(&repository, &["rev-parse", INTEGRATION_REF]), master);
+        assert_eq!(git(&repository, &["rev-parse", RELEASE_REF]), master);
+        assert_eq!(initialized.state.staging_oid.to_hex(), master);
+        assert_eq!(initialized.state.release_oid.to_hex(), master);
         assert!(initialized.checks.is_empty());
         assert_eq!(initialized.configuration.steps.len(), 1);
         assert!(initialized.configuration.steps[0].voting);
@@ -16909,12 +17103,13 @@ mod tests {
             .unwrap();
         let runtime = service.runtime(initialized.state.id).await.unwrap();
         let mut legacy_state = runtime.data.lock().state.clone();
-        legacy_state.integration_ref = USER_BRANCH_REF.into();
+        legacy_state.staging_ref = USER_BRANCH_REF.into();
         runtime
             .store
             .update_repository_state(&legacy_state)
             .unwrap();
         git(&repository, &["update-ref", "-d", INTEGRATION_REF]);
+        git(&repository, &["update-ref", "-d", RELEASE_REF]);
         drop(runtime);
         drop(service);
 
@@ -16923,12 +17118,243 @@ mod tests {
             .repository_snapshot(initialized.state.id)
             .await
             .unwrap();
-        assert_eq!(snapshot.state.integration_ref, INTEGRATION_REF);
+        assert_eq!(snapshot.state.staging_ref, INTEGRATION_REF);
+        assert_eq!(snapshot.state.release_ref, RELEASE_REF);
         assert_eq!(git(&repository, &["branch", "--show-current"]), "master");
-        assert_eq!(
-            git(&repository, &["rev-parse", INTEGRATION_REF]),
-            git(&repository, &["rev-parse", USER_BRANCH_REF])
+        let master = git(&repository, &["rev-parse", USER_BRANCH_REF]);
+        assert_eq!(git(&repository, &["rev-parse", INTEGRATION_REF]), master);
+        assert_eq!(git(&repository, &["rev-parse", RELEASE_REF]), master);
+    }
+
+    async fn wait_for_item_state(
+        service: &Arc<TollgateService>,
+        repository_id: RepositoryId,
+        item_id: QueueItemId,
+        state: QueueItemState,
+    ) -> QueueItemView {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let details = service.item_details(repository_id, item_id).await.unwrap();
+            if details.item.state == state {
+                return details;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "item stalled at {:?} waiting for {state:?}: {:?}",
+                details.item.state,
+                details.item.terminal_reason
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn existing_release_repository_migrates_to_staging_without_invalidating_its_queue() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        let candidate_worktree = temporary.path().join("candidate");
+        let support = temporary.path().join("support");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("base.txt"), "base\n").unwrap();
+        git(&repository, &["add", "base.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+        let base = git(&repository, &["rev-parse", "HEAD"]);
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "candidate",
+                candidate_worktree.to_str().unwrap(),
+                USER_BRANCH,
+            ],
         );
+        std::fs::write(candidate_worktree.join("feature.txt"), "feature\n").unwrap();
+        git(&candidate_worktree, &["add", "feature.txt"]);
+        git(&candidate_worktree, &["commit", "-m", "candidate"]);
+        let source = git(&candidate_worktree, &["rev-parse", "HEAD"]);
+
+        let service = TollgateService::open(support.clone()).await.unwrap();
+        let initialized = service
+            .initialize_repository_with_options(
+                &repository,
+                Some("test -f feature.txt".into()),
+                false,
+            )
+            .await
+            .unwrap();
+        let repository_id = initialized.state.id;
+        let submitted = service
+            .submit_candidate_from(
+                repository_id,
+                "HEAD".into(),
+                Some(candidate_worktree.to_string_lossy().into_owned()),
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        let validated = wait_for_item_state(
+            &service,
+            repository_id,
+            submitted.item_id,
+            QueueItemState::Ready,
+        )
+        .await;
+        let generation = validated.generation.clone().unwrap();
+        let certificate = validated.certificate.clone().unwrap();
+
+        // Rewrite the repository into the layout every repository had before `staging`:
+        // persisted state names `release` as its integration ref and `staging` does not exist.
+        let runtime = service.runtime(repository_id).await.unwrap();
+        let mut legacy_state = runtime.data.lock().state.clone();
+        legacy_state.staging_ref = LEGACY_INTEGRATION_REF.into();
+        runtime
+            .store
+            .update_repository_state(&legacy_state)
+            .unwrap();
+        let sequence_before = legacy_state.event_sequence;
+        runtime.data.lock().state = legacy_state;
+        drop(runtime);
+        service.shutdown().await.unwrap();
+        drop(service);
+        git(&repository, &["update-ref", "-d", INTEGRATION_REF]);
+        assert_eq!(git(&repository, &["rev-parse", RELEASE_REF]), base);
+
+        let reopened = TollgateService::open(support).await.unwrap();
+        let snapshot = reopened.repository_snapshot(repository_id).await.unwrap();
+        assert_eq!(snapshot.state.staging_ref, INTEGRATION_REF);
+        assert_eq!(snapshot.state.release_ref, RELEASE_REF);
+        assert_eq!(
+            snapshot.state.execution_state,
+            RepositoryExecutionState::Active
+        );
+        assert_eq!(git(&repository, &["rev-parse", INTEGRATION_REF]), base);
+        assert_eq!(git(&repository, &["rev-parse", RELEASE_REF]), base);
+        let runtime = reopened.runtime(repository_id).await.unwrap();
+        let migrated = runtime
+            .store
+            .events_after(sequence_before, 1_000)
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.kind == "refs.staged-release-migrated")
+            .collect::<Vec<_>>();
+        assert_eq!(migrated.len(), 1);
+        assert_eq!(
+            migrated[0].payload["reanchored_generation_ids"],
+            serde_json::json!([generation.id])
+        );
+        drop(runtime);
+
+        // No generation was invalidated: the item keeps its exact generation and evidence.
+        let after = reopened
+            .item_details(repository_id, submitted.item_id)
+            .await
+            .unwrap();
+        assert_eq!(after.item.state, QueueItemState::Ready);
+        assert_eq!(after.item.current_generation_id, Some(generation.id));
+        assert_eq!(after.item.certificate_id, Some(certificate.id));
+        assert_eq!(after.generation.as_ref().unwrap().invalidated_by, None);
+        assert!(
+            after
+                .attempt_generations
+                .iter()
+                .all(|attempt| attempt.invalidated_by.is_none())
+        );
+
+        let revision = reopened
+            .repository_snapshot(repository_id)
+            .await
+            .unwrap()
+            .state
+            .queue_revision;
+        let authorization = reopened
+            .authorize_candidate(repository_id, submitted.item_id, revision, CommandId::new())
+            .await
+            .unwrap();
+        assert!(authorization.evidence_reused);
+        assert_eq!(authorization.validation_generation_id, generation.id);
+        let promoted = wait_for_item_state(
+            &reopened,
+            repository_id,
+            submitted.item_id,
+            QueueItemState::Promoted,
+        )
+        .await;
+        assert_eq!(promoted.attempts.len(), 1);
+        assert_eq!(git(&repository, &["rev-parse", INTEGRATION_REF]), source);
+        assert_eq!(git(&repository, &["rev-parse", RELEASE_REF]), source);
+        let state = reopened
+            .repository_snapshot(repository_id)
+            .await
+            .unwrap()
+            .state;
+        assert_eq!(state.staging_oid.to_hex(), source);
+        assert_eq!(state.release_oid.to_hex(), source);
+        assert!(state.opt_out_equivalence_holds());
+    }
+
+    #[tokio::test]
+    async fn externally_moved_release_blocks_until_reconcile_realigns_staging() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        let support = temporary.path().join("support");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("base.txt"), "base\n").unwrap();
+        git(&repository, &["add", "base.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+
+        let service = TollgateService::open(support.clone()).await.unwrap();
+        let initialized = service
+            .initialize_repository_with_options(&repository, Some("true".into()), false)
+            .await
+            .unwrap();
+        let repository_id = initialized.state.id;
+        service.shutdown().await.unwrap();
+        drop(service);
+        std::fs::write(repository.join("external.txt"), "external\n").unwrap();
+        git(&repository, &["add", "external.txt"]);
+        git(&repository, &["commit", "-m", "external"]);
+        let external = git(&repository, &["rev-parse", "HEAD"]);
+        git(&repository, &["update-ref", RELEASE_REF, &external]);
+
+        let reopened = TollgateService::open(support).await.unwrap();
+        let blocked = reopened
+            .repository_snapshot(repository_id)
+            .await
+            .unwrap()
+            .state;
+        assert_eq!(blocked.execution_state, RepositoryExecutionState::Blocked);
+        assert!(
+            blocked
+                .block_reasons
+                .iter()
+                .any(|reason| reason.code == "external-release-movement")
+        );
+        assert!(
+            !blocked
+                .block_reasons
+                .iter()
+                .any(|reason| reason.code == "external-staging-movement")
+        );
+
+        reopened
+            .reconcile(repository_id, CommandId::new())
+            .await
+            .unwrap();
+        let state = reopened
+            .repository_snapshot(repository_id)
+            .await
+            .unwrap()
+            .state;
+        assert_eq!(state.execution_state, RepositoryExecutionState::Active);
+        assert!(state.block_reasons.is_empty());
+        assert_eq!(state.staging_oid.to_hex(), external);
+        assert_eq!(state.release_oid.to_hex(), external);
+        assert_eq!(git(&repository, &["rev-parse", INTEGRATION_REF]), external);
+        assert_eq!(git(&repository, &["rev-parse", RELEASE_REF]), external);
     }
 
     #[tokio::test]
@@ -16957,7 +17383,7 @@ mod tests {
         let slot_path = runtime.slots_root.join(slot_id.to_string());
         runtime
             .git
-            .provision_slot(&runtime.mirror, &slot_path, &initialized.state.master_oid)
+            .provision_slot(&runtime.mirror, &slot_path, &initialized.state.staging_oid)
             .await
             .unwrap();
         let slot_repository = GitRepository::discover(&slot_path).await.unwrap();
@@ -16969,7 +17395,7 @@ mod tests {
                 id: slot_id,
                 path: slot_path,
                 state: "idle".into(),
-                checkout_oid: Some(initialized.state.master_oid),
+                checkout_oid: Some(initialized.state.staging_oid),
                 health: "healthy".into(),
                 last_used: None,
             },
@@ -17228,7 +17654,11 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("primary, master, or release"));
+        assert!(
+            error
+                .to_string()
+                .contains("primary, master, staging, or release")
+        );
         let store = &service.runtime(initialized.state.id).await.unwrap().store;
         assert!(
             store
@@ -18825,7 +19255,7 @@ policy = "clone"
             .initialize_repository(&repository, Some("sleep 30".into()))
             .await
             .unwrap();
-        let old_release = initialized.state.master_oid;
+        let old_release = initialized.state.staging_oid;
 
         std::fs::write(repository.join("master.txt"), "master\n").unwrap();
         git(&repository, &["add", "master.txt"]);
@@ -18859,7 +19289,7 @@ policy = "clone"
             .await
             .unwrap();
         let mut state = runtime.data.lock().state.clone();
-        state.master_oid = new_release.clone();
+        state.set_staging_and_release(new_release.clone());
         state.queue_revision += 1;
         runtime.store.update_repository_state(&state).unwrap();
         runtime.data.lock().state = state;
@@ -19336,7 +19766,7 @@ policy = "clone"
             .repository_snapshot(initialized.state.id)
             .await
             .unwrap();
-        assert_eq!(recovered.state.master_oid.to_hex(), promoted);
+        assert_eq!(recovered.state.staging_oid.to_hex(), promoted);
         assert!(recovered.queue.is_empty());
         assert_eq!(recovered.seeds.len(), 1);
         assert_eq!(
@@ -19501,7 +19931,7 @@ policy = "clone"
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         };
 
-        let certified = snapshot.state.master_oid;
+        let certified = snapshot.state.staging_oid;
         let rebased_master =
             GitOid::from_hex(&git(&repository, &["rev-parse", USER_BRANCH_REF])).unwrap();
         assert_ne!(rebased_master.to_hex(), old_master);
@@ -19836,7 +20266,7 @@ run = "test -f feature.txt"
                 .find(|certificate| Some(certificate.id) == item.certificate_id)
                 .cloned()
                 .unwrap();
-            (item, certificate, data.state.master_oid.clone())
+            (item, certificate, data.state.staging_oid.clone())
         };
         item.state = item.state.transition(ItemEvent::PromotionStarted).unwrap();
         service.replace_item(&runtime, item).unwrap();
@@ -19866,7 +20296,7 @@ run = "test -f feature.txt"
             .repository_snapshot(initialized.state.id)
             .await
             .unwrap();
-        assert_eq!(snapshot.state.master_oid, certificate.tested_oid);
+        assert_eq!(snapshot.state.staging_oid, certificate.tested_oid);
         assert!(snapshot.queue.is_empty());
         assert_eq!(
             recovered
@@ -20001,8 +20431,8 @@ run = "test -f feature.txt"
                                 .current_generation_id
                     })
                     .unwrap();
-                assert_eq!(b_generation.expected_parent_oid, data.state.master_oid);
-                break (a_item, a_certificate, data.state.master_oid.clone());
+                assert_eq!(b_generation.expected_parent_oid, data.state.staging_oid);
+                break (a_item, a_certificate, data.state.staging_oid.clone());
             }
             assert!(tokio::time::Instant::now() < deadline);
             tokio::task::yield_now().await;
@@ -20053,7 +20483,7 @@ run = "test -f feature.txt"
             .repository_snapshot(initialized.state.id)
             .await
             .unwrap();
-        assert_eq!(snapshot.state.master_oid, a_certificate.tested_oid);
+        assert_eq!(snapshot.state.staging_oid, a_certificate.tested_oid);
         assert_eq!(
             snapshot.state.execution_state,
             RepositoryExecutionState::Active
@@ -21226,7 +21656,7 @@ run = "test -f feature.txt"
                     .unwrap();
                 assert!(!a_view.item.promotion_authorized);
                 assert_eq!(snapshot.queue.len(), 1);
-                assert_eq!(snapshot.state.master_oid, authorized.tested_oid);
+                assert_eq!(snapshot.state.staging_oid, authorized.tested_oid);
                 assert_eq!(
                     a_view.generation.as_ref().unwrap().expected_parent_oid,
                     authorized.tested_oid
@@ -21441,7 +21871,7 @@ run = "test -f feature.txt"
             tokio::task::yield_now().await;
         };
         assert!(snapshot.queue.is_empty());
-        assert_eq!(snapshot.state.master_oid, b_authorized.tested_oid);
+        assert_eq!(snapshot.state.staging_oid, b_authorized.tested_oid);
         let a_view = snapshot
             .history_items
             .iter()
@@ -22047,8 +22477,8 @@ run = "test -f feature.txt"
             let command = CommandId::new();
             if recovering {
                 let evidence = serde_json::json!({
-                    "persisted_master": initialized.state.master_oid,
-                    "observed_master": initialized.state.master_oid,
+                    "persisted_master": initialized.state.staging_oid,
+                    "observed_master": initialized.state.staging_oid,
                     "request_digest": "reconciliation-fixture",
                 });
                 runtime
@@ -22080,7 +22510,7 @@ run = "test -f feature.txt"
             );
             assert_eq!(
                 runtime.git.integration_oid().await.unwrap(),
-                initialized.state.master_oid
+                initialized.state.staging_oid
             );
         }
     }
@@ -22994,7 +23424,7 @@ run = "true"
             error,
             ServiceError::UnpromotedSourceAncestor { ancestor, release_oid }
                 if ancestor == prerequisite.source_oid
-                    && release_oid == initialized.state.master_oid
+                    && release_oid == initialized.state.staging_oid
         ));
         let snapshot = service
             .repository_snapshot(initialized.state.id)
@@ -23257,7 +23687,7 @@ run = "true"
                 release_oid,
             } => {
                 assert_eq!(ancestor, *queued.tested_oid.as_ref().unwrap());
-                assert_eq!(release_oid, after_cancel.state.master_oid);
+                assert_eq!(release_oid, after_cancel.state.staging_oid);
             }
             error => panic!("expected unpromoted source ancestor, got {error}"),
         }
@@ -23849,6 +24279,10 @@ run = "true"
         assert_eq!(
             git(&repository, &["show", "-s", "--format=%P", INTEGRATION_REF]),
             external_oid
+        );
+        assert_eq!(
+            git(&repository, &["rev-parse", RELEASE_REF]),
+            git(&repository, &["rev-parse", INTEGRATION_REF])
         );
     }
 

@@ -250,7 +250,7 @@ impl RepositoryStore {
     }
 
     pub fn initialize_repository(&self, state: &RepositoryState) -> Result<(), StoreError> {
-        let json = encode(state)?;
+        let json = encode_state(state)?;
         self.connection.lock().execute(
             "INSERT INTO repository_state (repository_id, state_json, queue_revision, event_sequence, schema_version, engine_epoch, active_configuration_digest, updated_at)\n             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)\n             ON CONFLICT(repository_id) DO UPDATE SET state_json=excluded.state_json, queue_revision=excluded.queue_revision, event_sequence=excluded.event_sequence, engine_epoch=excluded.engine_epoch, active_configuration_digest=excluded.active_configuration_digest, updated_at=excluded.updated_at",
             params![state.id.to_string(), json, state.queue_revision as i64, state.event_sequence as i64, SCHEMA_VERSION, state.engine_epoch as i64, state.active_configuration_digest, now()],
@@ -268,7 +268,7 @@ impl RepositoryStore {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute(
             "INSERT INTO repository_state (repository_id, state_json, queue_revision, event_sequence, schema_version, engine_epoch, active_configuration_digest, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![state.id.to_string(), encode(state)?, state.queue_revision as i64, state.event_sequence as i64, SCHEMA_VERSION, state.engine_epoch as i64, state.active_configuration_digest, now()],
+            params![state.id.to_string(), encode_state(state)?, state.queue_revision as i64, state.event_sequence as i64, SCHEMA_VERSION, state.engine_epoch as i64, state.active_configuration_digest, now()],
         )?;
         transaction.execute(
             "INSERT INTO configuration_snapshots (digest, schema_version, canonical_bytes, step_graph_digest, activation_sequence, supersedes_digest) VALUES (?1, ?2, ?3, ?4, 0, NULL)",
@@ -302,7 +302,7 @@ impl RepositoryStore {
     pub fn update_repository_state(&self, state: &RepositoryState) -> Result<(), StoreError> {
         let changed = self.connection.lock().execute(
             "UPDATE repository_state SET state_json=?2, queue_revision=?3, event_sequence=?4, engine_epoch=?5, active_configuration_digest=?6, updated_at=?7 WHERE repository_id=?1",
-            params![state.id.to_string(), encode(state)?, state.queue_revision as i64, state.event_sequence as i64, state.engine_epoch as i64, state.active_configuration_digest, now()],
+            params![state.id.to_string(), encode_state(state)?, state.queue_revision as i64, state.event_sequence as i64, state.engine_epoch as i64, state.active_configuration_digest, now()],
         )?;
         if changed == 0 {
             return Err(StoreError::RepositoryMissing);
@@ -328,7 +328,7 @@ impl RepositoryStore {
         )?;
         transaction.execute(
             "UPDATE repository_state SET state_json=?2, queue_revision=?3, event_sequence=?4, active_configuration_digest=?5, updated_at=?6 WHERE repository_id=?1",
-            params![state.id.to_string(), encode(state)?, state.queue_revision as i64, state.event_sequence as i64, state.active_configuration_digest, now()],
+            params![state.id.to_string(), encode_state(state)?, state.queue_revision as i64, state.event_sequence as i64, state.active_configuration_digest, now()],
         )?;
         transaction.execute(
             "UPDATE operation_intents SET state='external-applied', observed_json=?2, updated_at=?3 WHERE repository_id=?1 AND command_id=?4 AND kind='config-apply' AND state='prepared'",
@@ -482,7 +482,7 @@ impl RepositoryStore {
         let mut persisted_state: RepositoryState = decode(&state_json)?;
         persisted_state.queue_revision = new_revision as u64;
         persisted_state.event_sequence = new_sequence as u64;
-        transaction.execute("UPDATE repository_state SET state_json=?2, queue_revision=?3, event_sequence=?4, updated_at=?5 WHERE repository_id=?1", params![item.repository_id.to_string(), encode(&persisted_state)?, new_revision, new_sequence, now()])?;
+        transaction.execute("UPDATE repository_state SET state_json=?2, queue_revision=?3, event_sequence=?4, updated_at=?5 WHERE repository_id=?1", params![item.repository_id.to_string(), encode_state(&persisted_state)?, new_revision, new_sequence, now()])?;
         transaction.execute("UPDATE operation_intents SET state='completed', observed_json=?2, updated_at=?3 WHERE repository_id=?1 AND command_id=?4 AND kind='approval' AND state='prepared'", params![item.repository_id.to_string(), encode(item)?, now(), command_id.to_string()])?;
         transaction.execute("UPDATE volume_reservations SET active=0 WHERE intent_id IN (SELECT intent_id FROM operation_intents WHERE command_id=?1)", [command_id.to_string()])?;
         let event = DomainEvent {
@@ -534,7 +534,7 @@ impl RepositoryStore {
         persisted_state.event_sequence = new_sequence as u64;
         transaction.execute(
             "UPDATE repository_state SET state_json=?2, queue_revision=?3, event_sequence=?4, updated_at=?5 WHERE repository_id=?1",
-            params![item.repository_id.to_string(), encode(&persisted_state)?, revision, new_sequence, now()],
+            params![item.repository_id.to_string(), encode_state(&persisted_state)?, revision, new_sequence, now()],
         )?;
         transaction.execute(
             "UPDATE operation_intents SET state='completed', observed_json=?2, updated_at=?3 WHERE repository_id=?1 AND command_id=?4 AND kind='approval' AND state='prepared'",
@@ -613,7 +613,7 @@ impl RepositoryStore {
         )?;
         let mut persisted_state = state.clone();
         persisted_state.event_sequence = sequence;
-        transaction.execute("UPDATE repository_state SET state_json=?2, queue_revision=?3, event_sequence=?4, updated_at=?5 WHERE repository_id=?1", params![state.id.to_string(), encode(&persisted_state)?, state.queue_revision as i64, sequence as i64, now()])?;
+        transaction.execute("UPDATE repository_state SET state_json=?2, queue_revision=?3, event_sequence=?4, updated_at=?5 WHERE repository_id=?1", params![state.id.to_string(), encode_state(&persisted_state)?, state.queue_revision as i64, sequence as i64, now()])?;
         let event = DomainEvent {
             id: EventId::new(),
             repository_id: state.id,
@@ -693,7 +693,7 @@ impl RepositoryStore {
         persisted_state.event_sequence = new_sequence as u64;
         transaction.execute(
             "UPDATE repository_state SET state_json=?2, queue_revision=?3, event_sequence=?4, updated_at=?5 WHERE repository_id=?1",
-            params![state.id.to_string(), encode(&persisted_state)?, new_revision, new_sequence, now()],
+            params![state.id.to_string(), encode_state(&persisted_state)?, new_revision, new_sequence, now()],
         )?;
         let event = DomainEvent {
             id: EventId::new(),
@@ -751,7 +751,7 @@ impl RepositoryStore {
         persisted_state.event_sequence = sequence;
         transaction.execute(
             "UPDATE repository_state SET state_json=?2, queue_revision=?3, event_sequence=?4, updated_at=?5 WHERE repository_id=?1",
-            params![state.id.to_string(), encode(&persisted_state)?, state.queue_revision as i64, sequence as i64, now()],
+            params![state.id.to_string(), encode_state(&persisted_state)?, state.queue_revision as i64, sequence as i64, now()],
         )?;
         let event = DomainEvent {
             id: EventId::new(),
@@ -915,7 +915,7 @@ impl RepositoryStore {
         persisted_state.event_sequence = sequence;
         transaction.execute(
             "UPDATE repository_state SET state_json=?2, event_sequence=?3, updated_at=?4 WHERE repository_id=?1",
-            params![state.id.to_string(), encode(&persisted_state)?, sequence as i64, now()],
+            params![state.id.to_string(), encode_state(&persisted_state)?, sequence as i64, now()],
         )?;
         transaction.execute(
             "UPDATE operation_intents SET state='completed', observed_json=?2, updated_at=?3 WHERE repository_id=?1 AND command_id=?4 AND kind='artifact' AND state IN ('prepared','external-applied')",
@@ -1143,7 +1143,7 @@ impl RepositoryStore {
         persisted_state.event_sequence = sequence;
         transaction.execute(
             "UPDATE repository_state SET state_json=?2, event_sequence=?3, updated_at=?4 WHERE repository_id=?1",
-            params![state.id.to_string(), encode(&persisted_state)?, sequence as i64, recorded_at],
+            params![state.id.to_string(), encode_state(&persisted_state)?, sequence as i64, recorded_at],
         )?;
         let completed = transaction.execute(
             "UPDATE operation_intents SET state='completed', observed_json=?2, updated_at=?3 WHERE repository_id=?1 AND command_id=?4 AND kind=?5 AND state IN ('prepared','external-applied')",
@@ -1219,7 +1219,7 @@ impl RepositoryStore {
         persisted_state.event_sequence = sequence;
         transaction.execute(
             "UPDATE repository_state SET state_json=?2, event_sequence=?3, updated_at=?4 WHERE repository_id=?1",
-            params![state.id.to_string(), encode(&persisted_state)?, sequence as i64, now()],
+            params![state.id.to_string(), encode_state(&persisted_state)?, sequence as i64, now()],
         )?;
         if let Some(intent_kind) = intent_kind {
             transaction.execute(
@@ -1357,7 +1357,7 @@ impl RepositoryStore {
         persisted_state.event_sequence = sequence;
         transaction.execute(
             "UPDATE repository_state SET state_json=?2, event_sequence=?3, updated_at=?4 WHERE repository_id=?1",
-            params![state.id.to_string(), encode(&persisted_state)?, sequence as i64, now()],
+            params![state.id.to_string(), encode_state(&persisted_state)?, sequence as i64, now()],
         )?;
         transaction.execute(
             "UPDATE operation_intents SET state='completed', observed_json=?2, updated_at=?3 WHERE repository_id=?1 AND command_id=?4 AND kind='cache-snapshot' AND state IN ('prepared','external-applied')",
@@ -1482,7 +1482,7 @@ impl RepositoryStore {
         persisted_state.event_sequence = sequence;
         transaction.execute(
             "UPDATE repository_state SET state_json=?2, event_sequence=?3, updated_at=?4 WHERE repository_id=?1",
-            params![state.id.to_string(), encode(&persisted_state)?, sequence as i64, now()],
+            params![state.id.to_string(), encode_state(&persisted_state)?, sequence as i64, now()],
         )?;
         transaction.execute(
             "UPDATE operation_intents SET state='completed', observed_json=?2, updated_at=?3 WHERE repository_id=?1 AND command_id=?4 AND kind='cache-purge' AND state IN ('prepared','external-applied')",
@@ -1655,7 +1655,7 @@ impl RepositoryStore {
         persisted_state.event_sequence = sequence;
         transaction.execute(
             "UPDATE repository_state SET state_json=?2, queue_revision=?3, event_sequence=?4, updated_at=?5 WHERE repository_id=?1",
-            params![state.id.to_string(), encode(&persisted_state)?, state.queue_revision as i64, sequence as i64, now()],
+            params![state.id.to_string(), encode_state(&persisted_state)?, state.queue_revision as i64, sequence as i64, now()],
         )?;
         transaction.execute(
             "UPDATE operation_intents SET state='completed', observed_json=?2, updated_at=?3 WHERE repository_id=?1 AND command_id=?4 AND kind=?5 AND state IN ('prepared','external-applied','needs-attention')",
@@ -1928,7 +1928,7 @@ impl RepositoryStore {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute("INSERT OR REPLACE INTO source_promotions (item_id, source_oid, promoted_oid, old_master_oid, certificate_id, event_sequence) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", params![item.id.to_string(), item.source_oid.as_bytes(), certificate.tested_oid.as_bytes(), old_master, certificate.id.to_string(), state.event_sequence as i64])?;
         transaction.execute("UPDATE queue_items SET state=?2, remote_state=?3, cleanup_state=?4, item_json=?5, active=0 WHERE item_id=?1", params![item.id.to_string(), enum_json(&item.state)?, enum_json(&item.remote_state)?, enum_json(&item.cleanup_state)?, encode(item)?])?;
-        transaction.execute("UPDATE repository_state SET state_json=?2, queue_revision=?3, event_sequence=?4, updated_at=?5 WHERE repository_id=?1", params![state.id.to_string(), encode(state)?, state.queue_revision as i64, state.event_sequence as i64, now()])?;
+        transaction.execute("UPDATE repository_state SET state_json=?2, queue_revision=?3, event_sequence=?4, updated_at=?5 WHERE repository_id=?1", params![state.id.to_string(), encode_state(state)?, state.queue_revision as i64, state.event_sequence as i64, now()])?;
         transaction.execute("UPDATE operation_intents SET state='completed', observed_json=?2, updated_at=?3 WHERE repository_id=?1 AND kind='promotion' AND state IN ('prepared','external-applied')", params![state.id.to_string(), encode(item)?, now()])?;
         transaction.execute("UPDATE volume_reservations SET active=0 WHERE intent_id IN (SELECT intent_id FROM operation_intents WHERE repository_id=?1 AND kind='promotion' AND state='completed')", [state.id.to_string()])?;
         let event = DomainEvent {
@@ -1965,6 +1965,41 @@ impl RepositoryStore {
         )?;
         let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Persists `state` and one event describing the change in a single transaction. The event
+    /// takes the next sequence, which the returned event and the persisted state both carry.
+    pub fn record_state_event(
+        &self,
+        state: &RepositoryState,
+        actor: Actor,
+        kind: &str,
+        payload: serde_json::Value,
+    ) -> Result<DomainEvent, StoreError> {
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut persisted_state = state.clone();
+        persisted_state.event_sequence = state.event_sequence + 1;
+        let changed = transaction.execute(
+            "UPDATE repository_state SET state_json=?2, queue_revision=?3, event_sequence=?4, engine_epoch=?5, active_configuration_digest=?6, updated_at=?7 WHERE repository_id=?1",
+            params![state.id.to_string(), encode_state(&persisted_state)?, persisted_state.queue_revision as i64, persisted_state.event_sequence as i64, persisted_state.engine_epoch as i64, persisted_state.active_configuration_digest, now()],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::RepositoryMissing);
+        }
+        let event = DomainEvent {
+            id: EventId::new(),
+            repository_id: state.id,
+            sequence: persisted_state.event_sequence,
+            actor,
+            command_id: None,
+            kind: kind.into(),
+            payload,
+            created_at: OffsetDateTime::now_utc(),
+        };
+        insert_event(&transaction, &event)?;
+        transaction.commit()?;
+        Ok(event)
     }
 
     pub fn append_event(&self, event: &DomainEvent) -> Result<(), StoreError> {
@@ -2799,6 +2834,19 @@ fn verify_sqlite_version(connection: &Connection) -> Result<(), StoreError> {
 fn encode(value: &impl Serialize) -> Result<String, StoreError> {
     Ok(serde_json::to_string(value)?)
 }
+/// Encodes the repository projection for its single durable row. Every repository is opt-out
+/// (no release-stage steps) until release runs exist, so every persisted projection must keep
+/// `staging` and `release` at the same OID; debug builds, and with them every test, check that
+/// opt-out equivalence holds after each state transition.
+fn encode_state(state: &RepositoryState) -> Result<String, StoreError> {
+    debug_assert!(
+        state.opt_out_equivalence_holds(),
+        "opt-out equivalence violated: staging {} and release {} must be equal with nothing unreleased",
+        state.staging_oid,
+        state.release_oid,
+    );
+    encode(state)
+}
 fn decode<T: DeserializeOwned>(value: &str) -> Result<T, StoreError> {
     Ok(serde_json::from_str(value)?)
 }
@@ -2892,8 +2940,8 @@ mod tests {
     use super::*;
     use tollgate_domain::{
         BlockReason, CleanupPolicy, CleanupState, GitOid, ObjectFormat, QueueItemId, QueueItemKind,
-        QueueItemState, RemoteState, RepositoryExecutionState, SignatureState, SourceMetadata,
-        ValidationGenerationId,
+        QueueItemState, ReleaseLag, ReleaseState, RemoteState, RepositoryExecutionState,
+        SignatureState, SourceMetadata, ValidationGenerationId,
     };
 
     fn oid(value: u8) -> GitOid {
@@ -2905,8 +2953,12 @@ mod tests {
             id: RepositoryId::new(),
             name: name.into(),
             path: format!("/{name}"),
-            integration_ref: "refs/heads/release".into(),
-            master_oid: oid(1),
+            staging_ref: "refs/heads/staging".into(),
+            staging_oid: oid(1),
+            release_ref: "refs/heads/release".into(),
+            release_oid: oid(1),
+            release_lag: ReleaseLag::default(),
+            release_state: ReleaseState::Green,
             queue_revision: 0,
             event_sequence: 0,
             engine_epoch: 1,
@@ -2927,8 +2979,12 @@ mod tests {
             id: RepositoryId::new(),
             name: "demo".into(),
             path: "/demo".into(),
-            integration_ref: "refs/heads/master".into(),
-            master_oid: oid(1),
+            staging_ref: "refs/heads/staging".into(),
+            staging_oid: oid(1),
+            release_ref: "refs/heads/release".into(),
+            release_oid: oid(1),
+            release_lag: ReleaseLag::default(),
+            release_state: ReleaseState::Green,
             queue_revision: 0,
             event_sequence: 0,
             engine_epoch: 1,
@@ -2955,8 +3011,12 @@ mod tests {
             id: RepositoryId::new(),
             name: "backup-test".into(),
             path: "/backup-test".into(),
-            integration_ref: "refs/heads/release".into(),
-            master_oid: oid(1),
+            staging_ref: "refs/heads/staging".into(),
+            staging_oid: oid(1),
+            release_ref: "refs/heads/release".into(),
+            release_oid: oid(1),
+            release_lag: ReleaseLag::default(),
+            release_state: ReleaseState::Green,
             queue_revision: 0,
             event_sequence: 0,
             engine_epoch: 1,
@@ -3003,8 +3063,12 @@ mod tests {
             id: RepositoryId::new(),
             name: "promotion-intent".into(),
             path: "/promotion-intent".into(),
-            integration_ref: "refs/heads/release".into(),
-            master_oid: oid(1),
+            staging_ref: "refs/heads/staging".into(),
+            staging_oid: oid(1),
+            release_ref: "refs/heads/release".into(),
+            release_oid: oid(1),
+            release_lag: ReleaseLag::default(),
+            release_state: ReleaseState::Green,
             queue_revision: 0,
             event_sequence: 0,
             engine_epoch: 1,
@@ -3337,8 +3401,12 @@ mod tests {
             id: RepositoryId::new(),
             name: "reservation-test".into(),
             path: "/reservation-test".into(),
-            integration_ref: "refs/heads/master".into(),
-            master_oid: oid(7),
+            staging_ref: "refs/heads/staging".into(),
+            staging_oid: oid(7),
+            release_ref: "refs/heads/release".into(),
+            release_oid: oid(7),
+            release_lag: ReleaseLag::default(),
+            release_state: ReleaseState::Green,
             queue_revision: 0,
             event_sequence: 0,
             engine_epoch: 1,
@@ -3387,8 +3455,12 @@ mod tests {
             id: RepositoryId::new(),
             name: "candidate-race".into(),
             path: "/candidate-race".into(),
-            integration_ref: "refs/heads/release".into(),
-            master_oid: oid(1),
+            staging_ref: "refs/heads/staging".into(),
+            staging_oid: oid(1),
+            release_ref: "refs/heads/release".into(),
+            release_oid: oid(1),
+            release_lag: ReleaseLag::default(),
+            release_state: ReleaseState::Green,
             queue_revision: 0,
             event_sequence: 0,
             engine_epoch: 1,
@@ -3406,11 +3478,11 @@ mod tests {
         let generation = ValidationGeneration::derive(
             ValidationGenerationId::new(),
             item_id,
-            state.master_oid.clone(),
+            state.staging_oid.clone(),
             vec![item_id],
             vec![source_oid.clone()],
             vec![source_oid.clone()],
-            state.master_oid.clone(),
+            state.staging_oid.clone(),
             source_oid.clone(),
             "digest".into(),
             "steps".into(),
@@ -3486,8 +3558,12 @@ mod tests {
             id: RepositoryId::new(),
             name: "projection-race".into(),
             path: "/projection-race".into(),
-            integration_ref: "refs/heads/release".into(),
-            master_oid: oid(1),
+            staging_ref: "refs/heads/staging".into(),
+            staging_oid: oid(1),
+            release_ref: "refs/heads/release".into(),
+            release_oid: oid(1),
+            release_lag: ReleaseLag::default(),
+            release_state: ReleaseState::Green,
             queue_revision: 0,
             event_sequence: 0,
             engine_epoch: 1,
@@ -3505,11 +3581,11 @@ mod tests {
         let generation = ValidationGeneration::derive(
             ValidationGenerationId::new(),
             item_id,
-            state.master_oid.clone(),
+            state.staging_oid.clone(),
             vec![item_id],
             vec![source_oid.clone()],
             vec![source_oid.clone()],
-            state.master_oid.clone(),
+            state.staging_oid.clone(),
             source_oid.clone(),
             "digest".into(),
             "steps".into(),

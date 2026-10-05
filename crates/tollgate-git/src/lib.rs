@@ -15,10 +15,21 @@ use tokio::{fs, io::AsyncReadExt, process::Command};
 use tollgate_domain::{GitOid, ObjectFormat, QueueItemId};
 
 const EMPTY_HOOKS_DIRECTORY: &str = "/dev/null";
-pub const INTEGRATION_BRANCH: &str = "release";
-pub const INTEGRATION_REF: &str = "refs/heads/release";
+/// Tollgate-owned integration branch: every promotion advances it and new work bases on it.
+pub const INTEGRATION_BRANCH: &str = "staging";
+pub const INTEGRATION_REF: &str = "refs/heads/staging";
+/// Tollgate-owned released branch: the only source of remote pushes. It is always `staging` or a
+/// first-parent ancestor of it; without release-stage steps it always equals `staging`.
+pub const RELEASE_BRANCH: &str = "release";
+pub const RELEASE_REF: &str = "refs/heads/release";
 pub const USER_BRANCH: &str = "master";
 pub const USER_BRANCH_REF: &str = "refs/heads/master";
+
+/// Branches no feature worktree, update, or cleanup may use: the user-owned `master` and both
+/// Tollgate-owned refs.
+pub fn is_reserved_branch(branch: &str) -> bool {
+    matches!(branch, USER_BRANCH | INTEGRATION_BRANCH | RELEASE_BRANCH)
+}
 
 #[derive(Debug, Error)]
 pub enum GitError {
@@ -28,8 +39,8 @@ pub enum GitError {
     InvalidOutput(String),
     #[error("repository is dirty: {0}")]
     DirtyWorktree(String),
-    #[error("Tollgate integration branch `release` is checked out in {0}")]
-    IntegrationCheckedOut(String),
+    #[error("Tollgate-owned branch `{branch}` is checked out in {path}")]
+    IntegrationCheckedOut { branch: &'static str, path: String },
     #[error("unsupported Git object format `{0}`")]
     UnsupportedObjectFormat(String),
     #[error("source commit must have exactly one parent")]
@@ -185,8 +196,14 @@ impl GitRepository {
         })
     }
 
+    /// The `staging` OID: the base for gating, new work, and user `master` synchronization.
     pub async fn integration_oid(&self) -> Result<GitOid, GitError> {
         self.resolve_oid(INTEGRATION_REF).await
+    }
+
+    /// The `release` OID: what the remote push publishes.
+    pub async fn release_oid(&self) -> Result<GitOid, GitError> {
+        self.resolve_oid(RELEASE_REF).await
     }
 
     pub async fn tree_oid(&self, commit: &GitOid) -> Result<GitOid, GitError> {
@@ -303,6 +320,7 @@ impl GitRepository {
         })
     }
 
+    /// Fails when any worktree of the repository has `staging` or `release` checked out.
     pub async fn ensure_integration_not_checked_out(&self) -> Result<(), GitError> {
         let bytes = self.git(["worktree", "list", "--porcelain", "-z"]).await?;
         let fields = bytes.split(|byte| *byte == 0).collect::<Vec<_>>();
@@ -310,11 +328,22 @@ impl GitRepository {
         for field in fields {
             if let Some(path) = field.strip_prefix(b"worktree ") {
                 current_path = Some(String::from_utf8_lossy(path).into_owned());
-            } else if field == b"branch refs/heads/release" {
-                return Err(GitError::IntegrationCheckedOut(
-                    current_path.unwrap_or_default(),
-                ));
+                continue;
             }
+            let Some(checked_out) = field.strip_prefix(b"branch ") else {
+                continue;
+            };
+            let branch = if checked_out == INTEGRATION_REF.as_bytes() {
+                INTEGRATION_BRANCH
+            } else if checked_out == RELEASE_REF.as_bytes() {
+                RELEASE_BRANCH
+            } else {
+                continue;
+            };
+            return Err(GitError::IntegrationCheckedOut {
+                branch,
+                path: current_path.unwrap_or_default(),
+            });
         }
         Ok(())
     }
@@ -790,7 +819,7 @@ impl GitRepository {
     ) -> Result<bool, GitError> {
         let approved_identity = Self::directory_identity(worktree)?;
         let worktree = std::fs::canonicalize(worktree)?;
-        if worktree == self.worktree_root || matches!(branch, USER_BRANCH | INTEGRATION_BRANCH) {
+        if worktree == self.worktree_root || is_reserved_branch(branch) {
             return Ok(false);
         }
         let registration = self.registered_worktree(&worktree).await?.ok_or_else(|| {
@@ -868,34 +897,46 @@ impl GitRepository {
         Ok((!branch.is_empty()).then_some(branch))
     }
 
+    /// Registration: creates `staging` and `release` at local `master`'s exact OID in one ref
+    /// transaction. An existing Tollgate ref is accepted only at that OID.
     pub async fn initialize_integration_ref_from_master(&self) -> Result<GitOid, GitError> {
         self.ensure_integration_not_checked_out().await?;
         let master = self.resolve_oid(USER_BRANCH_REF).await?;
-        match self.optional_ref_oid(INTEGRATION_REF).await? {
-            Some(release) if release != master => Err(GitError::InvalidOutput(format!(
-                "local `release` already exists at {}, but `master` is {}; Tollgate will not overwrite it",
-                release.short(),
-                master.short()
-            ))),
-            Some(release) => Ok(release),
-            None => {
-                self.git(["update-ref", INTEGRATION_REF, &master.to_hex(), ""])
-                    .await?;
-                let release = self.integration_oid().await?;
-                if release != master {
-                    return Err(GitError::InvalidOutput(
-                        "release initialization did not preserve the exact master OID".into(),
-                    ));
+        let mut transaction = String::new();
+        for (branch, reference) in [
+            (INTEGRATION_BRANCH, INTEGRATION_REF),
+            (RELEASE_BRANCH, RELEASE_REF),
+        ] {
+            match self.optional_ref_oid(reference).await? {
+                Some(existing) if existing != master => {
+                    return Err(GitError::InvalidOutput(format!(
+                        "local `{branch}` already exists at {}, but `master` is {}; Tollgate will not overwrite it",
+                        existing.short(),
+                        master.short()
+                    )));
                 }
-                Ok(release)
+                Some(_) => {}
+                None => transaction.push_str(&format!("create {reference} {}\n", master.to_hex())),
             }
         }
+        if !transaction.is_empty() {
+            self.update_refs(&transaction).await?;
+        }
+        let (staging, release) = (self.integration_oid().await?, self.release_oid().await?);
+        if staging != master || release != master {
+            return Err(GitError::InvalidOutput(
+                "staging and release initialization did not preserve the exact master OID".into(),
+            ));
+        }
+        Ok(staging)
     }
 
+    /// Migrates the oldest layout, where Tollgate integrated directly on `master`, by creating
+    /// `release` at `master`'s OID. Staged-release migration then creates `staging`.
     pub async fn migrate_integration_ref_from_master(&self) -> Result<GitOid, GitError> {
         self.ensure_integration_not_checked_out().await?;
         let master = self.resolve_oid(USER_BRANCH_REF).await?;
-        if let Some(release) = self.optional_ref_oid(INTEGRATION_REF).await? {
+        if let Some(release) = self.optional_ref_oid(RELEASE_REF).await? {
             if release != master {
                 return Err(GitError::InvalidOutput(format!(
                     "cannot migrate Tollgate authority: existing `release` {} differs from legacy `master` {}",
@@ -905,9 +946,37 @@ impl GitRepository {
             }
             return Ok(release);
         }
-        self.git(["update-ref", INTEGRATION_REF, &master.to_hex(), ""])
+        self.git(["update-ref", RELEASE_REF, &master.to_hex(), ""])
             .await?;
-        self.integration_oid().await
+        self.release_oid().await
+    }
+
+    /// Staged-release migration: creates `staging` at the current `release` OID with an
+    /// expected-nonexistent compare-and-swap. A `staging` that already exists at exactly that OID
+    /// is accepted, so a migration interrupted after this step converges; any other existing
+    /// `staging` is refused.
+    pub async fn create_staging_from_release(&self) -> Result<GitOid, GitError> {
+        let release = self.release_oid().await?;
+        match self.optional_ref_oid(INTEGRATION_REF).await? {
+            Some(staging) if staging == release => return Ok(staging),
+            Some(staging) => {
+                return Err(GitError::InvalidOutput(format!(
+                    "cannot create Tollgate's `staging` branch: local `staging` already exists at {}, but `release` is {}; rename or delete that branch, then reopen Tollgate",
+                    staging.short(),
+                    release.short()
+                )));
+            }
+            None => {}
+        }
+        self.git(["update-ref", INTEGRATION_REF, &release.to_hex(), ""])
+            .await?;
+        let staging = self.integration_oid().await?;
+        if staging != release {
+            return Err(GitError::InvalidOutput(
+                "staging creation did not preserve the exact release OID".into(),
+            ));
+        }
+        Ok(staging)
     }
 
     pub async fn create_feature_worktree(
@@ -924,7 +993,7 @@ impl GitRepository {
         let valid = self
             .git_status(["check-ref-format", "--branch", branch])
             .await?;
-        if !valid.success() || matches!(branch, USER_BRANCH | INTEGRATION_BRANCH) {
+        if !valid.success() || is_reserved_branch(branch) {
             return Err(GitError::InvalidOutput(
                 "feature branch name is invalid or reserved".into(),
             ));
@@ -953,9 +1022,9 @@ impl GitRepository {
         let branch = self.current_branch().await?.ok_or_else(|| {
             GitError::InvalidOutput("feature update requires a checked-out branch".into())
         })?;
-        if matches!(branch.as_str(), USER_BRANCH | INTEGRATION_BRANCH) {
+        if is_reserved_branch(&branch) {
             return Err(GitError::InvalidOutput(
-                "feature update cannot operate on master or release".into(),
+                "feature update cannot operate on master, staging, or release".into(),
             ));
         }
         let old = self.resolve_oid("HEAD").await?;
@@ -1026,6 +1095,7 @@ impl GitRepository {
                 "fetch",
                 "--no-tags",
                 source.as_ref(),
+                "+refs/heads/staging:refs/tollgate/staging",
                 "+refs/heads/release:refs/tollgate/release",
                 "+refs/tollgate/sources/*:refs/tollgate/sources/*",
             ],
@@ -1436,23 +1506,63 @@ impl GitRepository {
         Ok(())
     }
 
+    /// The opt-out two-ref transaction: moves `staging` and `release` from `expected_old` to
+    /// `tested_new` in one `update-ref --stdin` transaction, so they hold the same OID before and
+    /// after. Nothing moves unless both refs equal `expected_old`.
     pub async fn compare_and_swap_integration(
         &self,
         expected_old: &GitOid,
         tested_new: &GitOid,
     ) -> Result<(), GitError> {
+        self.compare_and_swap_staging_and_release(expected_old, expected_old, tested_new)
+            .await
+    }
+
+    /// Moves `staging` from `expected_staging` and `release` from `expected_release` to the same
+    /// `new` OID in one ref transaction. Nothing moves unless both refs hold their expected OIDs.
+    pub async fn compare_and_swap_staging_and_release(
+        &self,
+        expected_staging: &GitOid,
+        expected_release: &GitOid,
+        new: &GitOid,
+    ) -> Result<(), GitError> {
         self.ensure_integration_not_checked_out().await?;
-        self.git([
-            "update-ref",
-            INTEGRATION_REF,
-            &tested_new.to_hex(),
-            &expected_old.to_hex(),
-        ])
+        self.update_refs(&format!(
+            "update {INTEGRATION_REF} {new} {expected_staging}\nupdate {RELEASE_REF} {new} {expected_release}\n",
+            new = new.to_hex(),
+            expected_staging = expected_staging.to_hex(),
+            expected_release = expected_release.to_hex(),
+        ))
         .await?;
-        if self.integration_oid().await? != *tested_new {
+        if self.integration_oid().await? != *new || self.release_oid().await? != *new {
             return Err(GitError::InvalidOutput(
-                "release CAS result mismatch".into(),
+                "staging and release CAS result mismatch".into(),
             ));
+        }
+        Ok(())
+    }
+
+    /// Applies `update-ref --stdin` instructions as one atomic ref transaction.
+    async fn update_refs(&self, instructions: &str) -> Result<(), GitError> {
+        use tokio::io::AsyncWriteExt;
+        let mut child = internal_command(&self.profile.executable, &self.worktree_root)
+            .args(["update-ref", "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| GitError::InvalidOutput("update-ref stdin is unavailable".into()))?;
+        stdin.write_all(instructions.as_bytes()).await?;
+        drop(stdin);
+        let output = child.wait_with_output().await?;
+        if !output.status.success() {
+            return Err(GitError::Command {
+                command: "git update-ref --stdin".into(),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().into(),
+            });
         }
         Ok(())
     }
@@ -2211,7 +2321,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn initializes_release_without_moving_the_checked_out_master_branch() {
+    async fn initializes_staging_and_release_without_moving_the_checked_out_master_branch() {
         let temporary = tempfile::tempdir().unwrap();
         let repository = temporary.path().join("repository");
         std::fs::create_dir(&repository).unwrap();
@@ -2229,11 +2339,146 @@ mod tests {
 
         assert_eq!(release, master);
         assert_eq!(adapter.integration_oid().await.unwrap(), master);
+        assert_eq!(adapter.release_oid().await.unwrap(), master);
         assert_eq!(
             adapter.current_branch().await.unwrap().as_deref(),
             Some(USER_BRANCH)
         );
         adapter.ensure_integration_not_checked_out().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn neither_tollgate_branch_may_be_checked_out_in_any_worktree() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("file.txt"), "base\n").unwrap();
+        git(&repository, &["add", "file.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+        let adapter = GitRepository::discover(&repository).await.unwrap();
+        adapter
+            .initialize_integration_ref_from_master()
+            .await
+            .unwrap();
+
+        for branch in [INTEGRATION_BRANCH, RELEASE_BRANCH] {
+            assert!(is_reserved_branch(branch));
+            let linked = temporary.path().join(branch);
+            git(
+                &repository,
+                &["worktree", "add", linked.to_str().unwrap(), branch],
+            );
+            match adapter.ensure_integration_not_checked_out().await {
+                Err(GitError::IntegrationCheckedOut {
+                    branch: checked_out,
+                    path,
+                }) => {
+                    assert_eq!(checked_out, branch);
+                    assert_eq!(
+                        std::fs::canonicalize(path).unwrap(),
+                        std::fs::canonicalize(&linked).unwrap()
+                    );
+                }
+                other => panic!("expected `{branch}` checkout protection, got {other:?}"),
+            }
+            git(
+                &repository,
+                &["worktree", "remove", "--force", linked.to_str().unwrap()],
+            );
+        }
+        git(&repository, &["checkout", INTEGRATION_BRANCH]);
+        assert!(matches!(
+            adapter.ensure_integration_not_checked_out().await,
+            Err(GitError::IntegrationCheckedOut {
+                branch: INTEGRATION_BRANCH,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_opt_out_transaction_moves_staging_and_release_together_or_not_at_all() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("file.txt"), "base\n").unwrap();
+        git(&repository, &["add", "file.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+        let adapter = GitRepository::discover(&repository).await.unwrap();
+        let base = adapter
+            .initialize_integration_ref_from_master()
+            .await
+            .unwrap();
+        std::fs::write(repository.join("file.txt"), "next\n").unwrap();
+        git(&repository, &["commit", "-am", "next"]);
+        let next = adapter.resolve_oid(USER_BRANCH_REF).await.unwrap();
+
+        adapter
+            .compare_and_swap_integration(&base, &next)
+            .await
+            .unwrap();
+        assert_eq!(adapter.integration_oid().await.unwrap(), next);
+        assert_eq!(adapter.release_oid().await.unwrap(), next);
+
+        // An externally moved `release` fails the whole transaction: `staging` stays put too.
+        git(&repository, &["update-ref", RELEASE_REF, &base.to_hex()]);
+        std::fs::write(repository.join("file.txt"), "third\n").unwrap();
+        git(&repository, &["commit", "-am", "third"]);
+        let third = adapter.resolve_oid(USER_BRANCH_REF).await.unwrap();
+        assert!(
+            adapter
+                .compare_and_swap_integration(&next, &third)
+                .await
+                .is_err()
+        );
+        assert_eq!(adapter.integration_oid().await.unwrap(), next);
+        assert_eq!(adapter.release_oid().await.unwrap(), base);
+
+        adapter
+            .compare_and_swap_staging_and_release(&next, &base, &third)
+            .await
+            .unwrap();
+        assert_eq!(adapter.integration_oid().await.unwrap(), third);
+        assert_eq!(adapter.release_oid().await.unwrap(), third);
+    }
+
+    #[tokio::test]
+    async fn staging_is_created_at_release_exactly_once() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("file.txt"), "base\n").unwrap();
+        git(&repository, &["add", "file.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+        git(&repository, &["branch", RELEASE_BRANCH]);
+        std::fs::write(repository.join("file.txt"), "master moved\n").unwrap();
+        git(&repository, &["commit", "-am", "move master"]);
+        let adapter = GitRepository::discover(&repository).await.unwrap();
+        let release = adapter.release_oid().await.unwrap();
+
+        assert_eq!(
+            adapter.create_staging_from_release().await.unwrap(),
+            release
+        );
+        assert_eq!(adapter.integration_oid().await.unwrap(), release);
+        // An interrupted migration that already created `staging` converges.
+        assert_eq!(
+            adapter.create_staging_from_release().await.unwrap(),
+            release
+        );
+
+        let master = adapter.resolve_oid(USER_BRANCH_REF).await.unwrap();
+        git(
+            &repository,
+            &["update-ref", INTEGRATION_REF, &master.to_hex()],
+        );
+        let error = adapter.create_staging_from_release().await.unwrap_err();
+        assert!(error.to_string().contains("already exists"));
+        assert_eq!(adapter.integration_oid().await.unwrap(), master);
+        assert_eq!(adapter.release_oid().await.unwrap(), release);
     }
 
     #[tokio::test]
@@ -3024,29 +3269,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refuses_to_overwrite_an_existing_divergent_release_branch() {
-        let temporary = tempfile::tempdir().unwrap();
-        let repository = temporary.path().join("repository");
-        std::fs::create_dir(&repository).unwrap();
-        git(&repository, &["init", "-b", USER_BRANCH]);
-        std::fs::write(repository.join("file.txt"), "base\n").unwrap();
-        git(&repository, &["add", "file.txt"]);
-        git(&repository, &["commit", "-m", "base"]);
-        git(&repository, &["branch", INTEGRATION_BRANCH]);
-        std::fs::write(repository.join("file.txt"), "master moved\n").unwrap();
-        git(&repository, &["commit", "-am", "move master"]);
+    async fn refuses_to_overwrite_an_existing_divergent_tollgate_branch() {
+        for (branch, other) in [
+            (INTEGRATION_BRANCH, RELEASE_REF),
+            (RELEASE_BRANCH, INTEGRATION_REF),
+        ] {
+            let temporary = tempfile::tempdir().unwrap();
+            let repository = temporary.path().join("repository");
+            std::fs::create_dir(&repository).unwrap();
+            git(&repository, &["init", "-b", USER_BRANCH]);
+            std::fs::write(repository.join("file.txt"), "base\n").unwrap();
+            git(&repository, &["add", "file.txt"]);
+            git(&repository, &["commit", "-m", "base"]);
+            git(&repository, &["branch", branch]);
+            std::fs::write(repository.join("file.txt"), "master moved\n").unwrap();
+            git(&repository, &["commit", "-am", "move master"]);
 
-        let adapter = GitRepository::discover(&repository).await.unwrap();
-        let error = adapter
-            .initialize_integration_ref_from_master()
-            .await
-            .unwrap_err();
+            let adapter = GitRepository::discover(&repository).await.unwrap();
+            let error = adapter
+                .initialize_integration_ref_from_master()
+                .await
+                .unwrap_err();
 
-        assert!(error.to_string().contains("will not overwrite"));
-        assert_ne!(
-            adapter.integration_oid().await.unwrap(),
-            adapter.resolve_oid(USER_BRANCH_REF).await.unwrap()
-        );
+            assert!(error.to_string().contains("will not overwrite"));
+            assert!(error.to_string().contains(&format!("`{branch}`")));
+            assert_ne!(
+                adapter
+                    .resolve_oid(&format!("refs/heads/{branch}"))
+                    .await
+                    .unwrap(),
+                adapter.resolve_oid(USER_BRANCH_REF).await.unwrap()
+            );
+            assert_eq!(adapter.optional_ref_oid(other).await.unwrap(), None);
+        }
     }
 
     #[tokio::test]

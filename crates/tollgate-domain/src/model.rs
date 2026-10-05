@@ -15,13 +15,28 @@ pub enum QueueItemKind {
     IndependentCheck,
 }
 
+/// The ref every repository registered before staged release used as its single integration
+/// ref. Persisted state that still names it as `staging_ref` predates the `staging` ref.
+pub const LEGACY_INTEGRATION_REF: &str = "refs/heads/release";
+
+/// Durable repository projection.
+///
+/// `staging_ref` is the Tollgate-owned integration ref every promotion advances and new work
+/// bases on. `release_ref` is the Tollgate-owned ref the remote push publishes. A repository
+/// without release-stage steps (every repository until release runs exist) keeps both at the same
+/// OID: every promotion updates them together in one ref transaction (opt-out equivalence).
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(from = "PersistedRepositoryState")]
 pub struct RepositoryState {
     pub id: RepositoryId,
     pub name: String,
     pub path: String,
-    pub integration_ref: String,
-    pub master_oid: GitOid,
+    pub staging_ref: String,
+    pub staging_oid: GitOid,
+    pub release_ref: String,
+    pub release_oid: GitOid,
+    pub release_lag: ReleaseLag,
+    pub release_state: ReleaseState,
     pub queue_revision: u64,
     pub event_sequence: u64,
     pub engine_epoch: u64,
@@ -32,6 +47,110 @@ pub struct RepositoryState {
     pub active_window_floor: u16,
     pub active_window_ceiling: u16,
     pub remote_enabled: bool,
+}
+
+impl RepositoryState {
+    /// Moves both Tollgate refs' projections to `oid`, as the opt-out two-ref transaction does
+    /// for the refs themselves: `release` equals `staging`, so nothing is unreleased.
+    pub fn set_staging_and_release(&mut self, oid: GitOid) {
+        self.release_oid = oid.clone();
+        self.staging_oid = oid;
+        self.release_lag = ReleaseLag::default();
+        self.release_state = ReleaseState::Green;
+    }
+
+    /// Opt-out equivalence: with no release-stage steps, `staging` and `release` name the same
+    /// OID and nothing is unreleased. Every repository is opt-out until release runs exist.
+    pub fn opt_out_equivalence_holds(&self) -> bool {
+        self.staging_oid == self.release_oid
+            && self.release_lag == ReleaseLag::default()
+            && self.release_state == ReleaseState::Green
+    }
+}
+
+/// How far `release` trails `staging`.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReleaseLag {
+    /// First-parent commits on `staging` that `release` does not contain.
+    pub commits: u64,
+    /// When `staging` first advanced past `release`; absent when nothing is unreleased.
+    pub since: Option<OffsetDateTime>,
+}
+
+/// The release stage's verdict on the newest `staging` tip.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReleaseState {
+    /// `release` equals `staging`.
+    #[default]
+    Green,
+    /// `release` trails `staging` and no release run has failed on the unreleased range.
+    Pending,
+    /// The latest release run failed; `release` stays at its last certified OID.
+    Failing,
+}
+
+/// Wire shape that also accepts state persisted before the `staging` ref existed, which named the
+/// integration ref `integration_ref`, its OID `master_oid`, and had no release fields. Such state
+/// decodes with `staging_ref` set to [`LEGACY_INTEGRATION_REF`] and `release` at the same OID, and
+/// startup reconciliation migrates it.
+#[derive(Deserialize)]
+struct PersistedRepositoryState {
+    id: RepositoryId,
+    name: String,
+    path: String,
+    #[serde(alias = "integration_ref")]
+    staging_ref: String,
+    #[serde(alias = "master_oid")]
+    staging_oid: GitOid,
+    #[serde(default)]
+    release_ref: Option<String>,
+    #[serde(default)]
+    release_oid: Option<GitOid>,
+    #[serde(default)]
+    release_lag: ReleaseLag,
+    #[serde(default)]
+    release_state: ReleaseState,
+    queue_revision: u64,
+    event_sequence: u64,
+    engine_epoch: u64,
+    execution_state: RepositoryExecutionState,
+    block_reasons: Vec<BlockReason>,
+    active_configuration_digest: String,
+    active_window: u16,
+    active_window_floor: u16,
+    active_window_ceiling: u16,
+    remote_enabled: bool,
+}
+
+impl From<PersistedRepositoryState> for RepositoryState {
+    fn from(state: PersistedRepositoryState) -> Self {
+        Self {
+            id: state.id,
+            name: state.name,
+            path: state.path,
+            release_ref: state
+                .release_ref
+                .unwrap_or_else(|| LEGACY_INTEGRATION_REF.into()),
+            release_oid: state
+                .release_oid
+                .unwrap_or_else(|| state.staging_oid.clone()),
+            staging_ref: state.staging_ref,
+            staging_oid: state.staging_oid,
+            release_lag: state.release_lag,
+            release_state: state.release_state,
+            queue_revision: state.queue_revision,
+            event_sequence: state.event_sequence,
+            engine_epoch: state.engine_epoch,
+            execution_state: state.execution_state,
+            block_reasons: state.block_reasons,
+            active_configuration_digest: state.active_configuration_digest,
+            active_window: state.active_window,
+            active_window_floor: state.active_window_floor,
+            active_window_ceiling: state.active_window_ceiling,
+            remote_enabled: state.remote_enabled,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -348,6 +467,85 @@ impl PassCertificate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn repository_state_json() -> serde_json::Value {
+        serde_json::json!({
+            "id": RepositoryId::new(),
+            "name": "repository",
+            "path": "/tmp/repository",
+            "staging_ref": "refs/heads/staging",
+            "staging_oid": GitOid::from_hex(&"a".repeat(40)).unwrap(),
+            "release_ref": "refs/heads/release",
+            "release_oid": GitOid::from_hex(&"b".repeat(40)).unwrap(),
+            "release_lag": { "commits": 1, "since": null },
+            "release_state": "pending",
+            "queue_revision": 3,
+            "event_sequence": 4,
+            "engine_epoch": 1,
+            "execution_state": "active",
+            "block_reasons": [],
+            "active_configuration_digest": "digest",
+            "active_window": 20,
+            "active_window_floor": 3,
+            "active_window_ceiling": 20,
+            "remote_enabled": false
+        })
+    }
+
+    #[test]
+    fn repository_state_round_trips_both_tollgate_refs() {
+        let value = repository_state_json();
+        let state = serde_json::from_value::<RepositoryState>(value.clone()).unwrap();
+        assert_eq!(state.staging_ref, "refs/heads/staging");
+        assert_eq!(state.release_oid.to_hex(), "b".repeat(40));
+        assert_eq!(state.release_state, ReleaseState::Pending);
+        assert!(!state.opt_out_equivalence_holds());
+        assert_eq!(serde_json::to_value(&state).unwrap(), value);
+    }
+
+    #[test]
+    fn state_persisted_before_staging_decodes_with_release_at_the_integration_oid() {
+        let mut value = repository_state_json();
+        let object = value.as_object_mut().unwrap();
+        for field in [
+            "staging_ref",
+            "staging_oid",
+            "release_ref",
+            "release_oid",
+            "release_lag",
+            "release_state",
+        ] {
+            object.remove(field);
+        }
+        let integration = GitOid::from_hex(&"c".repeat(40)).unwrap();
+        object.insert("integration_ref".into(), LEGACY_INTEGRATION_REF.into());
+        object.insert(
+            "master_oid".into(),
+            serde_json::to_value(&integration).unwrap(),
+        );
+
+        let state = serde_json::from_value::<RepositoryState>(value).unwrap();
+        assert_eq!(state.staging_ref, LEGACY_INTEGRATION_REF);
+        assert_eq!(state.release_ref, LEGACY_INTEGRATION_REF);
+        assert_eq!(state.staging_oid, integration);
+        assert_eq!(state.release_oid, integration);
+        assert!(state.opt_out_equivalence_holds());
+        let encoded = serde_json::to_value(&state).unwrap();
+        assert!(encoded.get("integration_ref").is_none());
+        assert!(encoded.get("master_oid").is_none());
+    }
+
+    #[test]
+    fn setting_staging_and_release_restores_opt_out_equivalence() {
+        let mut state = serde_json::from_value::<RepositoryState>(repository_state_json()).unwrap();
+        let promoted = GitOid::from_hex(&"d".repeat(40)).unwrap();
+        state.set_staging_and_release(promoted.clone());
+        assert_eq!(state.staging_oid, promoted);
+        assert_eq!(state.release_oid, promoted);
+        assert_eq!(state.release_lag, ReleaseLag::default());
+        assert_eq!(state.release_state, ReleaseState::Green);
+        assert!(state.opt_out_equivalence_holds());
+    }
 
     #[test]
     fn frozen_steps_record_release_stage_and_keep_gate_steps_unchanged() {

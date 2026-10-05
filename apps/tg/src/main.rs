@@ -10,7 +10,8 @@ use tollgate_domain::{BuildsetId, CommandId, QueueItemId, RepositoryId};
 use tollgate_git::{GitRepository, USER_BRANCH, USER_BRANCH_REF};
 use tollgate_ipc::{
     Frame, FrameCodec, FrameKind, Handshake, HandshakeAck, IpcCommand, IpcResponse,
-    MAX_CONTROL_PAYLOAD, MAX_LOG_PAYLOAD, PROTOCOL_VERSION, StructuredError, verify_peer_uid,
+    MAX_CONTROL_PAYLOAD, MAX_LOG_PAYLOAD, PROTOCOL_VERSION, SCHEMA_VERSION, StructuredError,
+    verify_peer_uid,
 };
 use tollgate_service::{
     ActivatingRepository, AppSnapshot, ArtifactPage, DiagnoseResult, ItemWaitStatus, QueueItemView,
@@ -307,10 +308,11 @@ async fn run(cli: Cli) -> anyhow::Result<u8> {
             print_value(response, cli.json, |value| {
                 let repository: RepositorySnapshot = serde_json::from_value(value.clone())?;
                 println!(
-                    "Initialized {}\n  repository  {}\n  release     {}\n  config      {}",
+                    "Initialized {}\n  repository  {}\n  staging     {}\n  release     {}\n  config      {}",
                     repository.state.name,
                     repository.state.id,
-                    repository.state.master_oid.short(),
+                    repository.state.staging_oid.short(),
+                    repository.state.release_oid.short(),
                     &repository.configuration.digest[..12]
                 );
                 if repository.state.execution_state
@@ -1398,7 +1400,7 @@ impl IpcClient {
             client_version: env!("CARGO_PKG_VERSION").into(),
             protocol_min: PROTOCOL_VERSION,
             protocol_max: PROTOCOL_VERSION,
-            schema_version: 1,
+            schema_version: SCHEMA_VERSION,
             max_control_payload: MAX_CONTROL_PAYLOAD as u32,
             max_log_payload: MAX_LOG_PAYLOAD as u32,
             supported_frame_kinds: vec![
@@ -1548,7 +1550,7 @@ async fn push_master(
         ));
     }
     master_git.ensure_clean().await?;
-    let release_oid = git.integration_oid().await?;
+    let staging_oid = git.integration_oid().await?;
     let mut master_oid = git.resolve_oid(USER_BRANCH_REF).await?;
     if master_git.resolve_oid("HEAD").await? != master_oid {
         return Err(anyhow!(
@@ -1557,8 +1559,8 @@ async fn push_master(
     }
 
     let mut rebased_from = None;
-    if !git.is_ancestor(&release_oid, &master_oid).await? {
-        let merge_base = git.merge_base_oid(&release_oid, &master_oid).await?;
+    if !git.is_ancestor(&staging_oid, &master_oid).await? {
+        let merge_base = git.merge_base_oid(&staging_oid, &master_oid).await?;
         let stale_sources = git
             .first_parent_commits_between(&merge_base, &master_oid)
             .await?;
@@ -1596,7 +1598,7 @@ async fn push_master(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
                     "status": "up-to-date",
-                    "release_oid": release_oid,
+                    "staging_oid": staging_oid,
                     "master_oid": master_oid,
                     "rebased_from": rebased_from,
                     "items": [],
@@ -1604,12 +1606,12 @@ async fn push_master(
             );
         } else if let Some(old_master) = rebased_from {
             println!(
-                "Updated local master {} to certified release {}.",
+                "Updated local master {} to certified staging {}.",
                 old_master.short(),
                 master_oid.short()
             );
         } else {
-            println!("Local master has no commits beyond certified release.");
+            println!("Local master has no commits beyond certified staging.");
         }
         return Ok(0);
     }
@@ -1671,7 +1673,7 @@ async fn push_master(
         .parse::<QueueItemId>()?;
     let result = serde_json::json!({
         "status": "scheduled",
-        "release_oid": release_oid,
+        "staging_oid": staging_oid,
         "master_oid": master_oid,
         "rebased_from": rebased_from,
         "items": scheduled,
@@ -1681,14 +1683,14 @@ async fn push_master(
     print_wait_value(result, json, wait, |value| {
         let count = value["items"].as_array().map_or(0, Vec::len);
         println!(
-            "Scheduled {count} master commit{} for certified push\n  release  {}\n  master   {}\n  tail     {}",
+            "Scheduled {count} master commit{} for certified push\n  staging  {}\n  master   {}\n  tail     {}",
             if count == 1 { "" } else { "s" },
-            oid_value(&value["release_oid"]),
+            oid_value(&value["staging_oid"]),
             oid_value(&value["master_oid"]),
             tail_id,
         );
         if value["rebased_from"].is_object() {
-            println!("  rebased  stale local master onto certified release");
+            println!("  rebased  stale local master onto certified staging");
         }
         if wait {
             println!("Waiting for Tollgate to certify, push, and synchronize local master.");
@@ -2203,10 +2205,10 @@ fn print_queue(repository: &RepositorySnapshot, json: bool) -> anyhow::Result<()
         return Ok(());
     }
     println!(
-        "{} · queue revision {} · release {}",
+        "{} · queue revision {} · staging {}",
         repository.state.name,
         repository.state.queue_revision,
-        repository.state.master_oid.short()
+        repository.state.staging_oid.short()
     );
     if repository.queue.is_empty() {
         println!("Gate is clear.");
@@ -2247,10 +2249,11 @@ fn print_status(repository: &RepositorySnapshot, id: Option<QueueItemId>) {
         return;
     }
     println!(
-        "{}\n  execution  {:?}\n  release    {}\n  queue      {} items · revision {}\n  runs       {} active · {} waiting\n  config     {}",
+        "{}\n  execution  {:?}\n  staging    {}\n  release    {}\n  queue      {} items · revision {}\n  runs       {} active · {} waiting\n  config     {}",
         repository.state.name,
         repository.state.execution_state,
-        repository.state.master_oid.short(),
+        repository.state.staging_oid.short(),
+        repository.state.release_oid.short(),
         repository.queue.len(),
         repository.state.queue_revision,
         repository.resources.active_runs,
@@ -2991,8 +2994,12 @@ mod tests {
                 "id": repository_id,
                 "name": "test-repository",
                 "path": "/tmp/test-repository",
-                "integration_ref": "refs/heads/release",
-                "master_oid": oid,
+                "staging_ref": "refs/heads/staging",
+                "staging_oid": oid,
+                "release_ref": "refs/heads/release",
+                "release_oid": oid,
+                "release_lag": { "commits": 0, "since": null },
+                "release_state": "green",
                 "queue_revision": 1,
                 "event_sequence": 1,
                 "engine_epoch": 1,

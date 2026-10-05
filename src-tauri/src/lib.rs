@@ -17,8 +17,9 @@ use tokio_util::codec::Framed;
 use tollgate_domain::{BuildsetId, CleanupPolicy, CommandId, QueueItemId, RepositoryId, SlotId};
 use tollgate_ipc::{
     Frame, FrameCodec, FrameKind, Handshake, HandshakeAck, IpcCommand, IpcResponse,
-    MAX_CONTROL_PAYLOAD, MAX_LOG_PAYLOAD, PROTOCOL_VERSION, ProtocolError, StructuredError,
-    UserSocketListener, acquire_user_authority_lock, bind_user_socket, verify_peer_uid,
+    MAX_CONTROL_PAYLOAD, MAX_LOG_PAYLOAD, PROTOCOL_VERSION, ProtocolError, SCHEMA_VERSION,
+    StructuredError, UserSocketListener, acquire_user_authority_lock, bind_user_socket,
+    verify_peer_uid,
 };
 use tollgate_service::{
     AppSnapshot, ApproveResult, CandidateAuthorizationResult, DoctorReport, EnvironmentView,
@@ -981,7 +982,7 @@ async fn handle_ipc_connection(
     let ack = HandshakeAck {
         app_version: env!("CARGO_PKG_VERSION").into(),
         selected_protocol: PROTOCOL_VERSION,
-        schema_version: 1,
+        schema_version: SCHEMA_VERSION,
         max_control_payload: MAX_CONTROL_PAYLOAD as u32,
         max_log_payload: MAX_LOG_PAYLOAD as u32,
         supported_frame_kinds: vec![
@@ -1779,7 +1780,7 @@ mod startup_ipc_tests {
             client_version: "test".into(),
             protocol_min: PROTOCOL_VERSION,
             protocol_max: PROTOCOL_VERSION,
-            schema_version: 1,
+            schema_version: SCHEMA_VERSION,
             max_control_payload: MAX_CONTROL_PAYLOAD as u32,
             max_log_payload: MAX_LOG_PAYLOAD as u32,
             supported_frame_kinds: vec![
