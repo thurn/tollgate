@@ -17,6 +17,8 @@ pub const PROTOCOL_VERSION: u16 = 1;
 /// `staging_oid` and added `release_ref`, `release_oid`, `release_lag`, and `release_state`.
 /// Version 3 added the `release` queue item kind and repository snapshots' `release_runs`.
 pub const SCHEMA_VERSION: u16 = 3;
+/// Structured error code for a handshake between a `tg` and an app whose `SCHEMA_VERSION`s differ.
+pub const SCHEMA_MISMATCH_CODE: &str = "schema-version-mismatch";
 pub const MAX_CONTROL_PAYLOAD: usize = 8 * 1024 * 1024;
 pub const MAX_LOG_PAYLOAD: usize = 1024 * 1024;
 const HEADER_SIZE: usize = 28;
@@ -211,6 +213,37 @@ pub struct HandshakeAck {
     pub max_control_payload: u32,
     pub max_log_payload: u32,
     pub supported_frame_kinds: Vec<FrameKind>,
+    /// Present when the app refuses the client, as for a client speaking another JSON schema
+    /// version. The app then answers every request on the connection with this error and runs
+    /// none of them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejection: Option<StructuredError>,
+}
+
+/// Rejects a handshake between a `tg` speaking JSON schema `cli_schema` and an app speaking
+/// `app_schema`. Payloads of different schema versions are not interchangeable (fields are
+/// renamed between versions), so a mismatch fails before any command runs, on whichever side
+/// notices it first. The message says which side to upgrade.
+pub fn schema_mismatch(cli_schema: u16, app_schema: u16) -> Option<StructuredError> {
+    if cli_schema == app_schema {
+        return None;
+    }
+    let remedy = if cli_schema < app_schema {
+        "upgrade tg to the version bundled with the running Tollgate app, then retry"
+    } else {
+        "quit and restart the Tollgate app so the upgraded version runs, then retry"
+    };
+    Some(StructuredError {
+        code: SCHEMA_MISMATCH_CODE.into(),
+        message: format!(
+            "tg speaks JSON schema version {cli_schema} but the running Tollgate app speaks version {app_schema}; {remedy}"
+        ),
+        retryable: false,
+        details: Some(serde_json::json!({
+            "cli_schema_version": cli_schema,
+            "app_schema_version": app_schema,
+        })),
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -548,6 +581,40 @@ mod tests {
         assert!(codec.decode(&mut encoded).unwrap().is_none());
         encoded.extend_from_slice(&second);
         assert_eq!(codec.decode(&mut encoded).unwrap().unwrap(), original);
+    }
+
+    #[test]
+    fn schema_mismatch_rejects_any_other_version_and_names_the_side_to_upgrade() {
+        assert_eq!(schema_mismatch(SCHEMA_VERSION, SCHEMA_VERSION), None);
+        let old_cli = schema_mismatch(SCHEMA_VERSION - 1, SCHEMA_VERSION).unwrap();
+        let old_app = schema_mismatch(SCHEMA_VERSION + 1, SCHEMA_VERSION).unwrap();
+        for error in [&old_cli, &old_app] {
+            assert_eq!(error.code, SCHEMA_MISMATCH_CODE);
+            assert!(!error.retryable);
+        }
+        assert_eq!(
+            old_cli.details.as_ref().unwrap()["cli_schema_version"],
+            SCHEMA_VERSION - 1
+        );
+        assert_eq!(
+            old_app.details.as_ref().unwrap()["app_schema_version"],
+            SCHEMA_VERSION
+        );
+        assert_ne!(old_cli.message, old_app.message);
+    }
+
+    #[test]
+    fn a_handshake_ack_without_a_rejection_decodes_as_accepted() {
+        let ack: HandshakeAck = serde_json::from_value(serde_json::json!({
+            "app_version": "0",
+            "selected_protocol": PROTOCOL_VERSION,
+            "schema_version": SCHEMA_VERSION,
+            "max_control_payload": MAX_CONTROL_PAYLOAD,
+            "max_log_payload": MAX_LOG_PAYLOAD,
+            "supported_frame_kinds": [],
+        }))
+        .unwrap();
+        assert_eq!(ack.rejection, None);
     }
 
     #[test]

@@ -26,7 +26,8 @@
       "properties": {
         "app_version": { "type": "string" }, "selected_protocol": { "type": "integer" },
         "schema_version": { "type": "integer" }, "max_control_payload": { "type": "integer", "maximum": 8388608 },
-        "max_log_payload": { "type": "integer", "maximum": 1048576 }, "supported_frame_kinds": { "type": "array", "items": { "type": "string" } }
+        "max_log_payload": { "type": "integer", "maximum": 1048576 }, "supported_frame_kinds": { "type": "array", "items": { "type": "string" } },
+        "rejection": { "type": "object", "required": ["code", "message", "retryable"], "properties": { "code": { "type": "string" }, "message": { "type": "string" }, "retryable": { "type": "boolean" }, "details": {} } }
       }
     },
     "request": {

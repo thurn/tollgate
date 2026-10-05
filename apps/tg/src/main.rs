@@ -11,7 +11,7 @@ use tollgate_git::{GitRepository, USER_BRANCH, USER_BRANCH_REF};
 use tollgate_ipc::{
     Frame, FrameCodec, FrameKind, Handshake, HandshakeAck, IpcCommand, IpcResponse,
     MAX_CONTROL_PAYLOAD, MAX_LOG_PAYLOAD, PROTOCOL_VERSION, SCHEMA_VERSION, StructuredError,
-    verify_peer_uid,
+    schema_mismatch, verify_peer_uid,
 };
 use tollgate_service::{
     ActivatingRepository, AppSnapshot, ArtifactPage, DiagnoseResult, ItemWaitStatus, QueueItemView,
@@ -1399,41 +1399,7 @@ impl IpcClient {
             }
         };
         verify_peer_uid(&stream).context("Tollgate app peer identity check failed")?;
-        let mut framed = Framed::new(stream, FrameCodec);
-        let correlation = Uuid::now_v7();
-        let handshake = Handshake {
-            client_instance_id,
-            client_version: env!("CARGO_PKG_VERSION").into(),
-            protocol_min: PROTOCOL_VERSION,
-            protocol_max: PROTOCOL_VERSION,
-            schema_version: SCHEMA_VERSION,
-            max_control_payload: MAX_CONTROL_PAYLOAD as u32,
-            max_log_payload: MAX_LOG_PAYLOAD as u32,
-            supported_frame_kinds: vec![
-                FrameKind::Handshake,
-                FrameKind::HandshakeAck,
-                FrameKind::Request,
-                FrameKind::Response,
-                FrameKind::Event,
-                FrameKind::Log,
-                FrameKind::Gap,
-            ],
-        };
-        framed
-            .send(Frame::control(
-                FrameKind::Handshake,
-                correlation,
-                &handshake,
-            )?)
-            .await?;
-        let ack = framed
-            .next()
-            .await
-            .ok_or_else(|| anyhow!("app closed during handshake"))??;
-        if ack.kind != FrameKind::HandshakeAck || ack.correlation_id != correlation {
-            return Err(anyhow!("invalid app handshake response"));
-        }
-        let _: HandshakeAck = ack.decode_json()?;
+        let framed = handshake(stream, client_instance_id).await?;
         Ok(Self {
             framed,
             no_launch,
@@ -1518,6 +1484,63 @@ impl IpcClient {
             self.request(IpcCommand::Snapshot).await?,
         )?)
     }
+}
+
+/// Opens an IPC session on `stream`. The app must accept this client and speak its JSON schema
+/// version; otherwise this fails before any command is sent.
+async fn handshake(
+    stream: UnixStream,
+    client_instance_id: tollgate_domain::ClientInstanceId,
+) -> anyhow::Result<Framed<UnixStream, FrameCodec>> {
+    let mut framed = Framed::new(stream, FrameCodec);
+    let correlation = Uuid::now_v7();
+    let handshake = Handshake {
+        client_instance_id,
+        client_version: env!("CARGO_PKG_VERSION").into(),
+        protocol_min: PROTOCOL_VERSION,
+        protocol_max: PROTOCOL_VERSION,
+        schema_version: SCHEMA_VERSION,
+        max_control_payload: MAX_CONTROL_PAYLOAD as u32,
+        max_log_payload: MAX_LOG_PAYLOAD as u32,
+        supported_frame_kinds: vec![
+            FrameKind::Handshake,
+            FrameKind::HandshakeAck,
+            FrameKind::Request,
+            FrameKind::Response,
+            FrameKind::Event,
+            FrameKind::Log,
+            FrameKind::Gap,
+        ],
+    };
+    framed
+        .send(Frame::control(
+            FrameKind::Handshake,
+            correlation,
+            &handshake,
+        )?)
+        .await?;
+    let ack = framed
+        .next()
+        .await
+        .ok_or_else(|| anyhow!("app closed during handshake"))??;
+    if ack.kind != FrameKind::HandshakeAck || ack.correlation_id != correlation {
+        return Err(anyhow!("invalid app handshake response"));
+    }
+    accept_handshake_ack(&ack.decode_json()?)?;
+    Ok(framed)
+}
+
+/// Refuses an app that rejected this client or speaks another JSON schema version. An app from
+/// before schema negotiation never rejects, so the version comparison also runs here.
+fn accept_handshake_ack(ack: &HandshakeAck) -> anyhow::Result<()> {
+    if let Some(rejection) = ack
+        .rejection
+        .clone()
+        .or_else(|| schema_mismatch(SCHEMA_VERSION, ack.schema_version))
+    {
+        return Err(anyhow!(IpcRequestError(rejection)));
+    }
+    Ok(())
 }
 
 async fn push_master(
@@ -2833,6 +2856,83 @@ mod tests {
             },
         };
         (snapshot, activation)
+    }
+
+    /// Handshakes with a fake app that acknowledges speaking `app_schema`, as an app from
+    /// before schema negotiation would: without a rejection. Returns the handshake result and
+    /// whether the client sent any frame after it.
+    async fn handshake_with_app_speaking(app_schema: u16) -> (anyhow::Result<()>, bool) {
+        let (client, app) = UnixStream::pair().unwrap();
+        let app = tokio::spawn(async move {
+            let mut framed = Framed::new(app, FrameCodec);
+            let first = framed.next().await.unwrap().unwrap();
+            let handshake: Handshake = first.decode_json().unwrap();
+            assert_eq!(handshake.schema_version, SCHEMA_VERSION);
+            let ack = serde_json::json!({
+                "app_version": "fake",
+                "selected_protocol": PROTOCOL_VERSION,
+                "schema_version": app_schema,
+                "max_control_payload": MAX_CONTROL_PAYLOAD,
+                "max_log_payload": MAX_LOG_PAYLOAD,
+                "supported_frame_kinds": ["Handshake", "HandshakeAck", "Request", "Response"],
+            });
+            framed
+                .send(Frame::control(FrameKind::HandshakeAck, first.correlation_id, &ack).unwrap())
+                .await
+                .unwrap();
+            framed.next().await.is_some()
+        });
+        let result = match handshake(client, tollgate_domain::ClientInstanceId::new()).await {
+            Ok(mut framed) => {
+                framed
+                    .send(
+                        Frame::control(FrameKind::Request, Uuid::now_v7(), &IpcCommand::Snapshot)
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                Ok(())
+            }
+            Err(error) => Err(error),
+        };
+        (result, app.await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn the_client_refuses_an_app_of_another_schema_version_before_any_request() {
+        let (accepted, sent_request) = handshake_with_app_speaking(SCHEMA_VERSION).await;
+        accepted.unwrap();
+        assert!(sent_request);
+        for app_schema in [SCHEMA_VERSION - 1, SCHEMA_VERSION + 1] {
+            let (refused, sent_request) = handshake_with_app_speaking(app_schema).await;
+            let error = refused.unwrap_err();
+            let structured = error.downcast_ref::<IpcRequestError>().unwrap();
+            assert_eq!(structured.0.code, tollgate_ipc::SCHEMA_MISMATCH_CODE);
+            assert_eq!(
+                structured.0.details.as_ref().unwrap()["app_schema_version"],
+                app_schema
+            );
+            assert!(!sent_request);
+        }
+    }
+
+    #[test]
+    fn an_app_rejection_is_reported_as_its_structured_error() {
+        let rejection = tollgate_ipc::schema_mismatch(SCHEMA_VERSION + 1, SCHEMA_VERSION).unwrap();
+        let ack = HandshakeAck {
+            app_version: "fake".into(),
+            selected_protocol: PROTOCOL_VERSION,
+            schema_version: SCHEMA_VERSION,
+            max_control_payload: MAX_CONTROL_PAYLOAD as u32,
+            max_log_payload: MAX_LOG_PAYLOAD as u32,
+            supported_frame_kinds: Vec::new(),
+            rejection: Some(rejection.clone()),
+        };
+        let error = accept_handshake_ack(&ack).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<IpcRequestError>().unwrap().0,
+            rejection
+        );
     }
 
     #[test]

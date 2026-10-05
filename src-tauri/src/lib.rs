@@ -19,7 +19,7 @@ use tollgate_ipc::{
     Frame, FrameCodec, FrameKind, Handshake, HandshakeAck, IpcCommand, IpcResponse,
     MAX_CONTROL_PAYLOAD, MAX_LOG_PAYLOAD, PROTOCOL_VERSION, ProtocolError, SCHEMA_VERSION,
     StructuredError, UserSocketListener, acquire_user_authority_lock, bind_user_socket,
-    verify_peer_uid,
+    schema_mismatch, verify_peer_uid,
 };
 use tollgate_service::{
     AppSnapshot, ApproveResult, CandidateAuthorizationResult, DoctorReport, EnvironmentView,
@@ -1087,6 +1087,10 @@ async fn handle_ipc_connection(
     if handshake.protocol_min > PROTOCOL_VERSION || handshake.protocol_max < PROTOCOL_VERSION {
         return Err("no mutually supported protocol version".into());
     }
+    // A client of another JSON schema version could misread or misencode renamed fields, so it
+    // runs nothing. Its requests still get the structured rejection as their response, which a
+    // client too old to read the acknowledgement's rejection reports like any command error.
+    let rejection = schema_mismatch(handshake.schema_version, SCHEMA_VERSION);
     let ack = HandshakeAck {
         app_version: env!("CARGO_PKG_VERSION").into(),
         selected_protocol: PROTOCOL_VERSION,
@@ -1104,6 +1108,7 @@ async fn handle_ipc_connection(
             FrameKind::Ping,
             FrameKind::Pong,
         ],
+        rejection: rejection.clone(),
     };
     framed
         .send(
@@ -1127,10 +1132,18 @@ async fn handle_ipc_connection(
         if frame.kind != FrameKind::Request {
             return Err("unexpected non-request frame".into());
         }
-        let command = frame
-            .decode_json::<IpcCommand>()
-            .map_err(|error| error.to_string())?;
-        let response = execute_ipc_command(&service, command).await;
+        let response = if let Some(rejection) = &rejection {
+            IpcResponse {
+                ok: false,
+                result: None,
+                error: Some(rejection.clone()),
+            }
+        } else {
+            let command = frame
+                .decode_json::<IpcCommand>()
+                .map_err(|error| error.to_string())?;
+            execute_ipc_command(&service, command).await
+        };
         let response = ipc_response_frame(frame.correlation_id, &response)
             .map_err(|error| error.to_string())?;
         framed
@@ -1868,6 +1881,16 @@ mod startup_ipc_tests {
     }
 
     async fn connect(path: &Path) -> Framed<tokio::net::UnixStream, FrameCodec> {
+        let (framed, ack) = connect_speaking(path, SCHEMA_VERSION).await;
+        assert_eq!(ack.rejection, None);
+        framed
+    }
+
+    /// Connects as a client speaking JSON schema `schema_version`.
+    async fn connect_speaking(
+        path: &Path,
+        schema_version: u16,
+    ) -> (Framed<tokio::net::UnixStream, FrameCodec>, HandshakeAck) {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
         let stream = loop {
             match tokio::net::UnixStream::connect(path).await {
@@ -1888,7 +1911,7 @@ mod startup_ipc_tests {
             client_version: "test".into(),
             protocol_min: PROTOCOL_VERSION,
             protocol_max: PROTOCOL_VERSION,
-            schema_version: SCHEMA_VERSION,
+            schema_version,
             max_control_payload: MAX_CONTROL_PAYLOAD as u32,
             max_log_payload: MAX_LOG_PAYLOAD as u32,
             supported_frame_kinds: vec![
@@ -1904,7 +1927,8 @@ mod startup_ipc_tests {
             .unwrap();
         let ack = framed.next().await.unwrap().unwrap();
         assert_eq!(ack.kind, FrameKind::HandshakeAck);
-        framed
+        let ack = ack.decode_json().unwrap();
+        (framed, ack)
     }
 
     async fn request(
@@ -2085,6 +2109,52 @@ mod startup_ipc_tests {
         let snapshot = snapshot(&mut client).await;
         assert!(snapshot.activating_repositories.is_empty());
         assert_eq!(snapshot.repositories.len(), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_client_of_another_schema_version_runs_no_command() {
+        let temporary = tempfile::tempdir().unwrap();
+        let support = temporary.path().join("support");
+        let repository = committed_repository(temporary.path(), "repository");
+        let socket = support.join("tollgate.sock");
+        let (_service, server) = start_serving(&socket, || TollgateService::start(support.clone()))
+            .await
+            .unwrap();
+
+        for schema_version in [SCHEMA_VERSION - 1, SCHEMA_VERSION + 1] {
+            let (mut client, ack) = connect_speaking(&socket, schema_version).await;
+            assert_eq!(ack.schema_version, SCHEMA_VERSION);
+            let rejection = ack.rejection.unwrap();
+            assert_eq!(rejection.code, tollgate_ipc::SCHEMA_MISMATCH_CODE);
+            // A client that ignores the rejection still gets it for each request instead of a
+            // result.
+            let response = request(
+                &mut client,
+                IpcCommand::Initialize {
+                    path: repository.to_string_lossy().into_owned(),
+                    run: Some("true".into()),
+                    bootstrap: false,
+                    detach_master: false,
+                },
+            )
+            .await;
+            assert!(!response.ok);
+            assert_eq!(response.result, None);
+            assert_eq!(response.error, Some(rejection));
+        }
+
+        let mut client = connect(&socket).await;
+        assert!(snapshot(&mut client).await.repositories.is_empty());
+        assert!(
+            std::process::Command::new("git")
+                .current_dir(&repository)
+                .args(["rev-parse", "--verify", "--quiet", "refs/heads/staging"])
+                .output()
+                .unwrap()
+                .stdout
+                .is_empty()
+        );
         server.abort();
     }
 }

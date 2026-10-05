@@ -209,7 +209,7 @@ The app exposes one `SOCK_STREAM` Unix-domain socket in the per-user application
 
 The v1 wire protocol uses a fixed magic, protocol version, frame kind, flags, correlation ID, and unsigned 32-bit big-endian payload length. Control JSON frames are limited to 8 MiB; binary log frames are limited to 1 MiB; zero length is permitted only for defined control kinds. A length over the negotiated maximum, unknown mandatory frame kind, malformed UTF-8/JSON, duplicate live correlation ID, or payload/declared-length mismatch closes the connection and emits no command. State-changing requests carry client-instance and command UUIDs and receive exactly one stored idempotent response.
 
-Request/response frames coexist with resumable event streams. A subscription supplies repository event sequence and per-log-stream offsets. The server returns contiguous durable frames after those positions or an explicit `gap/pruned` response with the earliest available offset; it never silently jumps. High-volume log frames contain repository ID, run/attempt ID, stream, per-stream byte offset, broker observation sequence, and payload. Every handshake identifies CLI version, protocol range, app version, JSON schema version (currently 3), maximum frame sizes, and supported frame kinds. The highest mutually supported protocol version is selected; no overlap fails before commands with a structured upgrade instruction.
+Request/response frames coexist with resumable event streams. A subscription supplies repository event sequence and per-log-stream offsets. The server returns contiguous durable frames after those positions or an explicit `gap/pruned` response with the earliest available offset; it never silently jumps. High-volume log frames contain repository ID, run/attempt ID, stream, per-stream byte offset, broker observation sequence, and payload. Every handshake identifies CLI version, protocol range, app version, JSON schema version (currently 3), maximum frame sizes, and supported frame kinds. The highest mutually supported protocol version is selected; no overlap fails before commands with a structured upgrade instruction. The JSON schema version must match exactly, because payloads of different schema versions rename fields. The app answers a client of another schema version with a handshake acknowledgement carrying a structured `schema-version-mismatch` rejection and then answers every request on that connection with the same error, running none of them, so even a client too old to read the rejection reports it as a command error. `tg` compares the acknowledged schema version itself as well, so it refuses an app from before this negotiation. The rejection says which side to upgrade: an older `tg` is upgraded to the version bundled with the app, and an older running app is quit and restarted.
 
 The Tauri frontend calls the same `tollgate-service` handlers in-process. Tauri commands are used for bounded request/response operations; Tauri channels carry ordered logs and state changes. Generated TypeScript types and a checked-in protocol schema prevent Rust/UI drift.
 
@@ -558,9 +558,11 @@ All authoritative internal ref changes use the frozen hooks-disabled Git profile
 
 Recovery inspects every incomplete intent:
 
-- If `staging == tested_new`, re-verify the certificate and finalize the database event idempotently.
-- If `staging == expected_old`, no ref change occurred. Retry only if every precondition is still valid; otherwise cancel the intent and regenerate.
-- If `staging` is any other OID, do not guess. Enter external-movement reconciliation.
+- If `staging == tested_new`, `release` must equal the value that promotion's transaction gives it: `tested_new` for the opt-out two-ref transaction, or its persisted pre-promotion OID for a staging-only promotion (section 12.7), as decided by the configuration the promotion activates. Then re-verify the certificate and finalize the database event idempotently.
+- If `staging == expected_old` and `release` still equals its persisted OID, no ref change occurred. Retry only if every precondition is still valid; otherwise cancel the intent and regenerate.
+- Any other combination, including either ref matching while the other does not, is external movement: the transaction moves both refs or neither. Do not guess; block with `ambiguous-promotion-recovery` and leave the intent needing attention for reconciliation.
+
+The persisted projection is always the pre-promotion one during this recovery, because a promotion persists its new projection in the transaction that completes its intent.
 
 The implementation must fault-inject a crash before and after every durable boundary and Git operation.
 
@@ -607,13 +609,15 @@ Patch equivalence or patch IDs never prove that an item was externally integrate
 3. If local is equal or ahead, report no inbound update and show unpushed certified commits.
 4. If the refs diverge, create no merge/rebase; block for `tg reconcile`.
 
+Before deciding among these, and holding the repository mutation lock, `tg pull` reads both local `staging` and `release` and requires each to equal its persisted OID. A ref that moved blocks the repository with `external-staging-movement` or `external-release-movement` and fails the pull, which then reports no outcome, not even "up to date". An adoption clears every external-movement block, because both refs were just verified at their persisted OIDs.
+
 When automatic pushing is enabled, remote `master` is authoritative: periodic fetch and the mandatory pre-promotion fetch adopt an inbound fast-forward immediately, invalidating runs that can no longer promote/push as tested. Fetch errors are visible but do not stop tests. With pushing disabled, automatic fetch only notifies; the user chooses when `tg pull` adopts the remote.
 
 When automatic user-master synchronization is disabled or needs attention, ordinary `git pull --ff-only` remains the fallback in the primary `master` worktree. It updates the user-owned branch and its files, never Tollgate-owned `staging` or `release`.
 
 ### 10.7 `tg push` and reconciliation
 
-`tg push` pushes only a contiguous chain of exact Tollgate-promoted local `release` commits to the configured remote branch. It is not a feature-branch push wrapper. It refuses when local `release` contains an uncertified external commit, when the remote lease is unknown/stale, or when history diverges.
+`tg push` pushes only a contiguous chain of exact Tollgate-promoted local `release` commits to the configured remote branch. It is not a feature-branch push wrapper. It refuses when local `release` contains an uncertified external commit, when the remote lease is unknown/stale, or when history diverges. Before comparing the remote with `release`, and holding the repository mutation lock, it requires local `staging` and `release` to equal their persisted OIDs, exactly as `tg pull` does: a moved ref blocks with its external-movement code and fails the push without pushing or reporting the remote up to date.
 
 `tg reconcile` is an explicit guided operation for rewritten/deleted/diverged refs. It presents local staging and release, last certified release, remote master, active queue base, and pending intents. Accepting a new base never blesses it as Tollgate-validated; it records external adoption, invalidates all active validation generations, and rebuilds. Any Git history repair itself remains an explicit user-directed Git action unless a previewed fast-forward/CAS is sufficient.
 
@@ -1177,7 +1181,9 @@ Intent reconciliation uses this evidence matrix:
 | Approval | retention ref equals recorded source OID and all recorded source/dependency inputs still verify | ref is absent | block; delete only with the recorded old-OID assertion after explicit intent cancellation |
 | Tested-object retention | tested ref equals recorded tested OID and object parent/tree/content verify | tested ref is absent | block |
 | Result completion | matching live worker terminal frame was received without lifetime-channel loss, logs are complete/durable, process group is reaped, and final checkout verification is recorded | any missing supervision evidence means the buildset is interrupted, never successful | block on contradictory durable evidence |
-| Promotion | authoritative `staging` equals recorded tested-new OID and certificate still verifies | `staging` equals expected-old and all other owned refs show no committed change | external-movement block |
+| Promotion | authoritative `staging` equals recorded tested-new OID, `release` equals tested-new for an opt-out promotion or still equals its persisted OID for a staging-only promotion (decided by the configuration the promotion activates), and certificate still verifies | `staging` equals expected-old and `release` equals its persisted OID | `ambiguous-promotion-recovery` block |
+| Pull | `staging` and `release` both equal the frozen remote OID, a descendant of the recorded expected-old | `staging` equals expected-old (a `release` that moved anyway is reported by the startup external-movement check) | `ambiguous-pull-recovery` block |
+| Reconciliation | `staging` and `release` both equal the recorded adopted OID; only then are the external-movement blocks cleared | — | `needs-attention`; startup's external-movement blocks stay for another explicit reconcile |
 | Push | direct remote observation equals recorded tested OID | remote still equals exact expected-old/nonexistence and local promoted chain still verifies | `push-blocked`/divergence |
 | Cleanup | each worktree path, registration, branch ref, and old OID independently matches the completed sub-operation evidence | unchanged owned worktree/ref still matches the pre-cleanup snapshot | `needs-attention`; never recreate or delete by guess |
 | Artifact publication | final path has exclusive ownership marker and manifest/hash/size match | final path absent and only owned staging exists | quarantine conflicting/partial paths |

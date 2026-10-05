@@ -1518,6 +1518,63 @@ fn push_external_movement_reason(
     state.block_reasons.push(reason);
 }
 
+/// The observed OIDs of both Tollgate-owned refs.
+#[derive(Clone, Debug, Serialize)]
+struct ObservedTollgateRefs {
+    staging: GitOid,
+    release: GitOid,
+}
+
+impl ObservedTollgateRefs {
+    async fn read(git: &GitRepository) -> Result<Self, GitError> {
+        Ok(Self {
+            staging: git.integration_oid().await?,
+            release: git.release_oid().await?,
+        })
+    }
+}
+
+/// Requires both Tollgate refs to still hold their persisted OIDs. Callers hold the repository
+/// mutation lock, so Tollgate itself moves neither ref meanwhile. Each ref that moved blocks the
+/// repository with its external-movement code, persisted before the returned error.
+fn block_externally_moved_refs(
+    runtime: &RepositoryRuntime,
+    observed: &ObservedTollgateRefs,
+    when: &str,
+) -> Result<(), ServiceError> {
+    let state = {
+        let mut data = runtime.data.lock();
+        let moved_staging = observed.staging != data.state.staging_oid;
+        let moved_release = observed.release != data.state.release_oid;
+        if !moved_staging && !moved_release {
+            return Ok(());
+        }
+        if moved_staging {
+            push_external_movement_reason(
+                &mut data.state,
+                INTEGRATION_BRANCH,
+                &observed.staging,
+                when,
+            );
+        }
+        if moved_release {
+            push_external_movement_reason(&mut data.state, RELEASE_BRANCH, &observed.release, when);
+        }
+        data.state.clone()
+    };
+    runtime.store.update_repository_state(&state)?;
+    let moved = state
+        .block_reasons
+        .iter()
+        .filter(|reason| EXTERNAL_MOVEMENT_CODES.contains(&reason.code.as_str()))
+        .map(|reason| reason.message.as_str())
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(ServiceError::Invariant(format!(
+        "{moved}; the repository is blocked until `tg reconcile`"
+    )))
+}
+
 /// Staged-release migration of a repository registered while `release` was its only Tollgate
 /// ref. Startup reconciliation runs it under the repository ownership lock, before recovery:
 ///
@@ -2770,11 +2827,19 @@ impl TollgateService {
             serde_json::from_value(evidence.get("observed_master").cloned().ok_or_else(|| {
                 ServiceError::Invariant("reconcile omitted observed master".into())
             })?)?;
-        if runtime.git.integration_oid().await? != observed {
+        // Reconciliation aligned both refs at `observed` before preparing its intent. Completing it
+        // clears every external-movement block, so both refs must still be there; otherwise the
+        // blocks startup recorded stay for another explicit reconcile.
+        let current = ObservedTollgateRefs::read(&runtime.git).await?;
+        if current.staging != observed || current.release != observed {
             runtime.store.set_intent_state(
                 command_id,
                 IntentState::NeedsAttention,
-                &serde_json::json!({"recovery": "reconcile-master-changed-again"}),
+                &serde_json::json!({
+                    "recovery": "reconcile-refs-changed-again",
+                    "observed_staging": current.staging,
+                    "observed_release": current.release,
+                }),
             )?;
             return Ok(());
         }
@@ -4821,7 +4886,12 @@ impl TollgateService {
                         ServiceError::Invariant("pull intent omitted expected local release".into())
                     })?,
                 )?;
+                // The pull's two-ref transaction moved `staging` and `release` together from
+                // `expected_local`, which both held, or moved neither.
+                let observed_release = runtime.git.release_oid().await?;
                 if observed_local == expected_local {
+                    // No effect. A `release` that moved anyway differs from its persisted OID,
+                    // which the startup external-movement check blocks on.
                     runtime.store.set_intent_state(
                         command_id,
                         IntentState::Canceled,
@@ -4831,6 +4901,7 @@ impl TollgateService {
                 }
                 let adopted_target = frozen_remote.as_ref().or(observed_remote.as_ref());
                 if adopted_target == Some(&observed_local)
+                    && observed_release == observed_local
                     && runtime
                         .git
                         .is_ancestor(&expected_local, &observed_local)
@@ -5106,8 +5177,11 @@ impl TollgateService {
                         )
                     })?
             };
-            let observed_master = runtime.git.integration_oid().await?;
-            if observed_master == certificate.expected_parent_oid {
+            let observed = ObservedTollgateRefs::read(&runtime.git).await?;
+            let persisted_release = runtime.data.lock().state.release_oid.clone();
+            if observed.staging == certificate.expected_parent_oid
+                && observed.release == persisted_release
+            {
                 item.state = item
                     .state
                     .transition(ItemEvent::PromotionDeferred)
@@ -5120,16 +5194,24 @@ impl TollgateService {
                 data.state.execution_state = RepositoryExecutionState::Blocked;
                 data.state.block_reasons.push(BlockReason {
                     code: "orphan-promotion-state".into(),
-                    message: "A promoting item has no durable promotion intent and release has moved.".into(),
-                    recovery_action: "Inspect release and the item certificate, then reconcile the external movement.".into(),
+                    message: "A promoting item has no durable promotion intent and staging or release has moved.".into(),
+                    recovery_action: "Inspect staging, release, and the item certificate, then reconcile the external movement.".into(),
                 });
                 data.state.clone()
             };
             runtime.store.update_repository_state(&state)?;
             return Ok(());
         };
-        let observed_master = runtime.git.integration_oid().await?;
+        // The persisted projection is the one from before the promotion: a completed promotion
+        // persists in the same transaction that completes its intent. So `release` started at
+        // the persisted OID, and the two-ref transaction moved both refs or neither.
+        let observed = ObservedTollgateRefs::read(&runtime.git).await?;
+        let persisted_release = runtime.data.lock().state.release_oid.clone();
+        let observed_master = observed.staging.clone();
         if observed_master == certificate.expected_parent_oid {
+            if observed.release != persisted_release {
+                return self.block_for_ambiguous_promotion(runtime, &observed, command_id);
+            }
             runtime.store.set_intent_state(
                 command_id,
                 IntentState::Canceled,
@@ -5159,7 +5241,7 @@ impl TollgateService {
             if observed_tree != certificate.tree_oid
                 || observed_parent != certificate.expected_parent_oid
             {
-                return self.block_for_ambiguous_promotion(runtime, &observed_master, command_id);
+                return self.block_for_ambiguous_promotion(runtime, &observed, command_id);
             }
             let mut item = {
                 let data = runtime.data.lock();
@@ -5172,7 +5254,7 @@ impl TollgateService {
             if item.state != QueueItemState::Promoting
                 || item.certificate_id != Some(certificate.id)
             {
-                return self.block_for_ambiguous_promotion(runtime, &observed_master, command_id);
+                return self.block_for_ambiguous_promotion(runtime, &observed, command_id);
             }
             let (generation, active_config) = {
                 let data = runtime.data.lock();
@@ -5188,6 +5270,16 @@ impl TollgateService {
             };
             let config = self.configuration_for_generation(runtime, &generation)?;
             let release_stage = config.has_release_stage();
+            // A staging-only promotion leaves `release` where it was; the opt-out transaction
+            // moves it to the promoted OID with `staging`.
+            let expected_release = if release_stage {
+                &persisted_release
+            } else {
+                &certificate.tested_oid
+            };
+            if &observed.release != expected_release {
+                return self.block_for_ambiguous_promotion(runtime, &observed, command_id);
+            }
             let remote_enabled = config.remote.enabled && !release_stage;
             if promotion_syncs_user_master_now(&config) {
                 self.sync_user_master_after_promotion(
@@ -5261,7 +5353,7 @@ impl TollgateService {
             self.rebuild_active_head_after_promotion(runtime).await?;
             return Ok(());
         }
-        self.block_for_ambiguous_promotion(runtime, &observed_master, command_id)
+        self.block_for_ambiguous_promotion(runtime, &observed, command_id)
     }
 
     async fn rebuild_active_head_after_promotion(
@@ -5297,21 +5389,25 @@ impl TollgateService {
     fn block_for_ambiguous_promotion(
         &self,
         runtime: &Arc<RepositoryRuntime>,
-        observed_master: &GitOid,
+        observed: &ObservedTollgateRefs,
         command_id: CommandId,
     ) -> Result<(), ServiceError> {
         runtime.store.set_intent_state(
             command_id,
             IntentState::NeedsAttention,
-            &serde_json::json!({"master": observed_master, "recovery": "ambiguous"}),
+            &serde_json::json!({
+                "master": observed.staging,
+                "release": observed.release,
+                "recovery": "ambiguous",
+            }),
         )?;
         let state = {
             let mut data = runtime.data.lock();
             data.state.execution_state = RepositoryExecutionState::Blocked;
             data.state.block_reasons.push(BlockReason {
                 code: "ambiguous-promotion-recovery".into(),
-                message: "release matches neither side of an unfinished promotion intent.".into(),
-                recovery_action: "Inspect the recorded certificate and reconcile the external release movement before resuming.".into(),
+                message: "staging and release match neither side of an unfinished promotion intent.".into(),
+                recovery_action: "Inspect the recorded certificate and reconcile the external staging or release movement before resuming.".into(),
             });
             data.state.clone()
         };
@@ -8044,8 +8140,8 @@ impl TollgateService {
             )?;
             return Err(error);
         }
-        let observed_local = match runtime.git.integration_oid().await {
-            Ok(oid) => oid,
+        let observed = match ObservedTollgateRefs::read(&runtime.git).await {
+            Ok(observed) => observed,
             Err(error) => {
                 runtime.store.set_intent_state(
                     command_id,
@@ -8055,16 +8151,15 @@ impl TollgateService {
                 return Err(error.into());
             }
         };
-        if observed_local != state.staging_oid {
+        if let Err(error) = block_externally_moved_refs(&runtime, &observed, "during `tg pull`") {
             runtime.store.set_intent_state(
                 command_id,
                 IntentState::NeedsAttention,
-                &serde_json::json!({"observed_local": observed_local}),
+                &serde_json::json!({"observed_local": observed.staging, "observed_release": observed.release}),
             )?;
-            return Err(ServiceError::Invariant(
-                "release moved while pull held the repository mutation boundary".into(),
-            ));
+            return Err(error);
         }
+        let observed_local = observed.staging;
 
         let mut next_state = state.clone();
         let mut affected = Vec::new();
@@ -8106,14 +8201,11 @@ impl TollgateService {
                     }
                     next_state.set_staging_and_release(remote_oid.clone());
                     next_state.queue_revision += 1;
+                    // Both refs were verified at their persisted OIDs above, so no external
+                    // movement block still describes them.
                     next_state.block_reasons.retain(|reason| {
-                        !matches!(
-                            reason.code.as_str(),
-                            "remote-diverged"
-                                | "external-master-movement"
-                                | "external-release-movement"
-                                | "remote-missing"
-                        )
+                        !EXTERNAL_MOVEMENT_CODES.contains(&reason.code.as_str())
+                            && !matches!(reason.code.as_str(), "remote-diverged" | "remote-missing")
                     });
                     next_state.execution_state = if next_state.block_reasons.is_empty() {
                         RepositoryExecutionState::Active
@@ -8334,6 +8426,30 @@ impl TollgateService {
                 command_id,
                 IntentState::Canceled,
                 &serde_json::json!({"stage": "push-pre-transition", "error": error.to_string()}),
+            )?;
+            return Err(error);
+        }
+        // The push publishes the persisted `release`; it must still be the real one.
+        let observed = match ObservedTollgateRefs::read(&runtime.git).await {
+            Ok(observed) => observed,
+            Err(error) => {
+                runtime.store.set_intent_state(
+                    command_id,
+                    IntentState::Canceled,
+                    &serde_json::json!({"stage": "push-local-observation", "error": error.to_string()}),
+                )?;
+                return Err(error.into());
+            }
+        };
+        if let Err(error) = block_externally_moved_refs(&runtime, &observed, "during `tg push`") {
+            runtime.store.set_intent_state(
+                command_id,
+                IntentState::Canceled,
+                &serde_json::json!({
+                    "stage": "push-local-observation",
+                    "observed_staging": observed.staging,
+                    "observed_release": observed.release,
+                }),
             )?;
             return Err(error);
         }
@@ -20996,129 +21112,205 @@ run = "test -f feature.txt"
 
     #[tokio::test]
     async fn restart_completes_a_promotion_only_when_release_matches_the_intent() {
-        let temporary = tempfile::tempdir().unwrap();
-        let repository = temporary.path().join("repository");
-        let feature = temporary.path().join("feature");
-        std::fs::create_dir(&repository).unwrap();
-        git(&repository, &["init", "-b", "master"]);
-        std::fs::write(repository.join("base"), "base").unwrap();
-        git(&repository, &["add", "base"]);
-        git(&repository, &["commit", "-m", "base"]);
-        git(
-            &repository,
-            &[
-                "worktree",
-                "add",
-                "-b",
-                "feature",
-                feature.to_str().unwrap(),
-                "master",
-            ],
-        );
-        std::fs::write(feature.join("change"), "change").unwrap();
-        git(&feature, &["add", "change"]);
-        git(&feature, &["commit", "-m", "change"]);
-        git(&repository, &["switch", "--detach", "master"]);
+        // Which refs the interrupted opt-out promotion left at its tested OID, and whether it
+        // recorded its intent. The two-ref transaction moves both or neither, so a single moved
+        // ref is external movement; so is any movement under a promoting item without an intent.
+        for (moved_staging, moved_release, recorded_intent) in [
+            (true, true, true),
+            (true, false, true),
+            (false, true, true),
+            (false, true, false),
+        ] {
+            let temporary = tempfile::tempdir().unwrap();
+            let repository = temporary.path().join("repository");
+            let feature = temporary.path().join("feature");
+            std::fs::create_dir(&repository).unwrap();
+            git(&repository, &["init", "-b", "master"]);
+            std::fs::write(repository.join("base"), "base").unwrap();
+            git(&repository, &["add", "base"]);
+            git(&repository, &["commit", "-m", "base"]);
+            git(
+                &repository,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    "feature",
+                    feature.to_str().unwrap(),
+                    "master",
+                ],
+            );
+            std::fs::write(feature.join("change"), "change").unwrap();
+            git(&feature, &["add", "change"]);
+            git(&feature, &["commit", "-m", "change"]);
+            git(&repository, &["switch", "--detach", "master"]);
 
-        let support = temporary.path().join("support");
-        let service = TollgateService::open(support.clone()).await.unwrap();
-        let initialized = service
-            .initialize_repository(&repository, Some("sleep 0.2; test -f change".into()))
-            .await
-            .unwrap();
-        let approved = service
-            .approve(initialized.state.id, "feature".into(), CommandId::new())
-            .await
-            .unwrap();
-        let running_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            let item = service
-                .item_status(initialized.state.id, approved.item_id)
+            let support = temporary.path().join("support");
+            let service = TollgateService::open(support.clone()).await.unwrap();
+            let initialized = service
+                .initialize_repository(&repository, Some("sleep 0.2; test -f change".into()))
                 .await
                 .unwrap();
-            if item.state == QueueItemState::Running {
-                break;
-            }
-            assert!(tokio::time::Instant::now() < running_deadline);
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        service
-            .set_paused(initialized.state.id, true)
-            .await
-            .unwrap();
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            let item = service
-                .item_status(initialized.state.id, approved.item_id)
+            let approved = service
+                .approve(initialized.state.id, "feature".into(), CommandId::new())
                 .await
                 .unwrap();
-            if item.state == QueueItemState::Ready {
-                break;
+            let running_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let item = service
+                    .item_status(initialized.state.id, approved.item_id)
+                    .await
+                    .unwrap();
+                if item.state == QueueItemState::Running {
+                    break;
+                }
+                assert!(tokio::time::Instant::now() < running_deadline);
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
-            assert!(tokio::time::Instant::now() < deadline);
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        let runtime = service.runtime(initialized.state.id).await.unwrap();
-        // The finished buildset's dispatch ends with a promotion pass; let it settle so it cannot
-        // observe, and cancel, the half-made promotion below.
-        while !runtime.dispatching.lock().is_empty() {
-            assert!(tokio::time::Instant::now() < deadline);
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        let (mut item, certificate, old_master) = {
-            let data = runtime.data.lock();
-            let item = data
-                .items
-                .iter()
-                .find(|item| item.id == approved.item_id)
-                .cloned()
+            service
+                .set_paused(initialized.state.id, true)
+                .await
                 .unwrap();
-            let certificate = data
-                .certificates
-                .iter()
-                .find(|certificate| Some(certificate.id) == item.certificate_id)
-                .cloned()
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let item = service
+                    .item_status(initialized.state.id, approved.item_id)
+                    .await
+                    .unwrap();
+                if item.state == QueueItemState::Ready {
+                    break;
+                }
+                assert!(tokio::time::Instant::now() < deadline);
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            let runtime = service.runtime(initialized.state.id).await.unwrap();
+            // The finished buildset's dispatch ends with a promotion pass; let it settle so it
+            // cannot observe, and cancel, the half-made promotion below.
+            while !runtime.dispatching.lock().is_empty() {
+                assert!(tokio::time::Instant::now() < deadline);
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            let (mut item, certificate, old_master) = {
+                let data = runtime.data.lock();
+                let item = data
+                    .items
+                    .iter()
+                    .find(|item| item.id == approved.item_id)
+                    .cloned()
+                    .unwrap();
+                let certificate = data
+                    .certificates
+                    .iter()
+                    .find(|certificate| Some(certificate.id) == item.certificate_id)
+                    .cloned()
+                    .unwrap();
+                (item, certificate, data.state.staging_oid.clone())
+            };
+            item.state = item.state.transition(ItemEvent::PromotionStarted).unwrap();
+            service.replace_item(&runtime, item).unwrap();
+            let promotion_command = CommandId::new();
+            if recorded_intent {
+                runtime
+                    .store
+                    .prepare_promotion(initialized.state.id, promotion_command, &certificate)
+                    .unwrap();
+            }
+            runtime
+                .git
+                .retain_tested_object(
+                    &runtime.mirror,
+                    &certificate.buildset_id.to_string(),
+                    &certificate.tested_oid,
+                )
+                .await
                 .unwrap();
-            (item, certificate, data.state.staging_oid.clone())
-        };
-        item.state = item.state.transition(ItemEvent::PromotionStarted).unwrap();
-        service.replace_item(&runtime, item).unwrap();
-        runtime
-            .store
-            .prepare_promotion(initialized.state.id, CommandId::new(), &certificate)
-            .unwrap();
-        runtime
-            .git
-            .retain_tested_object(
-                &runtime.mirror,
-                &certificate.buildset_id.to_string(),
-                &certificate.tested_oid,
-            )
-            .await
-            .unwrap();
-        runtime
-            .git
-            .compare_and_swap_integration(&old_master, &certificate.tested_oid)
-            .await
-            .unwrap();
-        drop(runtime);
-        drop(service);
+            match (moved_staging, moved_release) {
+                (true, true) => runtime
+                    .git
+                    .compare_and_swap_integration(&old_master, &certificate.tested_oid)
+                    .await
+                    .unwrap(),
+                (true, false) => runtime
+                    .git
+                    .compare_and_swap_staging(&old_master, &old_master, &certificate.tested_oid)
+                    .await
+                    .unwrap(),
+                _ => {
+                    git(
+                        &repository,
+                        &["update-ref", RELEASE_REF, &certificate.tested_oid.to_hex()],
+                    );
+                }
+            }
+            drop(runtime);
+            drop(service);
 
-        let recovered = TollgateService::open(support).await.unwrap();
-        let snapshot = recovered
-            .repository_snapshot(initialized.state.id)
-            .await
-            .unwrap();
-        assert_eq!(snapshot.state.staging_oid, certificate.tested_oid);
-        assert!(snapshot.queue.is_empty());
-        assert_eq!(
-            recovered
+            let recovered = TollgateService::open(support).await.unwrap();
+            let snapshot = recovered
+                .repository_snapshot(initialized.state.id)
+                .await
+                .unwrap();
+            let item_state = recovered
                 .item_status(initialized.state.id, approved.item_id)
                 .await
                 .unwrap()
-                .state,
-            QueueItemState::Promoted
-        );
+                .state;
+            if moved_staging && moved_release {
+                assert_eq!(snapshot.state.staging_oid, certificate.tested_oid);
+                assert_eq!(snapshot.state.release_oid, certificate.tested_oid);
+                assert_eq!(
+                    git(&repository, &["rev-parse", RELEASE_REF]),
+                    certificate.tested_oid.to_hex()
+                );
+                assert!(snapshot.queue.is_empty());
+                assert_eq!(item_state, QueueItemState::Promoted);
+                continue;
+            }
+            assert_ne!(item_state, QueueItemState::Promoted);
+            assert_eq!(
+                snapshot.state.execution_state,
+                RepositoryExecutionState::Blocked
+            );
+            let expected_block = if recorded_intent {
+                "ambiguous-promotion-recovery"
+            } else {
+                "orphan-promotion-state"
+            };
+            assert!(
+                snapshot
+                    .state
+                    .block_reasons
+                    .iter()
+                    .any(|reason| reason.code == expected_block),
+                "{:?}",
+                snapshot.state.block_reasons
+            );
+            assert_eq!(snapshot.state.staging_oid, old_master);
+            assert_eq!(snapshot.state.release_oid, old_master);
+            if recorded_intent {
+                let runtime = recovered.runtime(initialized.state.id).await.unwrap();
+                assert_eq!(
+                    intent_state_of(&runtime, "promotion", promotion_command),
+                    Some(IntentState::NeedsAttention)
+                );
+            }
+        }
+    }
+
+    /// The state of an unfinished or attention-needing operation intent, or `None` once it
+    /// completed or was canceled.
+    fn intent_state_of(
+        runtime: &RepositoryRuntime,
+        kind: &str,
+        command_id: CommandId,
+    ) -> Option<IntentState> {
+        runtime
+            .store
+            .recoverable_operations(&[kind])
+            .unwrap()
+            .into_iter()
+            .find(|(command, ..)| *command == command_id)
+            .map(|(_, _, _, state)| state)
     }
 
     #[tokio::test]
@@ -27524,12 +27716,22 @@ policy = "clone"
         assert_eq!(passed[0].payload["recovered"], true);
     }
 
-    #[tokio::test]
-    async fn restart_finishes_a_staging_promotion_and_replays_its_release_request() {
-        let temporary = tempfile::tempdir().unwrap();
-        let support = temporary.path().join("support");
+    /// A repository with a release stage whose promotion of `feature` crashed after its ref
+    /// update and before its promotion transaction. The update was the staging-only CAS, or, with
+    /// `release_moved_too`, also moved `release`, which a staging-only promotion never does.
+    async fn interrupted_staging_promotion(
+        root: &Path,
+        release_moved_too: bool,
+    ) -> (
+        RepositoryId,
+        PathBuf,
+        QueueItemId,
+        PassCertificate,
+        GitOid,
+        CommandId,
+    ) {
         let (service, id, repository) = staged_release_repository(
-            temporary.path(),
+            root,
             &[],
             &[("feature", "change.txt", "change\n")],
             "\n[[step]]\nname = \"full\"\nstage = \"release\"\nrun = \"true\"\nneeds = [\"fast\"]\n",
@@ -27597,9 +27799,10 @@ policy = "clone"
         };
         item.state = item.state.transition(ItemEvent::PromotionStarted).unwrap();
         service.replace_item(&runtime, item).unwrap();
+        let promotion_command = CommandId::new();
         runtime
             .store
-            .prepare_promotion(id, CommandId::new(), &certificate)
+            .prepare_promotion(id, promotion_command, &certificate)
             .unwrap();
         runtime
             .git
@@ -27610,14 +27813,37 @@ policy = "clone"
             )
             .await
             .unwrap();
-        runtime
-            .git
-            .compare_and_swap_staging(&base, &base, &certificate.tested_oid)
-            .await
-            .unwrap();
+        if release_moved_too {
+            runtime
+                .git
+                .compare_and_swap_staging_and_release(&base, &base, &certificate.tested_oid)
+                .await
+                .unwrap();
+        } else {
+            runtime
+                .git
+                .compare_and_swap_staging(&base, &base, &certificate.tested_oid)
+                .await
+                .unwrap();
+        }
         drop(runtime);
         drop(service);
+        (
+            id,
+            repository,
+            approved.item_id,
+            certificate,
+            base,
+            promotion_command,
+        )
+    }
 
+    #[tokio::test]
+    async fn restart_finishes_a_staging_promotion_and_replays_its_release_request() {
+        let temporary = tempfile::tempdir().unwrap();
+        let support = temporary.path().join("support");
+        let (id, repository, item_id, certificate, base, _) =
+            interrupted_staging_promotion(temporary.path(), false).await;
         let recovered = TollgateService::open(support).await.unwrap();
         let snapshot = wait_for_release_snapshot(
             &recovered,
@@ -27630,11 +27856,7 @@ policy = "clone"
         assert_eq!(snapshot.state.release_oid, base);
         assert_eq!(snapshot.state.release_lag.commits, 1);
         assert_eq!(
-            recovered
-                .item_status(id, approved.item_id)
-                .await
-                .unwrap()
-                .state,
+            recovered.item_status(id, item_id).await.unwrap().state,
             QueueItemState::Promoted
         );
         assert_eq!(git(&repository, &["rev-parse", RELEASE_REF]), base.to_hex());
@@ -27654,6 +27876,45 @@ policy = "clone"
                 .state,
             QueueItemState::CheckPassed
         );
+    }
+
+    #[tokio::test]
+    async fn restart_blocks_a_staging_promotion_whose_release_moved_too() {
+        let temporary = tempfile::tempdir().unwrap();
+        let support = temporary.path().join("support");
+        let (id, repository, item_id, certificate, base, promotion_command) =
+            interrupted_staging_promotion(temporary.path(), true).await;
+        let recovered = TollgateService::open(support).await.unwrap();
+        let snapshot = recovered.repository_snapshot(id).await.unwrap();
+        assert_eq!(
+            snapshot.state.execution_state,
+            RepositoryExecutionState::Blocked
+        );
+        assert!(
+            snapshot
+                .state
+                .block_reasons
+                .iter()
+                .any(|reason| reason.code == "ambiguous-promotion-recovery"),
+            "{:?}",
+            snapshot.state.block_reasons
+        );
+        assert_ne!(
+            recovered.item_status(id, item_id).await.unwrap().state,
+            QueueItemState::Promoted
+        );
+        assert_eq!(snapshot.state.staging_oid, base);
+        assert_eq!(snapshot.state.release_oid, base);
+        assert_eq!(
+            git(&repository, &["rev-parse", RELEASE_REF]),
+            certificate.tested_oid.to_hex()
+        );
+        let runtime = recovered.runtime(id).await.unwrap();
+        assert_eq!(
+            intent_state_of(&runtime, "promotion", promotion_command),
+            Some(IntentState::NeedsAttention)
+        );
+        assert_eq!(outstanding_release_intents(&runtime), 0);
     }
 
     #[tokio::test]
@@ -27745,5 +28006,259 @@ policy = "clone"
         let runtime = service.runtime(id).await.unwrap();
         assert!(!runtime.store.release_stage_configured());
         assert_eq!(outstanding_release_intents(&runtime), 0);
+    }
+
+    /// A commit with `parent`'s tree whose only parent is `parent`, created without moving any
+    /// branch.
+    fn external_commit(repository: &Path, parent: &GitOid, message: &str) -> GitOid {
+        let tree = format!("{}^{{tree}}", parent.to_hex());
+        GitOid::from_hex(&git(
+            repository,
+            &["commit-tree", &tree, "-p", &parent.to_hex(), "-m", message],
+        ))
+        .unwrap()
+    }
+
+    /// An opt-out repository whose `origin` remote `master` equals its `staging` and `release`.
+    async fn repository_with_matching_remote(
+        root: &Path,
+    ) -> (Arc<TollgateService>, RepositoryId, PathBuf, PathBuf, GitOid) {
+        let repository = root.join("repository");
+        let remote = root.join("remote.git");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("base.txt"), "base\n").unwrap();
+        git(&repository, &["add", "base.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+        git(
+            root,
+            &[
+                "init",
+                "--bare",
+                "-b",
+                USER_BRANCH,
+                remote.to_str().unwrap(),
+            ],
+        );
+        git(
+            &repository,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&repository, &["push", "origin", USER_BRANCH]);
+        let service = TollgateService::open(root.join("support")).await.unwrap();
+        let initialized = service
+            .initialize_repository_with_options(&repository, Some("true".into()), false)
+            .await
+            .unwrap();
+        let base = initialized.state.staging_oid.clone();
+        assert_eq!(initialized.state.release_oid, base);
+        (service, initialized.state.id, repository, remote, base)
+    }
+
+    fn remote_master(remote: &Path) -> String {
+        git(remote, &["rev-parse", "refs/heads/master"])
+    }
+
+    fn block_codes(state: &RepositoryState) -> Vec<&str> {
+        state
+            .block_reasons
+            .iter()
+            .map(|reason| reason.code.as_str())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn restart_completes_an_interrupted_reconcile_only_when_both_refs_hold_its_adoption() {
+        for release_moved_again in [false, true] {
+            let temporary = tempfile::tempdir().unwrap();
+            let repository = temporary.path().join("repository");
+            let support = temporary.path().join("support");
+            std::fs::create_dir(&repository).unwrap();
+            git(&repository, &["init", "-b", USER_BRANCH]);
+            std::fs::write(repository.join("base.txt"), "base\n").unwrap();
+            git(&repository, &["add", "base.txt"]);
+            git(&repository, &["commit", "-m", "base"]);
+            let service = TollgateService::open(support.clone()).await.unwrap();
+            let initialized = service
+                .initialize_repository_with_options(&repository, Some("true".into()), false)
+                .await
+                .unwrap();
+            let id = initialized.state.id;
+            let persisted = initialized.state.staging_oid.clone();
+            let adopted = external_commit(&repository, &persisted, "adopted");
+            let moved = external_commit(&repository, &adopted, "moved");
+            // `tg reconcile` aligned both refs at the adopted OID, prepared its intent, and
+            // crashed before persisting the adoption.
+            git(
+                &repository,
+                &["update-ref", INTEGRATION_REF, &adopted.to_hex()],
+            );
+            git(&repository, &["update-ref", RELEASE_REF, &adopted.to_hex()]);
+            let runtime = service.runtime(id).await.unwrap();
+            let command = CommandId::new();
+            runtime
+                .store
+                .prepare_operation(
+                    id,
+                    "reconcile",
+                    command,
+                    &serde_json::json!({
+                        "request_digest": "interrupted-reconcile",
+                        "persisted_master": persisted,
+                        "observed_master": adopted,
+                    }),
+                )
+                .unwrap();
+            drop(runtime);
+            drop(service);
+            if release_moved_again {
+                git(&repository, &["update-ref", RELEASE_REF, &moved.to_hex()]);
+            }
+
+            let reopened = TollgateService::open(support).await.unwrap();
+            let state = reopened.repository_snapshot(id).await.unwrap().state;
+            let runtime = reopened.runtime(id).await.unwrap();
+            if !release_moved_again {
+                assert_eq!(state.execution_state, RepositoryExecutionState::Active);
+                assert!(state.block_reasons.is_empty(), "{:?}", state.block_reasons);
+                assert_eq!(state.staging_oid, adopted);
+                assert_eq!(state.release_oid, adopted);
+                assert_eq!(intent_state_of(&runtime, "reconcile", command), None);
+                continue;
+            }
+            assert_eq!(state.execution_state, RepositoryExecutionState::Blocked);
+            let codes = block_codes(&state);
+            assert!(codes.contains(&"external-staging-movement"), "{codes:?}");
+            assert!(codes.contains(&"external-release-movement"), "{codes:?}");
+            assert_eq!(state.staging_oid, persisted);
+            assert_eq!(state.release_oid, persisted);
+            assert_eq!(
+                intent_state_of(&runtime, "reconcile", command),
+                Some(IntentState::NeedsAttention)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn restart_adopts_an_interrupted_pull_only_when_both_refs_moved_together() {
+        // `staging_only`: the crash left `staging` at the pulled OID and `release` behind, which
+        // the pull's two-ref transaction never does. Otherwise the pull never moved `staging`
+        // and only `release` moved externally.
+        for staging_only in [true, false] {
+            let temporary = tempfile::tempdir().unwrap();
+            let (service, id, repository, remote, base) =
+                repository_with_matching_remote(temporary.path()).await;
+            let pulled = external_commit(&repository, &base, "remote");
+            git(
+                &repository,
+                &[
+                    "push",
+                    "origin",
+                    &format!("{}:refs/heads/master", pulled.to_hex()),
+                ],
+            );
+            let runtime = service.runtime(id).await.unwrap();
+            let command = CommandId::new();
+            runtime
+                .store
+                .prepare_operation(
+                    id,
+                    "pull",
+                    command,
+                    &serde_json::json!({
+                        "request_digest": "interrupted-pull",
+                        "remote": "origin",
+                        "remote_fetch_url": runtime.git.remote_url("origin", false).await.unwrap(),
+                        "branch": USER_BRANCH,
+                        "expected_local": base,
+                        "observed_remote_oid": pulled,
+                        "affected_item_ids": Vec::<QueueItemId>::new(),
+                    }),
+                )
+                .unwrap();
+            drop(runtime);
+            drop(service);
+            let moved = if staging_only {
+                INTEGRATION_REF
+            } else {
+                RELEASE_REF
+            };
+            git(&repository, &["update-ref", moved, &pulled.to_hex()]);
+
+            let reopened = TollgateService::open(temporary.path().join("support"))
+                .await
+                .unwrap();
+            let state = reopened.repository_snapshot(id).await.unwrap().state;
+            let runtime = reopened.runtime(id).await.unwrap();
+            assert_eq!(state.execution_state, RepositoryExecutionState::Blocked);
+            assert_eq!(state.staging_oid, base);
+            assert_eq!(state.release_oid, base);
+            assert_eq!(remote_master(&remote), pulled.to_hex());
+            let codes = block_codes(&state);
+            let recovered = runtime
+                .store
+                .events_after(0, 10_000)
+                .unwrap()
+                .iter()
+                .any(|event| event.kind == "remote.pull-recovered");
+            assert!(!recovered);
+            if staging_only {
+                assert!(codes.contains(&"ambiguous-pull-recovery"), "{codes:?}");
+                assert_eq!(
+                    intent_state_of(&runtime, "pull", command),
+                    Some(IntentState::NeedsAttention)
+                );
+            } else {
+                assert_eq!(codes, vec!["external-release-movement"]);
+                assert_eq!(intent_state_of(&runtime, "pull", command), None);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn live_pull_and_push_block_on_either_ref_moving_while_the_service_runs() {
+        for (operation, moved_ref) in [
+            ("pull", RELEASE_REF),
+            ("pull", INTEGRATION_REF),
+            ("push", RELEASE_REF),
+            ("push", INTEGRATION_REF),
+        ] {
+            let temporary = tempfile::tempdir().unwrap();
+            let (service, id, repository, remote, base) =
+                repository_with_matching_remote(temporary.path()).await;
+            let moved = external_commit(&repository, &base, "external");
+            git(&repository, &["update-ref", moved_ref, &moved.to_hex()]);
+
+            let command = CommandId::new();
+            let result = if operation == "pull" {
+                service.pull(id, command).await
+            } else {
+                service.push(id, command).await
+            };
+            assert!(
+                result.is_err(),
+                "{operation} with {moved_ref} moved reported {result:?}"
+            );
+            let state = service.repository_snapshot(id).await.unwrap().state;
+            assert_eq!(state.execution_state, RepositoryExecutionState::Blocked);
+            let expected = if moved_ref == RELEASE_REF {
+                "external-release-movement"
+            } else {
+                "external-staging-movement"
+            };
+            assert_eq!(block_codes(&state), vec![expected]);
+            assert_eq!(state.staging_oid, base);
+            assert_eq!(state.release_oid, base);
+            assert_eq!(remote_master(&remote), base.to_hex());
+            assert_eq!(git(&repository, &["rev-parse", moved_ref]), moved.to_hex());
+            let runtime = service.runtime(id).await.unwrap();
+            let completed = runtime
+                .store
+                .events_after(0, 10_000)
+                .unwrap()
+                .iter()
+                .any(|event| event.kind == format!("remote.{operation}-completed"));
+            assert!(!completed);
+        }
     }
 }
