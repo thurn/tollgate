@@ -790,7 +790,9 @@ struct RepositoryRuntime {
     diagnosis: tokio::sync::Mutex<()>,
     execution_permits: RwLock<Arc<Semaphore>>,
     /// The `release_concurrency` permit. Release runs hold it instead of an execution permit,
-    /// so they never delay gate admission beyond the global buildset and slot limits.
+    /// so they never delay gate admission beyond the global buildset and slot limits. A larger
+    /// count never starts a second release run: [`release_run_may_start`] admits only the
+    /// oldest active one.
     release_permits: RwLock<Arc<Semaphore>>,
     /// Set when a release trigger is owed: a promotion recorded a release-run intent, the
     /// configuration changed, or the repository activated. Cleared by the spawned trigger.
@@ -2950,15 +2952,35 @@ impl TollgateService {
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| ServiceError::Invariant("config apply omitted request digest".into()))?;
         let state = runtime.data.lock().state.clone();
-        self.rebuild_after_base_adoption(runtime, &state.staging_oid)
-            .await?;
+        // A release-only edit left gate validation intact before the crash, so recovery keeps it
+        // intact too. An unknown previous configuration rebuilds conservatively.
+        let previous = match evidence
+            .get("active_digest")
+            .and_then(serde_json::Value::as_str)
+        {
+            Some(digest) => runtime
+                .store
+                .configuration_snapshot(digest)?
+                .map(|(canonical, step_graph_digest)| {
+                    EffectiveConfig::restore_canonical(&canonical, digest.into(), step_graph_digest)
+                })
+                .transpose()?,
+            None => None,
+        };
+        let gate_policy_changed = !previous
+            .is_some_and(|previous| previous.gate_policy_matches(&runtime.data.lock().config));
+        if gate_policy_changed {
+            self.rebuild_after_base_adoption(runtime, &state.staging_oid)
+                .await?;
+        }
         let independent = runtime
             .data
             .lock()
             .items
             .iter()
             .filter(|item| {
-                item.kind == QueueItemKind::IndependentCheck
+                gate_policy_changed
+                    && item.kind == QueueItemKind::IndependentCheck
                     && is_rebuildable_gate_state(item.state)
             })
             .cloned()
@@ -3015,7 +3037,10 @@ impl TollgateService {
             request_digest,
             &result,
             "configuration.activation-recovered",
-            &serde_json::json!({"digest": candidate_digest}),
+            &serde_json::json!({
+                "digest": candidate_digest,
+                "gate_policy_changed": gate_policy_changed,
+            }),
             Actor::Recovery,
         )?;
         completed_state.event_sequence = event.sequence;
@@ -5269,6 +5294,7 @@ impl TollgateService {
                 (generation, data.config.clone())
             };
             let config = self.configuration_for_generation(runtime, &generation)?;
+            let activated = promotion_activated_configuration(&config, &active_config);
             let release_stage = config.has_release_stage();
             // A staging-only promotion leaves `release` where it was; the opt-out transaction
             // moves it to the promoted OID with `staging`.
@@ -5311,7 +5337,7 @@ impl TollgateService {
             }
             state.queue_revision += 1;
             state.event_sequence += 1;
-            state.active_configuration_digest = config.digest.clone();
+            state.active_configuration_digest = activated.digest.clone();
             state.remote_enabled = config.remote.enabled;
             self.record_staging_promotion(
                 runtime,
@@ -5324,7 +5350,7 @@ impl TollgateService {
             {
                 let mut data = runtime.data.lock();
                 data.state = state;
-                data.config = config.clone();
+                data.config = activated.clone();
                 if let Some(existing) = data
                     .items
                     .iter_mut()
@@ -5333,13 +5359,13 @@ impl TollgateService {
                     *existing = item.clone();
                 }
             }
-            if config.digest != active_config.digest {
+            if activated.digest != active_config.digest {
                 runtime.scheduler_epoch.fetch_add(1, Ordering::AcqRel);
                 *runtime.execution_permits.write().await = Arc::new(Semaphore::new(usize::from(
-                    config.resources.repository_concurrency,
+                    activated.resources.repository_concurrency,
                 )));
                 *runtime.release_permits.write().await =
-                    Arc::new(Semaphore::new(release_permit_count(&config)));
+                    Arc::new(Semaphore::new(release_permit_count(&activated)));
                 runtime
                     .release_trigger_requested
                     .store(true, Ordering::Release);
@@ -9693,7 +9719,7 @@ impl TollgateService {
             let _ = runtime.events.send(event);
             return self.repository_snapshot(repository_id).await;
         }
-        let (items, old_digest, state) = {
+        let (items, old_digest, gate_policy_changed, state) = {
             let mut data = runtime.data.lock();
             if data
                 .items
@@ -9706,23 +9732,31 @@ impl TollgateService {
                         .into(),
                 ));
             }
+            // A release-only edit leaves gate and independent-check validation untouched: their
+            // generations, buildsets, and certificates stay current. Release runs follow the
+            // release-stage digest through the release trigger instead.
+            let gate_policy_changed = !data.config.gate_policy_matches(&candidate);
             let items = data
                 .items
                 .iter()
                 .filter(|item| {
-                    matches!(
-                        item.state,
-                        QueueItemState::Constructing
-                            | QueueItemState::Queued
-                            | QueueItemState::Preparing
-                            | QueueItemState::Running
-                            | QueueItemState::Ready
-                    )
+                    gate_policy_changed
+                        && item.kind != QueueItemKind::Release
+                        && matches!(
+                            item.state,
+                            QueueItemState::Constructing
+                                | QueueItemState::Queued
+                                | QueueItemState::Preparing
+                                | QueueItemState::Running
+                                | QueueItemState::Ready
+                        )
                 })
                 .cloned()
                 .collect::<Vec<_>>();
             let old_digest = data.config.digest.clone();
-            data.state.queue_revision += 1;
+            if gate_policy_changed {
+                data.state.queue_revision += 1;
+            }
             data.state.active_configuration_digest = candidate.digest.clone();
             data.state.remote_enabled = candidate.remote.enabled;
             data.state.execution_state = if data.state.block_reasons.is_empty() {
@@ -9731,24 +9765,30 @@ impl TollgateService {
                 RepositoryExecutionState::Blocked
             };
             data.config = candidate.clone();
-            (items, old_digest, data.state.clone())
+            (items, old_digest, gate_policy_changed, data.state.clone())
         };
-        let tokens = runtime
-            .cancellations
-            .lock()
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        for token in tokens {
-            token.cancel();
+        if gate_policy_changed {
+            // Terminate the gate and independent-check work this apply rebuilds. A running
+            // release run keeps running; the release trigger retires it only when the
+            // release-stage digest changed.
+            let tokens = {
+                let cancellations = runtime.cancellations.lock();
+                items
+                    .iter()
+                    .filter_map(|item| cancellations.get(&item.id).cloned())
+                    .collect::<Vec<_>>()
+            };
+            for token in tokens {
+                token.cancel();
+            }
+            runtime.scheduler_epoch.fetch_add(1, Ordering::AcqRel);
+            *runtime.execution_permits.write().await = Arc::new(Semaphore::new(usize::from(
+                candidate.resources.repository_concurrency,
+            )));
+            self.reconfigure_global_scheduler().await;
         }
-        runtime.scheduler_epoch.fetch_add(1, Ordering::AcqRel);
-        *runtime.execution_permits.write().await = Arc::new(Semaphore::new(usize::from(
-            candidate.resources.repository_concurrency,
-        )));
         *runtime.release_permits.write().await =
             Arc::new(Semaphore::new(release_permit_count(&candidate)));
-        self.reconfigure_global_scheduler().await;
         let result = MutationResult {
             repository_id,
             action: "config-apply".into(),
@@ -9885,6 +9925,8 @@ impl TollgateService {
             &serde_json::json!({
                 "digest": candidate.digest,
                 "step_graph_digest": candidate.step_graph_digest,
+                "release_step_graph_digest": candidate.release_step_graph_digest,
+                "gate_policy_changed": gate_policy_changed,
                 "supersedes": old_digest,
             }),
             Actor::Ui,
@@ -11421,6 +11463,12 @@ impl TollgateService {
             if data.state.execution_state != RepositoryExecutionState::Active {
                 return Ok(());
             }
+            // Decided under the mutation lock that starts the run, so two dispatched release
+            // runs can never both start; the one left queued is dispatched again when the
+            // started one ends.
+            if item.kind == QueueItemKind::Release && !release_run_may_start(&data, item_id) {
+                return Ok(());
+            }
             if item.kind == QueueItemKind::Gate {
                 let active_position = data
                     .items
@@ -11951,6 +11999,14 @@ impl TollgateService {
         }
         item = current_item.ok_or(ServiceError::ItemNotFound(item_id))?;
         if item.kind == QueueItemKind::Release {
+            // A skipped step counts as failing only when the run selected it, so a prerequisite
+            // that no selected release step needs is never blamed.
+            let selected = config
+                .selected_run_steps(StepStage::Release, &changed_paths)
+                .unwrap_or_else(|_| config.run_steps(StepStage::Release))
+                .into_iter()
+                .map(|step| step.name.as_str())
+                .collect::<HashSet<_>>();
             let failing_steps = config
                 .run_steps(StepStage::Release)
                 .into_iter()
@@ -11961,7 +12017,7 @@ impl TollgateService {
                         Some((_, result)) if result.class == StepResultClass::Success => None,
                         Some(_) => Some(step.name.clone()),
                         None if outcome.skipped.contains(&step.name)
-                            && step.is_applicable(&changed_paths).unwrap_or(true) =>
+                            && selected.contains(step.name.as_str()) =>
                         {
                             Some(step.name.clone())
                         }
@@ -13048,7 +13104,10 @@ impl TollgateService {
                 data.items
                     .iter()
                     .filter(|item| {
-                        item.kind != QueueItemKind::Gate && item.state == QueueItemState::Queued
+                        item.kind != QueueItemKind::Gate
+                            && item.state == QueueItemState::Queued
+                            && (item.kind != QueueItemKind::Release
+                                || release_run_may_start(&data, item.id))
                     })
                     .map(|item| item.id),
             );
@@ -13547,6 +13606,7 @@ impl TollgateService {
                     "certificate failed synchronous promotion revalidation".into(),
                 ));
             }
+            let activated = promotion_activated_configuration(&config, &active_config);
             let push_intent = if config.remote.enabled && !release_stage {
                 let remote_fetch_url = runtime.git.remote_url(&config.remote.name, false).await?;
                 let remote_push_url = runtime.git.remote_url(&config.remote.name, true).await?;
@@ -13883,7 +13943,7 @@ impl TollgateService {
             }
             new_state.queue_revision += 1;
             new_state.event_sequence += 1;
-            new_state.active_configuration_digest = config.digest.clone();
+            new_state.active_configuration_digest = activated.digest.clone();
             new_state.remote_enabled = config.remote.enabled;
             new_state.active_window =
                 (new_state.active_window + 1).min(new_state.active_window_ceiling);
@@ -13898,7 +13958,7 @@ impl TollgateService {
             {
                 let mut data = runtime.data.lock();
                 data.state = new_state;
-                data.config = config.clone();
+                data.config = activated.clone();
                 if let Some(existing) = data
                     .items
                     .iter_mut()
@@ -13907,13 +13967,13 @@ impl TollgateService {
                     *existing = item.clone();
                 }
             }
-            if config.digest != active_config.digest {
+            if activated.digest != active_config.digest {
                 runtime.scheduler_epoch.fetch_add(1, Ordering::AcqRel);
                 *runtime.execution_permits.write().await = Arc::new(Semaphore::new(usize::from(
-                    config.resources.repository_concurrency,
+                    activated.resources.repository_concurrency,
                 )));
                 *runtime.release_permits.write().await =
-                    Arc::new(Semaphore::new(release_permit_count(&config)));
+                    Arc::new(Semaphore::new(release_permit_count(&activated)));
                 runtime
                     .release_trigger_requested
                     .store(true, Ordering::Release);
@@ -16204,6 +16264,34 @@ fn promotion_syncs_user_master_now(config: &EffectiveConfig) -> bool {
             !config.remote.enabled
         }
     }
+}
+
+/// The configuration a promotion activates: the promoted generation's frozen configuration,
+/// unless it applies the active gate policy ([`EffectiveConfig::gate_policy_matches`]), in which
+/// case the active configuration stays. A release-only configuration edit keeps gate generations
+/// built under the previous configuration, and promoting one of them never reverts that edit.
+fn promotion_activated_configuration(
+    generation_config: &EffectiveConfig,
+    active_config: &EffectiveConfig,
+) -> EffectiveConfig {
+    if generation_config.gate_policy_matches(active_config) {
+        active_config.clone()
+    } else {
+        generation_config.clone()
+    }
+}
+
+/// Whether release run `item_id` may start. A repository runs at most one release run at a time
+/// (staged-release-design.md 8.2), whatever its `release_concurrency` permit count, and starts
+/// them in queue order: only the oldest active release run may start, and it stays the oldest
+/// until it ends. With the trigger's coalescing, this keeps at most one started and one queued
+/// release run per repository and delivers their outcomes in target order.
+fn release_run_may_start(data: &RuntimeData, item_id: QueueItemId) -> bool {
+    data.items
+        .iter()
+        .filter(|item| item.kind == QueueItemKind::Release && !item.state.is_terminal())
+        .min_by_key(|item| item.enqueue_sequence)
+        .is_some_and(|oldest| oldest.id == item_id)
 }
 
 /// Whether the latest conclusive release run, the one with the newest target, failed.
@@ -28006,6 +28094,512 @@ policy = "clone"
         let runtime = service.runtime(id).await.unwrap();
         assert!(!runtime.store.release_stage_configured());
         assert_eq!(outstanding_release_intents(&runtime), 0);
+    }
+
+    /// Asserts that no two release buildsets overlapped: each started after the previous one
+    /// finished, so the repository never ran two release runs at once.
+    fn assert_release_buildsets_never_overlap(runtime: &RepositoryRuntime) {
+        let data = runtime.data.lock();
+        let release_items = data
+            .items
+            .iter()
+            .filter(|item| item.kind == QueueItemKind::Release)
+            .map(|item| item.id)
+            .collect::<HashSet<_>>();
+        let mut buildsets = data
+            .buildsets
+            .iter()
+            .filter(|buildset| release_items.contains(&buildset.item_id))
+            .collect::<Vec<_>>();
+        buildsets.sort_by_key(|buildset| buildset.created_at);
+        for pair in buildsets.windows(2) {
+            let finished = pair[0]
+                .finished_at
+                .unwrap_or_else(|| panic!("release buildset {} never finished", pair[0].id));
+            assert!(
+                finished <= pair[1].created_at,
+                "release buildset {} started at {} before {} finished at {finished}",
+                pair[1].id,
+                pair[1].created_at,
+                pair[0].id
+            );
+        }
+    }
+
+    /// What the latest completed `config-apply` intent observed.
+    fn last_config_apply_record(runtime: &RepositoryRuntime) -> serde_json::Value {
+        runtime
+            .store
+            .completed_operation_records("config-apply")
+            .unwrap()
+            .pop()
+            .unwrap()
+            .1
+    }
+
+    fn item_buildset_count(runtime: &RepositoryRuntime, item_id: QueueItemId) -> usize {
+        runtime
+            .data
+            .lock()
+            .buildsets
+            .iter()
+            .filter(|buildset| buildset.item_id == item_id)
+            .count()
+    }
+
+    #[tokio::test]
+    async fn release_runs_start_one_at_a_time_whatever_the_release_permit_count() {
+        let temporary = tempfile::tempdir().unwrap();
+        let gate = temporary.path().join("release-may-finish");
+        let (service, id, _repository) = staged_release_repository(
+            temporary.path(),
+            &[],
+            &[
+                ("feature-a", "a.txt", "a\n"),
+                ("feature-b", "b.txt", "b\n"),
+                ("feature-c", "c.txt", "c\n"),
+            ],
+            &format!(
+                "\n[resources]\nrelease_concurrency = 2\n\n[[step]]\nname = \"full\"\nstage = \"release\"\nrun = \"while [ ! -f '{}' ]; do sleep 0.05; done\"\nneeds = [\"fast\"]\n",
+                gate.display()
+            ),
+        )
+        .await;
+        let runtime = service.runtime(id).await.unwrap();
+        assert_eq!(runtime.data.lock().config.resources.release_concurrency, 2);
+
+        let tip_a = approve_and_promote(&service, id, "feature-a").await;
+        wait_for_release_snapshot(&service, id, "the first release run to start", |snapshot| {
+            release_runs_for(snapshot, &tip_a)
+                .iter()
+                .any(|view| view.item.state == QueueItemState::Running)
+        })
+        .await;
+        let tip_b = approve_and_promote(&service, id, "feature-b").await;
+        let queued = wait_for_release_snapshot(
+            &service,
+            id,
+            "a queued run for the second tip",
+            |snapshot| !release_runs_for(snapshot, &tip_b).is_empty(),
+        )
+        .await;
+        let queued_b = release_runs_for(&queued, &tip_b)[0].item.id;
+        // A free second permit must not start the queued run while the first runs; give a
+        // regression time to start it.
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let waiting = service.item_status(id, queued_b).await.unwrap();
+        assert_eq!(waiting.state, QueueItemState::Queued);
+        assert_eq!(item_buildset_count(&runtime, queued_b), 0);
+
+        let tip_c = approve_and_promote(&service, id, "feature-c").await;
+        let coalesced = wait_for_release_snapshot(
+            &service,
+            id,
+            "the queued run to retarget to the newest tip",
+            |snapshot| !release_runs_for(snapshot, &tip_c).is_empty(),
+        )
+        .await;
+        assert_eq!(
+            coalesced
+                .release_runs
+                .iter()
+                .filter(|view| !view.item.state.is_terminal())
+                .map(|view| (view.item.source_oid.clone(), view.item.state))
+                .collect::<Vec<_>>(),
+            [
+                (tip_c.clone(), QueueItemState::Queued),
+                (tip_a.clone(), QueueItemState::Running),
+            ],
+            "at most one running and one queued release run, whatever the permit count"
+        );
+        assert_eq!(
+            service.item_status(id, queued_b).await.unwrap().state,
+            QueueItemState::Superseded
+        );
+
+        std::fs::write(&gate, "").unwrap();
+        let finished =
+            wait_for_release_snapshot(&service, id, "both release runs to pass", |snapshot| {
+                snapshot
+                    .release_runs
+                    .iter()
+                    .all(|view| view.item.state.is_terminal())
+                    && event_kinds(&snapshot.history, "release.run-passed").len() == 2
+            })
+            .await;
+        assert_release_buildsets_never_overlap(&runtime);
+        let events = runtime.store.events_after(0, 10_000).unwrap();
+        assert_eq!(
+            event_kinds(&events, "release.run-passed")
+                .iter()
+                .map(|event| event.payload["tested_oid"].clone())
+                .collect::<Vec<_>>(),
+            [serde_json::json!(tip_a), serde_json::json!(tip_c)],
+            "outcomes arrive in target order"
+        );
+        assert_eq!(finished.state.staging_oid, tip_c);
+    }
+
+    #[tokio::test]
+    async fn restart_reruns_the_started_release_run_before_its_queued_successor() {
+        let temporary = tempfile::tempdir().unwrap();
+        let support = temporary.path().join("support");
+        let gate = temporary.path().join("release-may-finish");
+        let (service, id, _repository) = staged_release_repository(
+            temporary.path(),
+            &[],
+            &[("feature-a", "a.txt", "a\n"), ("feature-b", "b.txt", "b\n")],
+            &format!(
+                "\n[resources]\nrelease_concurrency = 2\n\n[[step]]\nname = \"full\"\nstage = \"release\"\nrun = \"while [ ! -f '{}' ]; do sleep 0.05; done\"\nneeds = [\"fast\"]\n",
+                gate.display()
+            ),
+        )
+        .await;
+        let tip_a = approve_and_promote(&service, id, "feature-a").await;
+        wait_for_release_snapshot(&service, id, "the first release run to start", |snapshot| {
+            release_runs_for(snapshot, &tip_a)
+                .iter()
+                .any(|view| view.item.state == QueueItemState::Running)
+        })
+        .await;
+        let tip_b = approve_and_promote(&service, id, "feature-b").await;
+        let queued = wait_for_release_snapshot(
+            &service,
+            id,
+            "a queued run for the second tip",
+            |snapshot| !release_runs_for(snapshot, &tip_b).is_empty(),
+        )
+        .await;
+        let run_a = release_runs_for(&queued, &tip_a)[0].item.id;
+        let run_b = release_runs_for(&queued, &tip_b)[0].item.id;
+        service.shutdown().await.unwrap();
+        drop(service);
+
+        // Both runs are queued after the restart; the interrupted one is started, so it keeps
+        // its target and reruns first while its successor waits.
+        let recovered = TollgateService::open(support).await.unwrap();
+        let runtime = recovered.runtime(id).await.unwrap();
+        wait_for_release_snapshot(
+            &recovered,
+            id,
+            "the interrupted release run to rerun",
+            |snapshot| {
+                release_runs_for(snapshot, &tip_a)
+                    .iter()
+                    .any(|view| view.item.state == QueueItemState::Running)
+            },
+        )
+        .await;
+        assert_eq!(item_buildset_count(&runtime, run_a), 2);
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        assert_eq!(
+            recovered.item_status(id, run_b).await.unwrap().state,
+            QueueItemState::Queued
+        );
+        assert_eq!(item_buildset_count(&runtime, run_b), 0);
+
+        std::fs::write(&gate, "").unwrap();
+        wait_for_release_snapshot(&recovered, id, "both release runs to pass", |snapshot| {
+            [run_a, run_b].iter().all(|run| {
+                snapshot.release_runs.iter().any(|view| {
+                    view.item.id == *run && view.item.state == QueueItemState::CheckPassed
+                })
+            })
+        })
+        .await;
+        assert_release_buildsets_never_overlap(&runtime);
+    }
+
+    #[tokio::test]
+    async fn release_runs_without_a_selected_release_step_pass_without_running_prerequisites() {
+        let temporary = tempfile::tempdir().unwrap();
+        let runs = temporary.path().join("setup-runs");
+        // `setup` passes only the first time it runs: in the gate run.
+        let (service, id, _repository) = staged_release_repository(
+            temporary.path(),
+            &[],
+            &[("feature-docs", "docs/guide.md", "guide\n")],
+            &format!(
+                "\n[[step]]\nname = \"setup\"\nrun = \"test ! -f '{0}' && touch '{0}'\"\n\n[[step]]\nname = \"full\"\nstage = \"release\"\nrun = \"true\"\nneeds = [\"setup\"]\ninclude = [\"src/**\"]\n",
+                runs.display()
+            ),
+        )
+        .await;
+        let tip = approve_and_promote(&service, id, "feature-docs").await;
+        let snapshot = wait_for_release_snapshot(&service, id, "the release run", |snapshot| {
+            release_runs_for(snapshot, &tip)
+                .iter()
+                .any(|view| view.item.state.is_terminal())
+        })
+        .await;
+        let run = release_runs_for(&snapshot, &tip)[0];
+        assert_eq!(
+            run.item.state,
+            QueueItemState::CheckPassed,
+            "{:?}",
+            run.item.terminal_reason
+        );
+        assert_eq!(
+            run.buildset
+                .as_ref()
+                .unwrap()
+                .step_results
+                .iter()
+                .map(|result| (result.name.as_str(), result.result_class.as_str()))
+                .collect::<BTreeMap<_, _>>(),
+            BTreeMap::from([("full", "skipped"), ("setup", "skipped")]),
+            "a docs-only range runs neither the filtered release step nor its prerequisite"
+        );
+        let certificate = run.certificate.as_ref().expect("release certificate");
+        assert!(certificate.voting_results.is_empty());
+        assert_eq!(snapshot.state.release_state, ReleaseState::Pending);
+    }
+
+    /// The staged-release fixture's policy with `fast` and `full` running `fast_run` and
+    /// `full_run`, plus `extra` configuration.
+    fn staged_policy(fast_run: &str, full_run: &str, extra: &str) -> String {
+        format!(
+            "version = 1\n{extra}\n[[step]]\nname = \"fast\"\nrun = \"{fast_run}\"\n\n[[step]]\nname = \"full\"\nstage = \"release\"\nrun = \"{full_run}\"\nneeds = [\"fast\"]\n"
+        )
+    }
+
+    #[tokio::test]
+    async fn release_only_configuration_edits_keep_gate_validation_and_gate_edits_rebuild_it() {
+        let temporary = tempfile::tempdir().unwrap();
+        let gate = temporary.path().join("gate-may-finish");
+        let blocking = format!("while [ ! -f '{}' ]; do sleep 0.05; done", gate.display());
+        let (service, id, repository) = staged_release_repository(
+            temporary.path(),
+            &[],
+            &[("feature-a", "a.txt", "a\n"), ("feature-b", "b.txt", "b\n")],
+            "",
+        )
+        .await;
+        let apply = |policy: String| {
+            let service = Arc::clone(&service);
+            let path = repository.join(".tollgate/config.toml");
+            async move {
+                std::fs::write(path, policy).unwrap();
+                service
+                    .apply_configuration(id, CommandId::new())
+                    .await
+                    .unwrap()
+            }
+        };
+        apply(staged_policy(&blocking, "true", "")).await;
+        let runtime = service.runtime(id).await.unwrap();
+        let submitted = service
+            .submit_candidate_from(
+                id,
+                "HEAD".into(),
+                Some(
+                    temporary
+                        .path()
+                        .join("feature-a")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        let running =
+            wait_for_item_state(&service, id, submitted.item_id, QueueItemState::Running).await;
+        let generation = running.generation.clone().unwrap().id;
+        let buildset = running.buildset.clone().unwrap().id;
+
+        // A release-only edit while the gate buildset runs leaves it running to completion.
+        let gate_digest = runtime.data.lock().config.step_graph_digest.clone();
+        let release_edit = apply(staged_policy(&blocking, "echo edited", "")).await;
+        assert_eq!(runtime.data.lock().config.step_graph_digest, gate_digest);
+        assert_eq!(
+            release_edit.state.active_configuration_digest,
+            runtime.data.lock().config.digest
+        );
+        std::fs::write(&gate, "").unwrap();
+        let ready =
+            wait_for_item_state(&service, id, submitted.item_id, QueueItemState::Ready).await;
+        assert_eq!(ready.generation.as_ref().unwrap().id, generation);
+        assert_eq!(ready.buildset.as_ref().unwrap().id, buildset);
+        assert_eq!(item_buildset_count(&runtime, submitted.item_id), 1);
+        let certificate = ready.certificate.clone().expect("gate certificate").id;
+
+        // Another release-only edit, including release-only resources, keeps the certificate.
+        let revision = runtime.data.lock().state.queue_revision;
+        let kept_policy = staged_policy(
+            &blocking,
+            "echo again",
+            "\n[resources]\nmax_release_lag = 3\nrelease_concurrency = 2\n",
+        );
+        apply(kept_policy.clone()).await;
+        let kept = service.item_details(id, submitted.item_id).await.unwrap();
+        assert_eq!(kept.item.state, QueueItemState::Ready);
+        assert_eq!(kept.generation.as_ref().unwrap().id, generation);
+        assert_eq!(kept.certificate.as_ref().unwrap().id, certificate);
+        assert_eq!(runtime.data.lock().state.queue_revision, revision);
+        assert_eq!(
+            last_config_apply_record(&runtime)["gate_policy_changed"],
+            false
+        );
+
+        // Promoting the retained candidate keeps the edited configuration active.
+        let kept_digest = EffectiveConfig::parse(&kept_policy).unwrap().digest;
+        service
+            .authorize_candidate(id, submitted.item_id, revision, CommandId::new())
+            .await
+            .unwrap();
+        wait_item_promoted(&service, id, submitted.item_id).await;
+        let promoted = service.repository_snapshot(id).await.unwrap();
+        assert_eq!(promoted.state.active_configuration_digest, kept_digest);
+        assert_eq!(
+            promoted.state.execution_state,
+            RepositoryExecutionState::Active
+        );
+
+        // A gate edit rebuilds the gate candidate's validation.
+        let second = service
+            .submit_candidate_from(
+                id,
+                "HEAD".into(),
+                Some(
+                    temporary
+                        .path()
+                        .join("feature-b")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        let validated =
+            wait_for_item_state(&service, id, second.item_id, QueueItemState::Ready).await;
+        let old_generation = validated.generation.clone().unwrap().id;
+        apply(staged_policy(
+            "true",
+            "echo again",
+            "\n[resources]\nmax_release_lag = 3\nrelease_concurrency = 2\n",
+        ))
+        .await;
+        let rebuilt = service.item_details(id, second.item_id).await.unwrap();
+        assert_ne!(rebuilt.generation.as_ref().unwrap().id, old_generation);
+        assert!(rebuilt.certificate.is_none());
+        let revalidated =
+            wait_for_item_state(&service, id, second.item_id, QueueItemState::Ready).await;
+        assert_ne!(
+            revalidated.certificate.as_ref().unwrap().id,
+            validated.certificate.as_ref().unwrap().id
+        );
+        assert_eq!(
+            last_config_apply_record(&runtime)["gate_policy_changed"],
+            true
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_recovers_a_configuration_apply_rebuilding_gate_validation_only_for_gate_edits()
+    {
+        for gate_edit in [false, true] {
+            let temporary = tempfile::tempdir().unwrap();
+            let support = temporary.path().join("support");
+            let (service, id, repository) = staged_release_repository(
+                temporary.path(),
+                &[],
+                &[("feature-a", "a.txt", "a\n")],
+                "\n[[step]]\nname = \"full\"\nstage = \"release\"\nrun = \"true\"\nneeds = [\"fast\"]\n",
+            )
+            .await;
+            let submitted = service
+                .submit_candidate_from(
+                    id,
+                    "HEAD".into(),
+                    Some(
+                        temporary
+                            .path()
+                            .join("feature-a")
+                            .to_string_lossy()
+                            .into_owned(),
+                    ),
+                    CommandId::new(),
+                )
+                .await
+                .unwrap();
+            let ready =
+                wait_for_item_state(&service, id, submitted.item_id, QueueItemState::Ready).await;
+            let certificate = ready.certificate.clone().unwrap().id;
+
+            // `tg config apply` activated the edit and crashed before rebuilding the queue.
+            let policy = if gate_edit {
+                staged_policy("true # edited", "true", "")
+            } else {
+                staged_policy("true", "echo edited", "")
+            };
+            std::fs::write(repository.join(".tollgate/config.toml"), &policy).unwrap();
+            let candidate = EffectiveConfig::parse(&policy).unwrap();
+            let runtime = service.runtime(id).await.unwrap();
+            let active_digest = runtime.data.lock().config.digest.clone();
+            let command = CommandId::new();
+            let request_digest = command_digest(&serde_json::json!({
+                "repository_id": id,
+                "active_digest": active_digest,
+                "candidate_digest": candidate.digest,
+            }))
+            .unwrap();
+            runtime
+                .store
+                .prepare_operation(
+                    id,
+                    "config-apply",
+                    command,
+                    &serde_json::json!({
+                        "request_digest": request_digest,
+                        "active_digest": active_digest,
+                        "candidate_digest": candidate.digest,
+                    }),
+                )
+                .unwrap();
+            let mut state = runtime.data.lock().state.clone();
+            state.active_configuration_digest = candidate.digest.clone();
+            runtime
+                .store
+                .stage_configuration(
+                    &state,
+                    &candidate.canonical_bytes().unwrap(),
+                    &candidate.step_graph_digest,
+                    &active_digest,
+                    command,
+                    &request_digest,
+                )
+                .unwrap();
+            runtime.data.lock().state.active_configuration_digest = candidate.digest.clone();
+            drop(runtime);
+            service.shutdown().await.unwrap();
+            drop(service);
+
+            let recovered = TollgateService::open(support).await.unwrap();
+            let runtime = recovered.runtime(id).await.unwrap();
+            assert_eq!(intent_state_of(&runtime, "config-apply", command), None);
+            assert_eq!(runtime.data.lock().config.digest, candidate.digest);
+            let item = recovered.item_details(id, submitted.item_id).await.unwrap();
+            if gate_edit {
+                assert_ne!(
+                    item.generation.as_ref().unwrap().id,
+                    ready.generation.as_ref().unwrap().id
+                );
+                assert!(item.certificate.is_none());
+            } else {
+                assert_eq!(item.item.state, QueueItemState::Ready);
+                assert_eq!(
+                    item.generation.as_ref().unwrap().id,
+                    ready.generation.as_ref().unwrap().id
+                );
+                assert_eq!(item.certificate.as_ref().unwrap().id, certificate);
+            }
+            assert_eq!(
+                last_config_apply_record(&runtime)["gate_policy_changed"],
+                gate_edit
+            );
+        }
     }
 
     /// A commit with `parent`'s tree whose only parent is `parent`, created without moving any

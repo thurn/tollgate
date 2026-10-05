@@ -567,6 +567,51 @@ impl EffectiveConfig {
         }
     }
 
+    /// Steps one run of `stage` executes for `changed_paths`, in declaration
+    /// order. A gate run selects each gate-stage step by its own path filters.
+    /// A release run starts from the release-stage steps its path filters
+    /// select and adds only the run steps those transitively need (through
+    /// `needs` or `soft_needs`) whose own path filters also select them, so a
+    /// release run that selects no release-stage step selects nothing and
+    /// never runs a prerequisite on its own.
+    pub fn selected_run_steps(
+        &self,
+        stage: StepStage,
+        changed_paths: &[String],
+    ) -> Result<Vec<&EffectiveStep>, ConfigError> {
+        let mut selected = Vec::new();
+        for step in self.run_steps(stage) {
+            if step.is_applicable(changed_paths)? {
+                selected.push(step);
+            }
+        }
+        Ok(match stage {
+            StepStage::Gate => selected,
+            StepStage::Release => dependency_closure(&selected, |step| !step.stage.is_gate()),
+        })
+    }
+
+    /// Whether `other` applies the same gate policy: it differs from this
+    /// configuration at most in release-only policy, meaning release-stage
+    /// steps, `release_concurrency`, and `max_release_lag`. Such an edit
+    /// never affects gate validation, so it leaves gate generations, their
+    /// buildsets, and their certificates intact. Adding the first or removing
+    /// the last release-stage step changes how a promotion moves the refs, so
+    /// it always changes the gate policy.
+    pub fn gate_policy_matches(&self, other: &Self) -> bool {
+        let gate_policy = |config: &Self| {
+            let mut policy = config.clone();
+            policy.steps.retain(|step| step.stage.is_gate());
+            policy.resources.release_concurrency = default_release_concurrency();
+            policy.resources.max_release_lag = 0;
+            policy.digest.clear();
+            policy.release_step_graph_digest = None;
+            policy
+        };
+        self.has_release_stage() == other.has_release_stage()
+            && gate_policy(self) == gate_policy(other)
+    }
+
     /// The release-stage step graph digest a release run freezes, or the
     /// gate-stage digest for a gate run.
     pub fn run_step_graph_digest(&self, stage: StepStage) -> Option<&str> {
@@ -1196,14 +1241,25 @@ fn release_graph_digest(steps: &[EffectiveStep]) -> Result<Option<String>, Confi
 }
 
 fn release_run_steps(steps: &[EffectiveStep]) -> Vec<&EffectiveStep> {
+    let all = steps.iter().collect::<Vec<_>>();
+    dependency_closure(&all, |step| !step.stage.is_gate())
+}
+
+/// The steps of `steps` matching `root`, plus every step of `steps` they
+/// transitively need through `needs` or `soft_needs`, in declaration order. A
+/// dependency outside `steps` is not followed.
+fn dependency_closure<'a>(
+    steps: &[&'a EffectiveStep],
+    root: impl Fn(&EffectiveStep) -> bool,
+) -> Vec<&'a EffectiveStep> {
     let by_name = steps
         .iter()
-        .map(|step| (step.name.as_str(), step))
+        .map(|step| (step.name.as_str(), *step))
         .collect::<HashMap<_, _>>();
     let mut selected = BTreeSet::new();
     let mut pending = steps
         .iter()
-        .filter(|step| !step.stage.is_gate())
+        .filter(|step| root(step))
         .map(|step| step.name.as_str())
         .collect::<Vec<_>>();
     while let Some(name) = pending.pop() {
@@ -1221,6 +1277,7 @@ fn release_run_steps(steps: &[EffectiveStep]) -> Vec<&EffectiveStep> {
     }
     steps
         .iter()
+        .copied()
         .filter(|step| selected.contains(step.name.as_str()))
         .collect()
 }
@@ -1636,6 +1693,80 @@ mod tests {
         )
         .unwrap();
         assert_eq!(restored, config);
+    }
+
+    #[test]
+    fn release_runs_select_path_filtered_release_steps_and_only_their_prerequisites() {
+        let config = staged(
+            "version = 1\n[[step]]\nname = \"setup\"\nrun = \"setup\"\n[[step]]\nname = \"build\"\nrun = \"build\"\nneeds = [\"setup\"]\n[[step]]\nname = \"fast\"\nrun = \"fast\"\nneeds = [\"setup\"]\n[[step]]\nname = \"full\"\nstage = \"release\"\nrun = \"full\"\nneeds = [\"setup\"]\ninclude = [\"src/**\"]\n[[step]]\nname = \"docs\"\nstage = \"release\"\nrun = \"docs\"\nsoft_needs = [\"build\"]\ninclude = [\"docs/**\"]\n",
+        )
+        .unwrap();
+        let selected = |stage: StepStage, paths: &[&str]| {
+            config
+                .selected_run_steps(
+                    stage,
+                    &paths
+                        .iter()
+                        .map(|path| (*path).to_owned())
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap()
+                .into_iter()
+                .map(|step| step.name.as_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            selected(StepStage::Release, &["README.md"]),
+            Vec::<&str>::new(),
+            "no selected release step selects no prerequisite either"
+        );
+        assert_eq!(
+            selected(StepStage::Release, &["src/lib.rs"]),
+            ["setup", "full"]
+        );
+        assert_eq!(
+            selected(StepStage::Release, &["docs/guide.md"]),
+            ["setup", "build", "docs"],
+            "soft needs are followed transitively"
+        );
+        assert_eq!(
+            selected(StepStage::Release, &["src/lib.rs", "docs/guide.md"]),
+            ["setup", "build", "full", "docs"]
+        );
+        assert_eq!(
+            selected(StepStage::Gate, &["README.md"]),
+            ["setup", "build", "fast"],
+            "gate runs select each gate step by its own filters"
+        );
+    }
+
+    #[test]
+    fn release_only_edits_keep_the_gate_policy() {
+        let base = staged_pair("fast", "full");
+        assert!(base.gate_policy_matches(&base));
+        assert!(base.gate_policy_matches(&staged_pair("fast", "full --slow")));
+        let with_release_resources = staged(
+            "version = 1\n[resources]\nrelease_concurrency = 2\nmax_release_lag = 5\n[[step]]\nname = \"setup\"\nrun = \"setup\"\n[[step]]\nname = \"fast\"\nrun = \"fast\"\nneeds = [\"setup\"]\n[[step]]\nname = \"lint\"\nrun = \"lint\"\n[[step]]\nname = \"full\"\nstage = \"release\"\nrun = \"full\"\nneeds = [\"setup\"]\n",
+        )
+        .unwrap();
+        assert_ne!(with_release_resources.digest, base.digest);
+        assert!(base.gate_policy_matches(&with_release_resources));
+
+        assert!(!base.gate_policy_matches(&staged_pair("fast --quick", "full")));
+        let gate_resources = staged(
+            "version = 1\n[resources]\nrepository_concurrency = 3\n[[step]]\nname = \"setup\"\nrun = \"setup\"\n[[step]]\nname = \"fast\"\nrun = \"fast\"\nneeds = [\"setup\"]\n[[step]]\nname = \"lint\"\nrun = \"lint\"\n[[step]]\nname = \"full\"\nstage = \"release\"\nrun = \"full\"\nneeds = [\"setup\"]\n",
+        )
+        .unwrap();
+        assert!(!base.gate_policy_matches(&gate_resources));
+        let opt_out = staged(
+            "version = 1\n[[step]]\nname = \"setup\"\nrun = \"setup\"\n[[step]]\nname = \"fast\"\nrun = \"fast\"\nneeds = [\"setup\"]\n[[step]]\nname = \"lint\"\nrun = \"lint\"\n",
+        )
+        .unwrap();
+        assert_eq!(opt_out.step_graph_digest, base.step_graph_digest);
+        assert!(
+            !base.gate_policy_matches(&opt_out) && !opt_out.gate_policy_matches(&base),
+            "opting in or out changes how promotions move the refs"
+        );
     }
 
     #[test]

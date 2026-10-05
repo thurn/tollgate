@@ -1086,10 +1086,12 @@ pub async fn run_buildset(
 /// Runs one buildset of `stage`: a gate run executes the gate-stage steps only, and a release
 /// run executes the release-stage steps plus the gate-stage steps they need
 /// ([`EffectiveConfig::run_steps`]). Steps outside the run are not part of the buildset and are
-/// never reported, not even as skipped. `changed_paths` selects steps by their path filters; a
-/// release run passes the union of its whole tested range. The "at least one applicable voting
-/// step" rule applies to gate runs only: a release run whose path filters select no voting step
-/// passes vacuously, because every applicable release-stage voting step passed.
+/// never reported, not even as skipped. `changed_paths` selects steps by their path filters
+/// ([`EffectiveConfig::selected_run_steps`]); a release run passes the union of its whole tested
+/// range and runs only the release-stage steps those filters select plus the prerequisites they
+/// need. The "at least one applicable voting step" rule applies to gate runs only: a release run
+/// whose path filters select no release-stage step passes vacuously without running any
+/// prerequisite, because every applicable release-stage voting step passed.
 pub async fn run_buildset_scheduled(
     config: &EffectiveConfig,
     stage: StepStage,
@@ -1100,15 +1102,8 @@ pub async fn run_buildset_scheduled(
     reusable_steps: HashMap<String, ReusableStepResult>,
 ) -> Result<BuildsetResult, RunnerError> {
     let run_steps = config.run_steps(stage);
-    let applicable = run_steps
-        .iter()
-        .copied()
-        .filter_map(|step| match step.is_applicable(changed_paths) {
-            Ok(true) => Some(Ok(step)),
-            Ok(false) => None,
-            Err(error) => Some(Err(error)),
-        })
-        .collect::<Result<Vec<_>, _>>()
+    let applicable = config
+        .selected_run_steps(stage, changed_paths)
         .map_err(|error| RunnerError::Interrupted(error.to_string()))?;
     let applicable_names = applicable
         .iter()
@@ -1919,6 +1914,57 @@ printf '%s\n' '{"code":"BAD CODE","message":"unsafe","paths":["../escape"]}' > "
         assert!(result.passed);
         assert_eq!(step_names(&result), ["full"]);
         assert!(related.path().join("full-ran").exists());
+    }
+
+    #[tokio::test]
+    async fn release_runs_never_run_prerequisites_of_release_steps_their_range_skips() {
+        let config = EffectiveConfig::parse(
+            "version=1\n[[step]]\nname=\"setup\"\nrun=\"touch setup-ran; exit 1\"\n[[step]]\nname=\"fast\"\nrun=\"true\"\nneeds=[\"setup\"]\n[[step]]\nname=\"full\"\nstage=\"release\"\nrun=\"touch full-ran\"\nneeds=[\"setup\"]\ninclude=[\"src/**\"]\n",
+        )
+        .unwrap();
+
+        let docs_only = tempfile::tempdir().unwrap();
+        let oid = committed_slot(docs_only.path());
+        let result = run_buildset_scheduled(
+            &config,
+            StepStage::Release,
+            slot_execution(docs_only.path(), oid),
+            &["docs/readme.md".into()],
+            CancellationToken::new(),
+            None,
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            result.passed,
+            "a range that selects no release step passes without running its prerequisites"
+        );
+        assert!(result.steps.is_empty(), "{:?}", step_names(&result));
+        assert_eq!(result.skipped, ["setup", "full"]);
+        assert!(!docs_only.path().join("setup-ran").exists());
+
+        let source = tempfile::tempdir().unwrap();
+        let oid = committed_slot(source.path());
+        let result = run_buildset_scheduled(
+            &config,
+            StepStage::Release,
+            slot_execution(source.path(), oid),
+            &["src/lib.rs".into()],
+            CancellationToken::new(),
+            None,
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !result.passed,
+            "a selected release step's failing prerequisite fails the run"
+        );
+        assert_eq!(step_names(&result), ["setup"]);
+        assert_eq!(result.skipped, ["full"]);
+        assert!(source.path().join("setup-ran").exists());
+        assert!(!source.path().join("full-ran").exists());
     }
 
     #[tokio::test]
