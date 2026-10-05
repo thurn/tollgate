@@ -234,6 +234,8 @@ pub struct FrozenStep {
     pub id: StepId,
     pub name: String,
     pub command: FrozenCommand,
+    #[serde(default, skip_serializing_if = "FrozenStepStage::is_gate")]
+    pub stage: FrozenStepStage,
     pub working_directory: String,
     pub needs: Vec<StepId>,
     pub soft_needs: Vec<StepId>,
@@ -246,6 +248,23 @@ pub struct FrozenStep {
     pub memory_bytes: u64,
     pub rss_limit_bytes: Option<u64>,
     pub semaphores: Vec<String>,
+}
+
+/// The validation stage a frozen step was configured in. Gate-stage steps are
+/// omitted from serialized frozen steps, which keeps buildsets frozen before
+/// stages existed byte-identical.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FrozenStepStage {
+    #[default]
+    Gate,
+    Release,
+}
+
+impl FrozenStepStage {
+    pub const fn is_gate(&self) -> bool {
+        matches!(self, Self::Gate)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -323,5 +342,41 @@ impl PassCertificate {
             step_graph_digest,
             engine_epoch,
         ) && self.expected_parent_oid == *observed_master
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frozen_steps_record_release_stage_and_keep_gate_steps_unchanged() {
+        let mut step = FrozenStep {
+            id: StepId::new(),
+            name: "ci".into(),
+            command: FrozenCommand::Argv {
+                argv: vec!["ci".into()],
+            },
+            stage: FrozenStepStage::Gate,
+            working_directory: ".".into(),
+            needs: Vec::new(),
+            soft_needs: Vec::new(),
+            voting: true,
+            final_step: false,
+            reuse_on_retry: false,
+            timeout_ns: 1,
+            cpu_tokens: 0,
+            memory_bytes: 0,
+            rss_limit_bytes: None,
+            semaphores: Vec::new(),
+        };
+        let gate = serde_json::to_value(&step).unwrap();
+        assert!(gate.get("stage").is_none());
+        assert_eq!(serde_json::from_value::<FrozenStep>(gate).unwrap(), step);
+
+        step.stage = FrozenStepStage::Release;
+        let release = serde_json::to_value(&step).unwrap();
+        assert_eq!(release["stage"], "release");
+        assert_eq!(serde_json::from_value::<FrozenStep>(release).unwrap(), step);
     }
 }

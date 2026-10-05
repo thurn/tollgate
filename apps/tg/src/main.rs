@@ -1076,26 +1076,7 @@ async fn run(cli: Cli) -> anyhow::Result<u8> {
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&candidate)?);
             } else {
-                println!(
-                    "Configuration valid\n  digest  {}\n  graph   {}\n  runner  {}",
-                    candidate["digest"].as_str().unwrap_or("?"),
-                    candidate["step_graph_digest"].as_str().unwrap_or("?"),
-                    candidate["runner"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .filter_map(|value| value.as_str())
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                );
-                for step in candidate["steps"].as_array().into_iter().flatten() {
-                    println!(
-                        "  step    {:<18} voting={} timeout={}m",
-                        step["name"].as_str().unwrap_or("?"),
-                        step["voting"].as_bool().unwrap_or(false),
-                        step["timeout_ns"].as_u64().unwrap_or(0) / 60_000_000_000
-                    );
-                }
+                print!("{}", render_configuration(&candidate));
             }
         }
         TopCommand::Config(ConfigCommand::Apply) => {
@@ -2669,6 +2650,49 @@ fn format_bytes(bytes: u64) -> String {
     format!("{:.1} GiB", bytes as f64 / GIB)
 }
 
+/// Human-readable `tg config validate` and `tg config explain` output for a
+/// serialized effective configuration. Defaulted fields that the effective
+/// JSON omits are shown with their effective values.
+fn render_configuration(candidate: &serde_json::Value) -> String {
+    let mut output = format!(
+        "Configuration valid\n  digest         {}\n  gate graph     {}\n  release graph  {}\n  runner         {}\n  sync master    {}\n  release runs   concurrency={} max_lag={}\n",
+        candidate["digest"].as_str().unwrap_or("?"),
+        candidate["step_graph_digest"].as_str().unwrap_or("?"),
+        candidate["release_step_graph_digest"]
+            .as_str()
+            .unwrap_or("none"),
+        candidate["runner"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|value| value.as_str())
+            .collect::<Vec<_>>()
+            .join(" "),
+        match &candidate["sync_user_master"] {
+            serde_json::Value::String(target) => target.as_str(),
+            serde_json::Value::Bool(false) => "disabled",
+            _ => "staging",
+        },
+        candidate["resources"]["release_concurrency"]
+            .as_u64()
+            .unwrap_or(1),
+        match candidate["resources"]["max_release_lag"].as_u64() {
+            None | Some(0) => "unlimited".to_string(),
+            Some(lag) => lag.to_string(),
+        },
+    );
+    for step in candidate["steps"].as_array().into_iter().flatten() {
+        output.push_str(&format!(
+            "  step           {:<18} stage={} voting={} timeout={}m\n",
+            step["name"].as_str().unwrap_or("?"),
+            step["stage"].as_str().unwrap_or("gate"),
+            step["voting"].as_bool().unwrap_or(false),
+            step["timeout_ns"].as_u64().unwrap_or(0) / 60_000_000_000
+        ));
+    }
+    output
+}
+
 fn print_value(
     value: serde_json::Value,
     json: bool,
@@ -3324,5 +3348,40 @@ mod tests {
         );
         status.item.state = tollgate_domain::QueueItemState::CheckFailed;
         assert_eq!(diagnostic_replay_unavailable(&status), None);
+    }
+
+    #[test]
+    fn configuration_explain_prints_each_step_stage() {
+        let rendered = render_configuration(&serde_json::json!({
+            "digest": "config-digest",
+            "step_graph_digest": "gate-digest",
+            "release_step_graph_digest": "release-digest",
+            "runner": ["/bin/sh", "-c"],
+            "sync_user_master": "release",
+            "resources": { "max_release_lag": 3 },
+            "steps": [
+                { "name": "fast", "voting": true, "timeout_ns": 600_000_000_000u64 },
+                { "name": "full", "stage": "release", "voting": true, "timeout_ns": 3_600_000_000_000u64 }
+            ]
+        }));
+        let step_line = |name: &str| {
+            rendered
+                .lines()
+                .find(|line| line.split_whitespace().nth(1) == Some(name))
+                .unwrap()
+                .to_owned()
+        };
+        assert!(step_line("fast").contains("stage=gate"), "{rendered}");
+        assert!(step_line("full").contains("stage=release"), "{rendered}");
+        assert!(rendered.contains("release-digest"), "{rendered}");
+        assert!(rendered.contains("concurrency=1 max_lag=3"), "{rendered}");
+
+        let defaulted = render_configuration(&serde_json::json!({
+            "sync_user_master": false,
+            "resources": {},
+            "steps": []
+        }));
+        assert!(defaulted.contains("disabled"), "{defaulted}");
+        assert!(defaulted.contains("max_lag=unlimited"), "{defaulted}");
     }
 }

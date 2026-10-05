@@ -7,7 +7,11 @@
   "required": ["version"],
   "properties": {
     "version": { "const": 1 },
-    "sync_user_master": { "type": "boolean", "default": true },
+    "sync_user_master": {
+      "oneOf": [{ "type": "boolean" }, { "enum": ["staging", "release"] }],
+      "default": "staging",
+      "description": "Which Tollgate ref user-owned local master follows; true is an alias for \"staging\" and false disables synchronization."
+    },
     "runner": { "$ref": "#/$defs/argv" },
     "allow_no_job": { "type": "boolean", "default": false },
     "allow_concurrent_roots": { "type": "boolean", "default": false },
@@ -21,7 +25,9 @@
         "scheduler_weight": { "type": "integer", "minimum": 1, "maximum": 100, "default": 1 },
         "volume_warning_bytes": { "type": "integer", "exclusiveMinimum": 1073741824, "default": 16106127360 },
         "volume_critical_bytes": { "type": "integer", "minimum": 1073741824, "default": 10737418240 },
-        "volume_emergency_bytes": { "type": "integer", "minimum": 1, "default": 536870912 }
+        "volume_emergency_bytes": { "type": "integer", "minimum": 1, "default": 536870912 },
+        "release_concurrency": { "type": "integer", "minimum": 1, "maximum": 64, "default": 1 },
+        "max_release_lag": { "type": "integer", "minimum": 0, "maximum": 4294967295, "default": 0, "description": "0 means unlimited." }
       }
     },
     "remote": {
@@ -73,12 +79,14 @@
       "allOf": [{ "if": { "properties": { "reuse_on_retry": { "const": true } }, "required": ["reuse_on_retry"] }, "then": { "properties": { "final": { "const": false }, "artifact": { "maxItems": 0 } } } }],
       "properties": {
         "name": { "$ref": "#/$defs/name" }, "run": { "type": "string", "minLength": 1 }, "argv": { "$ref": "#/$defs/argv" },
+        "stage": { "enum": ["gate", "release"], "default": "gate" },
         "working_directory": { "$ref": "#/$defs/relativePath" }, "needs": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/name" } },
         "soft_needs": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/name" } }, "timeout": { "type": "string", "pattern": "^[0-9]+[smhd]$", "default": "60m" },
         "voting": { "type": "boolean", "default": true }, "final": { "type": "boolean", "default": false }, "reuse_on_retry": { "type": "boolean", "default": false }, "cpu_tokens": { "type": "integer", "minimum": 0, "default": 0 },
         "memory_bytes": { "type": "integer", "minimum": 0, "default": 0 }, "rss_limit_bytes": { "type": "integer", "minimum": 1048576 },
         "semaphores": { "type": "array", "uniqueItems": true, "default": [], "items": { "$ref": "#/$defs/name" } },
         "include": { "type": "array", "items": { "type": "string" } }, "exclude": { "type": "array", "items": { "type": "string" } },
+        "include_mode": { "enum": ["any", "all"], "default": "any" }, "exclude_mode": { "enum": ["any", "all"], "default": "any" },
         "environment": { "type": "object", "additionalProperties": { "type": "string" }, "propertyNames": { "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" } },
         "remove_environment": { "type": "array", "uniqueItems": true, "items": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" } },
         "artifact": { "type": "array", "items": { "$ref": "#/$defs/artifact" } }

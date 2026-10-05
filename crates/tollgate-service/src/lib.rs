@@ -4752,7 +4752,7 @@ impl TollgateService {
                         })
                     });
                     if matches_push {
-                        if runtime.data.lock().config.sync_user_master {
+                        if runtime.data.lock().config.sync_user_master.is_enabled() {
                             self.sync_user_master_after_promotion(
                                 runtime,
                                 Some(item.id),
@@ -5006,7 +5006,7 @@ impl TollgateService {
             };
             let config = self.configuration_for_generation(runtime, &generation)?;
             let remote_enabled = config.remote.enabled;
-            if config.sync_user_master && !remote_enabled {
+            if config.sync_user_master.is_enabled() && !remote_enabled {
                 self.sync_user_master_after_promotion(
                     runtime,
                     Some(item.id),
@@ -5856,7 +5856,7 @@ impl TollgateService {
         let data = runtime.data.lock();
         Ok(RepositoryDeliveryContext {
             path: data.state.path.clone(),
-            sync_user_master: data.config.sync_user_master,
+            sync_user_master: data.config.sync_user_master.is_enabled(),
         })
     }
 
@@ -8286,7 +8286,7 @@ impl TollgateService {
             .filter(|item| item.state == QueueItemState::PromotedLocalPushPending)
             .cloned()
             .collect::<Vec<_>>();
-        if config.sync_user_master && !pending.is_empty() {
+        if config.sync_user_master.is_enabled() && !pending.is_empty() {
             self.sync_user_master_after_promotion(
                 &runtime,
                 pending.last().map(|item| item.id),
@@ -13206,7 +13206,7 @@ impl TollgateService {
                 .git
                 .compare_and_swap_integration(&observed_master, &certificate.tested_oid)
                 .await?;
-            if config.sync_user_master && !config.remote.enabled {
+            if config.sync_user_master.is_enabled() && !config.remote.enabled {
                 self.sync_user_master_after_promotion(
                     &runtime,
                     Some(item.id),
@@ -13282,7 +13282,7 @@ impl TollgateService {
                             IntentState::ExternalApplied,
                             &serde_json::json!({"remote": certificate.tested_oid}),
                         )?;
-                        if config.sync_user_master {
+                        if config.sync_user_master.is_enabled() {
                             self.sync_user_master_after_promotion(
                                 &runtime,
                                 Some(item.id),
@@ -13450,7 +13450,7 @@ impl TollgateService {
         runtime: &Arc<RepositoryRuntime>,
         actor: Actor,
     ) -> Result<Option<UserMasterSyncOutcome>, ServiceError> {
-        if !runtime.data.lock().config.sync_user_master {
+        if !runtime.data.lock().config.sync_user_master.is_enabled() {
             return Ok(None);
         }
         let Some((item_id, generation_id, tested_oid, replace_tip)) =
@@ -15138,6 +15138,10 @@ fn freeze_steps(buildset: BuildsetId, config: &EffectiveConfig) -> Vec<FrozenSte
                 tollgate_config::EffectiveCommand::Argv { argv } => {
                     FrozenCommand::Argv { argv: argv.clone() }
                 }
+            },
+            stage: match step.stage {
+                tollgate_config::StepStage::Gate => FrozenStepStage::Gate,
+                tollgate_config::StepStage::Release => FrozenStepStage::Release,
             },
             working_directory: step.working_directory.clone(),
             needs: step

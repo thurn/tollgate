@@ -31,8 +31,8 @@ pub enum ConfigError {
 #[serde(deny_unknown_fields)]
 pub struct ConfigFile {
     pub version: u16,
-    #[serde(default = "default_true")]
-    pub sync_user_master: bool,
+    #[serde(default)]
+    pub sync_user_master: SyncUserMaster,
     #[serde(default)]
     pub runner: Option<Vec<String>>,
     #[serde(default)]
@@ -49,7 +49,7 @@ pub struct ConfigFile {
     pub cache: CacheFile,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResourceFile {
     #[serde(default = "default_max_buildsets")]
@@ -68,6 +68,116 @@ pub struct ResourceFile {
     pub volume_critical_bytes: u64,
     #[serde(default = "default_volume_emergency_bytes")]
     pub volume_emergency_bytes: u64,
+    #[serde(default = "default_release_concurrency")]
+    pub release_concurrency: u16,
+    #[serde(default)]
+    pub max_release_lag: u32,
+}
+
+impl Default for ResourceFile {
+    fn default() -> Self {
+        Self {
+            max_buildsets: default_max_buildsets(),
+            cpu_tokens: 0,
+            memory_bytes: 0,
+            repository_concurrency: default_repository_concurrency(),
+            scheduler_weight: default_scheduler_weight(),
+            volume_warning_bytes: default_volume_warning_bytes(),
+            volume_critical_bytes: default_volume_critical_bytes(),
+            volume_emergency_bytes: default_volume_emergency_bytes(),
+            release_concurrency: default_release_concurrency(),
+            max_release_lag: 0,
+        }
+    }
+}
+
+/// Which Tollgate-owned ref user-owned local `master` follows after promotion.
+///
+/// The configuration file accepts `true` (an alias for `"staging"`), `false`,
+/// `"staging"`, or `"release"`. Canonical bytes omit the `"staging"` default
+/// and encode `false` as a boolean, so configurations written before staged
+/// release keep their digests.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SyncUserMaster {
+    #[default]
+    Staging,
+    Release,
+    Disabled,
+}
+
+impl SyncUserMaster {
+    pub const fn is_enabled(self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+
+    const fn is_staging(&self) -> bool {
+        matches!(self, Self::Staging)
+    }
+}
+
+impl Serialize for SyncUserMaster {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Staging => serializer.serialize_str("staging"),
+            Self::Release => serializer.serialize_str("release"),
+            Self::Disabled => serializer.serialize_bool(false),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for SyncUserMaster {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = SyncUserMaster;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("true, false, \"staging\", or \"release\"")
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Self::Value, E> {
+                Ok(if value {
+                    SyncUserMaster::Staging
+                } else {
+                    SyncUserMaster::Disabled
+                })
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                match value {
+                    "staging" => Ok(SyncUserMaster::Staging),
+                    "release" => Ok(SyncUserMaster::Release),
+                    _ => Err(E::invalid_value(serde::de::Unexpected::Str(value), &self)),
+                }
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+/// The validation stage a step belongs to. Gate-stage steps certify a
+/// promotion; release-stage steps certify a release advance.
+#[derive(
+    Clone, Copy, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum StepStage {
+    #[default]
+    Gate,
+    Release,
+}
+
+impl StepStage {
+    pub const fn is_gate(&self) -> bool {
+        matches!(self, Self::Gate)
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Gate => "gate",
+            Self::Release => "release",
+        }
+    }
 }
 
 const fn default_max_buildsets() -> u16 {
@@ -87,6 +197,17 @@ const fn default_volume_critical_bytes() -> u64 {
 }
 const fn default_volume_emergency_bytes() -> u64 {
     512 * 1024 * 1024
+}
+const fn default_release_concurrency() -> u16 {
+    1
+}
+
+fn is_default_release_concurrency(value: &u16) -> bool {
+    *value == default_release_concurrency()
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -151,6 +272,8 @@ pub struct StepFile {
     pub name: String,
     pub run: Option<String>,
     pub argv: Option<Vec<String>>,
+    #[serde(default)]
+    pub stage: StepStage,
     #[serde(default = "root_directory")]
     pub working_directory: String,
     #[serde(default)]
@@ -206,10 +329,6 @@ const fn default_true() -> bool {
     true
 }
 
-fn is_true(value: &bool) -> bool {
-    *value
-}
-
 fn is_false(value: &bool) -> bool {
     !*value
 }
@@ -232,8 +351,8 @@ const fn default_retention_days() -> u16 {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct EffectiveConfig {
     pub version: u16,
-    #[serde(default = "default_true")]
-    pub sync_user_master: bool,
+    #[serde(default)]
+    pub sync_user_master: SyncUserMaster,
     pub runner: Vec<String>,
     pub allow_no_job: bool,
     pub allow_concurrent_roots: bool,
@@ -242,7 +361,14 @@ pub struct EffectiveConfig {
     pub remote: EffectiveRemote,
     pub cache: EffectiveCache,
     pub digest: String,
+    /// Digest of the gate-stage step graph. Gate validation generations freeze
+    /// it, so release-stage steps never contribute to it.
     pub step_graph_digest: String,
+    /// Digest of the steps a release run executes: every release-stage step
+    /// plus the gate-stage steps they transitively need. Absent when the
+    /// configuration has no release-stage steps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_step_graph_digest: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -255,6 +381,15 @@ pub struct EffectiveResources {
     pub volume_warning_bytes: u64,
     pub volume_critical_bytes: u64,
     pub volume_emergency_bytes: u64,
+    #[serde(
+        default = "default_release_concurrency",
+        skip_serializing_if = "is_default_release_concurrency"
+    )]
+    pub release_concurrency: u16,
+    /// Unreleased staging commits tolerated after a failed release run before
+    /// promotion pauses. Zero means unlimited.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub max_release_lag: u32,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -280,6 +415,8 @@ pub struct EffectiveCachePath {
 pub struct EffectiveStep {
     pub name: String,
     pub command: EffectiveCommand,
+    #[serde(default, skip_serializing_if = "StepStage::is_gate")]
+    pub stage: StepStage,
     pub working_directory: String,
     pub needs: Vec<String>,
     pub soft_needs: Vec<String>,
@@ -328,8 +465,8 @@ impl EffectiveConfig {
         #[derive(Serialize)]
         struct Canonical<'a> {
             version: u16,
-            #[serde(skip_serializing_if = "is_true")]
-            sync_user_master: bool,
+            #[serde(skip_serializing_if = "SyncUserMaster::is_staging")]
+            sync_user_master: SyncUserMaster,
             runner: &'a [String],
             allow_no_job: bool,
             allow_concurrent_roots: bool,
@@ -359,8 +496,8 @@ impl EffectiveConfig {
         #[derive(Deserialize)]
         struct Canonical {
             version: u16,
-            #[serde(default = "default_true")]
-            sync_user_master: bool,
+            #[serde(default)]
+            sync_user_master: SyncUserMaster,
             runner: Vec<String>,
             allow_no_job: bool,
             allow_concurrent_roots: bool,
@@ -370,6 +507,7 @@ impl EffectiveConfig {
             cache: EffectiveCache,
         }
         let value: Canonical = serde_json::from_slice(bytes)?;
+        let release_step_graph_digest = release_graph_digest(&value.steps)?;
         Ok(Self {
             version: value.version,
             sync_user_master: value.sync_user_master,
@@ -382,7 +520,20 @@ impl EffectiveConfig {
             cache: value.cache,
             digest,
             step_graph_digest,
+            release_step_graph_digest,
         })
+    }
+
+    /// Steps of one stage, in declaration order.
+    pub fn stage_steps(&self, stage: StepStage) -> impl Iterator<Item = &EffectiveStep> {
+        self.steps.iter().filter(move |step| step.stage == stage)
+    }
+
+    /// Steps a release run executes, in declaration order: every
+    /// release-stage step plus the gate-stage steps they transitively need.
+    /// Empty when the configuration has no release-stage steps.
+    pub fn release_run_steps(&self) -> Vec<&EffectiveStep> {
+        release_run_steps(&self.steps)
     }
 
     pub fn applicable_steps(
@@ -400,6 +551,21 @@ impl EffectiveConfig {
     }
 
     fn from_file(raw: ConfigFile) -> Result<Self, ConfigError> {
+        let config = Self::build(raw)?;
+        if let Some(step) = config.stage_steps(StepStage::Release).next() {
+            return Err(ConfigError::InvalidStep {
+                step: step.name.clone(),
+                message: "stage = \"release\" is not supported by this Tollgate version; \
+                          release-stage validation is not available yet"
+                    .into(),
+            });
+        }
+        Ok(config)
+    }
+
+    /// Parse and validate every stage rule. `from_file` additionally rejects
+    /// release-stage steps, which this version cannot yet execute.
+    fn build(raw: ConfigFile) -> Result<Self, ConfigError> {
         if raw.version != 1 {
             return Err(ConfigError::UnsupportedVersion(raw.version));
         }
@@ -424,6 +590,22 @@ impl EffectiveConfig {
             .step
             .iter()
             .any(|step| !step.needs.is_empty() || !step.soft_needs.is_empty());
+        if !any_explicit_edges
+            && let Some(pair) = raw
+                .step
+                .windows(2)
+                .find(|pair| !pair[0].stage.is_gate() && pair[1].stage.is_gate())
+        {
+            return Err(ConfigError::InvalidStep {
+                step: pair[1].name.clone(),
+                message: format!(
+                    "the implicit declaration-order chain would make this gate-stage step \
+                     depend on release-stage step `{}`; declare gate-stage steps first or \
+                     declare explicit needs",
+                    pair[0].name
+                ),
+            });
+        }
         let mut steps: Vec<EffectiveStep> = Vec::with_capacity(raw.step.len());
         for (index, mut step) in raw.step.into_iter().enumerate() {
             let implicit_needs = if !any_explicit_edges && index > 0 {
@@ -434,7 +616,7 @@ impl EffectiveConfig {
             steps.push(normalize_step(step, implicit_needs)?);
         }
         validate_graph(&steps)?;
-        if !raw.allow_no_job && !steps.iter().any(|step| step.voting) {
+        if !raw.allow_no_job && !steps.iter().any(|step| step.voting && step.stage.is_gate()) {
             return Err(ConfigError::Invalid(
                 "a gate configuration requires at least one voting step".into(),
             ));
@@ -473,6 +655,8 @@ impl EffectiveConfig {
             } else {
                 raw.resources.volume_emergency_bytes
             },
+            release_concurrency: raw.resources.release_concurrency,
+            max_release_lag: raw.resources.max_release_lag,
         };
         validate_resources(&steps, &resources)?;
 
@@ -495,7 +679,8 @@ impl EffectiveConfig {
             name: raw.remote.name,
             branch: raw.remote.branch,
         };
-        let step_graph_digest = graph_digest(&steps)?;
+        let step_graph_digest = graph_digest(steps.iter().filter(|step| step.stage.is_gate()))?;
+        let release_step_graph_digest = release_graph_digest(&steps)?;
         let mut config = Self {
             version: 1,
             sync_user_master: raw.sync_user_master,
@@ -508,6 +693,7 @@ impl EffectiveConfig {
             cache,
             digest: String::new(),
             step_graph_digest,
+            release_step_graph_digest,
         };
         config.digest = blake3::hash(&config.canonical_bytes()?)
             .to_hex()
@@ -649,6 +835,7 @@ fn normalize_step(step: StepFile, needs: Vec<String>) -> Result<EffectiveStep, C
     Ok(EffectiveStep {
         name: step.name,
         command,
+        stage: step.stage,
         working_directory: normalize_relative(&step.working_directory)?,
         needs,
         soft_needs: sorted_unique(step.soft_needs)?,
@@ -692,6 +879,14 @@ fn validate_graph(steps: &[EffectiveStep]) -> Result<(), ConfigError> {
                 return Err(ConfigError::InvalidStep {
                     step: step.name.clone(),
                     message: "a step cannot depend on itself".into(),
+                });
+            }
+            if step.stage.is_gate() && !prerequisite.stage.is_gate() {
+                return Err(ConfigError::InvalidStep {
+                    step: step.name.clone(),
+                    message: format!(
+                        "a gate-stage step cannot depend on release-stage step `{dependency}`"
+                    ),
                 });
             }
             if prerequisite.final_step && !step.final_step {
@@ -741,6 +936,12 @@ fn validate_resources(
     {
         return Err(ConfigError::Invalid(
             "repository_concurrency must be between 1 and max_buildsets".into(),
+        ));
+    }
+    if resources.release_concurrency == 0 || resources.release_concurrency > resources.max_buildsets
+    {
+        return Err(ConfigError::Invalid(
+            "release_concurrency must be between 1 and max_buildsets".into(),
         ));
     }
     if !(1..=100).contains(&resources.scheduler_weight) {
@@ -963,10 +1164,53 @@ fn sorted_names(values: Vec<String>) -> Result<Vec<String>, ConfigError> {
     sorted_unique(values)
 }
 
-fn graph_digest(steps: &[EffectiveStep]) -> Result<String, ConfigError> {
-    Ok(blake3::hash(&serde_json::to_vec(steps)?)
-        .to_hex()
-        .to_string())
+/// Hash a step graph as the JSON array of its steps. Gate-stage steps omit
+/// `stage`, so a configuration without release-stage steps hashes exactly as
+/// its whole step list did before stages existed.
+fn graph_digest<'a>(steps: impl Iterator<Item = &'a EffectiveStep>) -> Result<String, ConfigError> {
+    Ok(
+        blake3::hash(&serde_json::to_vec(&steps.collect::<Vec<_>>())?)
+            .to_hex()
+            .to_string(),
+    )
+}
+
+fn release_graph_digest(steps: &[EffectiveStep]) -> Result<Option<String>, ConfigError> {
+    let run = release_run_steps(steps);
+    if run.is_empty() {
+        return Ok(None);
+    }
+    graph_digest(run.into_iter()).map(Some)
+}
+
+fn release_run_steps(steps: &[EffectiveStep]) -> Vec<&EffectiveStep> {
+    let by_name = steps
+        .iter()
+        .map(|step| (step.name.as_str(), step))
+        .collect::<HashMap<_, _>>();
+    let mut selected = BTreeSet::new();
+    let mut pending = steps
+        .iter()
+        .filter(|step| !step.stage.is_gate())
+        .map(|step| step.name.as_str())
+        .collect::<Vec<_>>();
+    while let Some(name) = pending.pop() {
+        if !selected.insert(name) {
+            continue;
+        }
+        if let Some(step) = by_name.get(name) {
+            pending.extend(
+                step.needs
+                    .iter()
+                    .chain(&step.soft_needs)
+                    .map(String::as_str),
+            );
+        }
+    }
+    steps
+        .iter()
+        .filter(|step| selected.contains(step.name.as_str()))
+        .collect()
 }
 
 #[cfg(test)]
@@ -979,7 +1223,7 @@ mod tests {
             EffectiveConfig::parse("version = 1\n[[step]]\nname = \"ci\"\nrun = \"./ci\"\n")
                 .unwrap();
         assert_eq!(config.runner, ["/bin/sh", "-c"]);
-        assert!(config.sync_user_master);
+        assert_eq!(config.sync_user_master, SyncUserMaster::Staging);
         assert!(
             serde_json::from_slice::<serde_json::Value>(&config.canonical_bytes().unwrap())
                 .unwrap()
@@ -998,7 +1242,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(!config.sync_user_master);
+        assert_eq!(config.sync_user_master, SyncUserMaster::Disabled);
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&config.canonical_bytes().unwrap())
                 .unwrap()
@@ -1026,7 +1270,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(restored.sync_user_master);
+        assert_eq!(restored.sync_user_master, SyncUserMaster::Staging);
     }
 
     #[test]
@@ -1107,5 +1351,288 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    const LEGACY_SINGLE: &str = "version = 1\n[[step]]\nname = \"ci\"\nrun = \"./ci\"\n";
+    const LEGACY_CHAIN: &str = "version = 1\nsync_user_master = false\n[resources]\nrepository_concurrency = 1\n[[step]]\nname = \"build\"\nrun = \"build\"\n[[step]]\nname = \"test\"\nargv = [\"cargo\", \"test\"]\nvoting = false\n[[step]]\nname = \"lint\"\nrun = \"lint\"\nneeds = []\n";
+
+    /// Parse with every stage rule but without the interim rejection of
+    /// release-stage steps.
+    fn staged(input: &str) -> Result<EffectiveConfig, ConfigError> {
+        EffectiveConfig::build(toml::from_str(input)?)
+    }
+
+    fn staged_pair(gate: &str, release: &str) -> EffectiveConfig {
+        staged(&format!(
+            "version = 1\n[[step]]\nname = \"setup\"\nrun = \"setup\"\n[[step]]\nname = \"fast\"\nrun = \"{gate}\"\nneeds = [\"setup\"]\n[[step]]\nname = \"lint\"\nrun = \"lint\"\n[[step]]\nname = \"full\"\nstage = \"release\"\nrun = \"{release}\"\nneeds = [\"setup\"]\n"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn configurations_without_stages_keep_their_pre_stage_digests() {
+        let single = EffectiveConfig::parse(LEGACY_SINGLE).unwrap();
+        assert_eq!(
+            single.digest,
+            "0dc5c49a2823952c1b9cd6f14cc48d6cebe06764a2c9b3caa2d4d01cb7fdaf9e"
+        );
+        assert_eq!(
+            single.step_graph_digest,
+            "45ad637f7d3252e4a5d66498dc10f9d3d4f6c309c748419a936d0b7cc211646a"
+        );
+        assert_eq!(single.release_step_graph_digest, None);
+        let chain = EffectiveConfig::parse(LEGACY_CHAIN).unwrap();
+        assert_eq!(
+            chain.digest,
+            "9d509518b6feb090fc896a940f05515784c458493a7767540547516478253006"
+        );
+        assert_eq!(
+            chain.step_graph_digest,
+            "fa61fb5aabb4d9b2b25d941edc1e82de3848b9fc69b54fc9e5c011107a4b2f70"
+        );
+
+        let explicit_defaults = EffectiveConfig::parse(
+            "version = 1\nsync_user_master = true\n[resources]\nrelease_concurrency = 1\nmax_release_lag = 0\n[[step]]\nname = \"ci\"\nrun = \"./ci\"\nstage = \"gate\"\n",
+        )
+        .unwrap();
+        assert_eq!(explicit_defaults.digest, single.digest);
+        assert_eq!(
+            explicit_defaults.step_graph_digest,
+            single.step_graph_digest
+        );
+    }
+
+    #[test]
+    fn sync_user_master_accepts_booleans_and_ref_names() {
+        let parse = |value: &str| {
+            EffectiveConfig::parse(&format!(
+                "version = 1\nsync_user_master = {value}\n[[step]]\nname = \"ci\"\nrun = \"./ci\"\n"
+            ))
+        };
+        let defaulted = EffectiveConfig::parse(LEGACY_SINGLE).unwrap();
+        assert_eq!(defaulted.sync_user_master, SyncUserMaster::Staging);
+        for (value, expected) in [
+            ("true", SyncUserMaster::Staging),
+            ("\"staging\"", SyncUserMaster::Staging),
+            ("\"release\"", SyncUserMaster::Release),
+            ("false", SyncUserMaster::Disabled),
+        ] {
+            let config = parse(value).unwrap();
+            assert_eq!(config.sync_user_master, expected, "{value}");
+            assert_eq!(
+                config.sync_user_master.is_enabled(),
+                expected != SyncUserMaster::Disabled
+            );
+            assert_eq!(
+                config.digest == defaulted.digest,
+                expected == SyncUserMaster::Staging,
+                "{value}"
+            );
+            let restored = EffectiveConfig::restore_canonical(
+                &config.canonical_bytes().unwrap(),
+                config.digest.clone(),
+                config.step_graph_digest.clone(),
+            )
+            .unwrap();
+            assert_eq!(restored, config, "{value}");
+        }
+        let release: serde_json::Value =
+            serde_json::from_slice(&parse("\"release\"").unwrap().canonical_bytes().unwrap())
+                .unwrap();
+        assert_eq!(release["sync_user_master"], "release");
+        assert!(parse("\"master\"").is_err());
+        assert!(parse("1").is_err());
+    }
+
+    #[test]
+    fn release_resources_default_validate_and_contribute_when_set() {
+        let defaulted = EffectiveConfig::parse(LEGACY_SINGLE).unwrap();
+        assert_eq!(defaulted.resources.release_concurrency, 1);
+        assert_eq!(defaulted.resources.max_release_lag, 0);
+        let with = |resources: &str| {
+            EffectiveConfig::parse(&format!(
+                "version = 1\n[resources]\n{resources}\n[[step]]\nname = \"ci\"\nrun = \"./ci\"\n"
+            ))
+        };
+        let concurrent = with("release_concurrency = 2").unwrap();
+        assert_eq!(concurrent.resources.release_concurrency, 2);
+        assert_ne!(concurrent.digest, defaulted.digest);
+        let lagged = with("max_release_lag = 5").unwrap();
+        assert_eq!(lagged.resources.max_release_lag, 5);
+        assert_ne!(lagged.digest, defaulted.digest);
+        for config in [&concurrent, &lagged] {
+            let restored = EffectiveConfig::restore_canonical(
+                &config.canonical_bytes().unwrap(),
+                config.digest.clone(),
+                config.step_graph_digest.clone(),
+            )
+            .unwrap();
+            assert_eq!(&restored, config);
+        }
+        assert!(with("release_concurrency = 0").is_err());
+        assert!(with("max_buildsets = 2\nrelease_concurrency = 3").is_err());
+        assert!(with("max_release_lag = -1").is_err());
+    }
+
+    #[test]
+    fn release_stage_steps_are_rejected_until_release_runs_exist() {
+        let input = "version = 1\n[[step]]\nname = \"fast\"\nrun = \"fast\"\n[[step]]\nname = \"full\"\nstage = \"release\"\nrun = \"full\"\n";
+        let error = EffectiveConfig::parse(input).unwrap_err();
+        assert!(
+            matches!(&error, ConfigError::InvalidStep { step, .. } if step == "full"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("stage"), "{error}");
+        let config = staged(input).unwrap();
+        assert_eq!(config.steps[1].stage, StepStage::Release);
+        assert_eq!(config.steps[1].needs, ["fast"]);
+        assert!(
+            EffectiveConfig::parse(
+                "version = 1\n[[step]]\nname = \"ci\"\nrun = \"ci\"\nstage = \"nightly\"\n"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn gate_steps_cannot_depend_on_release_steps() {
+        for edge in ["needs", "soft_needs"] {
+            let input = format!(
+                "version = 1\n[[step]]\nname = \"full\"\nstage = \"release\"\nrun = \"full\"\n[[step]]\nname = \"fast\"\nrun = \"fast\"\n{edge} = [\"full\"]\n"
+            );
+            let error = staged(&input).unwrap_err();
+            assert!(
+                matches!(&error, ConfigError::InvalidStep { step, .. } if step == "fast"),
+                "{edge}: {error}"
+            );
+            assert!(EffectiveConfig::parse(&input).is_err());
+        }
+        assert!(
+            staged(
+                "version = 1\n[[step]]\nname = \"full\"\nstage = \"release\"\nrun = \"full\"\n[[step]]\nname = \"fast\"\nrun = \"fast\"\n"
+            )
+            .is_err(),
+            "an implicit chain from a release step into a gate step is rejected"
+        );
+        let release_needs_gate = staged(
+            "version = 1\n[[step]]\nname = \"fast\"\nrun = \"fast\"\n[[step]]\nname = \"full\"\nstage = \"release\"\nrun = \"full\"\nsoft_needs = [\"fast\"]\n",
+        )
+        .unwrap();
+        assert_eq!(release_needs_gate.steps[1].soft_needs, ["fast"]);
+    }
+
+    #[test]
+    fn the_voting_step_requirement_applies_to_the_gate_stage() {
+        let error = staged(
+            "version = 1\n[[step]]\nname = \"fast\"\nrun = \"fast\"\nvoting = false\n[[step]]\nname = \"full\"\nstage = \"release\"\nrun = \"full\"\n",
+        )
+        .unwrap_err();
+        assert!(matches!(error, ConfigError::Invalid(_)), "{error}");
+        assert!(
+            staged(
+                "version = 1\n[[step]]\nname = \"fast\"\nrun = \"fast\"\n[[step]]\nname = \"full\"\nstage = \"release\"\nrun = \"full\"\nvoting = false\n"
+            )
+            .is_ok()
+        );
+        assert!(
+            staged(
+                "version = 1\nallow_no_job = true\n[[step]]\nname = \"full\"\nstage = \"release\"\nrun = \"full\"\n"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn stage_digests_are_independent() {
+        let base = staged_pair("fast", "full");
+        let release_digest = base.release_step_graph_digest.clone().unwrap();
+
+        let release_edit = staged_pair("fast", "full --slow");
+        assert_eq!(release_edit.step_graph_digest, base.step_graph_digest);
+        assert_ne!(
+            release_edit.release_step_graph_digest.as_deref(),
+            Some(release_digest.as_str())
+        );
+
+        let gate_edit = staged_pair("fast --quick", "full");
+        assert_ne!(gate_edit.step_graph_digest, base.step_graph_digest);
+        assert_eq!(
+            gate_edit.release_step_graph_digest.as_deref(),
+            Some(release_digest.as_str()),
+            "a gate step outside the release run does not affect the release digest"
+        );
+
+        let without_release = staged(
+            "version = 1\n[[step]]\nname = \"setup\"\nrun = \"setup\"\n[[step]]\nname = \"fast\"\nrun = \"fast\"\nneeds = [\"setup\"]\n[[step]]\nname = \"lint\"\nrun = \"lint\"\n",
+        )
+        .unwrap();
+        assert_eq!(base.step_graph_digest, without_release.step_graph_digest);
+        assert_eq!(without_release.release_step_graph_digest, None);
+    }
+
+    #[test]
+    fn release_runs_include_their_transitive_gate_prerequisites() {
+        let config = staged(
+            "version = 1\n[[step]]\nname = \"install\"\nrun = \"install\"\n[[step]]\nname = \"build\"\nrun = \"build\"\nneeds = [\"install\"]\n[[step]]\nname = \"lint\"\nrun = \"lint\"\n[[step]]\nname = \"full\"\nstage = \"release\"\nrun = \"full\"\nsoft_needs = [\"build\"]\n[[step]]\nname = \"e2e\"\nstage = \"release\"\nrun = \"e2e\"\nneeds = [\"full\"]\n",
+        )
+        .unwrap();
+        let names = |steps: Vec<&EffectiveStep>| {
+            steps
+                .into_iter()
+                .map(|step| step.name.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            names(config.release_run_steps()),
+            ["install", "build", "full", "e2e"]
+        );
+        assert_eq!(
+            names(config.stage_steps(StepStage::Gate).collect()),
+            ["install", "build", "lint"]
+        );
+
+        let install_edit = staged(
+            &"version = 1\n[[step]]\nname = \"install\"\nrun = \"install\"\n[[step]]\nname = \"build\"\nrun = \"build\"\nneeds = [\"install\"]\n[[step]]\nname = \"lint\"\nrun = \"lint\"\n[[step]]\nname = \"full\"\nstage = \"release\"\nrun = \"full\"\nsoft_needs = [\"build\"]\n[[step]]\nname = \"e2e\"\nstage = \"release\"\nrun = \"e2e\"\nneeds = [\"full\"]\n"
+                .replacen("run = \"install\"", "run = \"install --frozen\"", 1),
+        )
+        .unwrap();
+        assert_ne!(
+            install_edit.release_step_graph_digest, config.release_step_graph_digest,
+            "a gate step the release run reruns is part of the release digest"
+        );
+
+        let restored = EffectiveConfig::restore_canonical(
+            &config.canonical_bytes().unwrap(),
+            config.digest.clone(),
+            config.step_graph_digest.clone(),
+        )
+        .unwrap();
+        assert_eq!(restored, config);
+    }
+
+    #[test]
+    fn schema_declares_the_staged_release_keys() {
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../../../schemas/config-v1.schema.json")).unwrap();
+        let sync = &schema["properties"]["sync_user_master"];
+        assert_eq!(sync["default"], "staging");
+        let accepted = sync["oneOf"].as_array().unwrap();
+        assert!(accepted.iter().any(|entry| entry["type"] == "boolean"));
+        assert!(
+            accepted
+                .iter()
+                .any(|entry| { entry["enum"] == serde_json::json!(["staging", "release"]) })
+        );
+        let resources = &schema["properties"]["resources"]["properties"];
+        assert_eq!(
+            resources["release_concurrency"]["default"],
+            u64::from(default_release_concurrency())
+        );
+        assert_eq!(resources["release_concurrency"]["minimum"], 1);
+        assert_eq!(resources["max_release_lag"]["default"], 0);
+        assert_eq!(resources["max_release_lag"]["minimum"], 0);
+        let stage = &schema["$defs"]["step"]["properties"]["stage"];
+        assert_eq!(stage["enum"], serde_json::json!(["gate", "release"]));
+        assert_eq!(stage["default"], StepStage::default().as_str());
     }
 }
