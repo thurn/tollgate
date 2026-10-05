@@ -18,7 +18,7 @@ use tollgate_domain::{BuildsetId, CleanupPolicy, CommandId, QueueItemId, Reposit
 use tollgate_ipc::{
     Frame, FrameCodec, FrameKind, Handshake, HandshakeAck, IpcCommand, IpcResponse,
     MAX_CONTROL_PAYLOAD, MAX_LOG_PAYLOAD, PROTOCOL_VERSION, ProtocolError, StructuredError,
-    acquire_user_authority_lock, bind_user_socket, verify_peer_uid,
+    UserSocketListener, acquire_user_authority_lock, bind_user_socket, verify_peer_uid,
 };
 use tollgate_service::{
     AppSnapshot, ApproveResult, CandidateAuthorizationResult, DoctorReport, EnvironmentView,
@@ -653,17 +653,11 @@ pub fn run() {
         .to_owned();
     let _authority = acquire_user_authority_lock(&support_root.join("app-authority.lock"))
         .expect("another Tollgate app authority is already active");
-    // Repositories activate in the background, so the IPC socket binds before any repository
-    // work and answers status and doctor while activation runs.
-    let service = tauri::async_runtime::block_on(TollgateService::start_default())
-        .expect("Tollgate service initialization failed");
-    let ipc_service = service.clone();
-    let ipc_path = support_root.join("tollgate.sock");
-    tauri::async_runtime::spawn(async move {
-        if let Err(error) = serve_ipc(ipc_service, ipc_path).await {
-            eprintln!("Tollgate IPC server stopped: {error}");
-        }
-    });
+    let (service, _ipc_server) = tauri::async_runtime::block_on(start_serving(
+        &support_root.join("tollgate.sock"),
+        TollgateService::start_default,
+    ))
+    .unwrap_or_else(|error| panic!("Tollgate startup failed: {error}"));
     let notification_path = support_root.join("notification-preferences.json");
     let initial_notification_preferences = if notification_path.exists() {
         match std::fs::read(&notification_path)
@@ -922,10 +916,36 @@ fn cli_destination() -> Option<std::path::PathBuf> {
         .map(|home| home.join(".local/bin/tg"))
 }
 
-async fn serve_ipc(service: Service, path: std::path::PathBuf) -> Result<(), String> {
-    let listener = bind_user_socket(&path)
+/// Binds the IPC socket, then starts the service and serves the socket. Startup fails before any
+/// repository work when the socket cannot bind. Repositories activate in the background, so the
+/// bound socket answers status and doctor while activation runs.
+async fn start_serving<Start, Started>(
+    socket: &std::path::Path,
+    start: Start,
+) -> Result<(Service, tokio::task::JoinHandle<Result<(), String>>), String>
+where
+    Start: FnOnce() -> Started,
+    Started: std::future::Future<Output = Result<Service, ServiceError>>,
+{
+    let listener = bind_user_socket(socket)
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| format!("IPC socket {} did not bind: {error}", socket.display()))?;
+    let service = start()
+        .await
+        .map_err(|error| format!("service initialization failed: {error}"))?;
+    let server = tokio::spawn(serve_ipc(service.clone(), listener));
+    Ok((service, server))
+}
+
+async fn serve_ipc(service: Service, listener: UserSocketListener) -> Result<(), String> {
+    let result = accept_ipc(service, listener).await;
+    if let Err(error) = &result {
+        eprintln!("Tollgate IPC server stopped: {error}");
+    }
+    result
+}
+
+async fn accept_ipc(service: Service, listener: UserSocketListener) -> Result<(), String> {
     loop {
         let (stream, _) = listener.accept().await.map_err(|error| error.to_string())?;
         if let Err(error) = verify_peer_uid(&stream) {
@@ -1799,6 +1819,56 @@ mod startup_ipc_tests {
         serde_json::from_value(response.result.unwrap()).unwrap()
     }
 
+    #[tokio::test]
+    async fn startup_binds_the_socket_before_any_repository_activation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let support = temporary.path().join("support");
+        let repository = committed_repository(temporary.path(), "repository");
+        let repository_id = TollgateService::open(support.clone())
+            .await
+            .unwrap()
+            .initialize_repository_with_options(&repository, Some("true".into()), false)
+            .await
+            .unwrap()
+            .state
+            .id;
+        let socket = support.join("tollgate.sock");
+
+        // The service starts, and its repositories begin activating, only after the bind.
+        let probe = ActivationProbe::default();
+        probe.hold(repository_id);
+        let start = {
+            let (socket, support, probe) = (socket.clone(), support.clone(), probe.clone());
+            move || async move {
+                assert!(
+                    tokio::net::UnixStream::connect(&socket).await.is_ok(),
+                    "the socket must accept connections before the service starts"
+                );
+                TollgateService::start_with_probe(support, probe).await
+            }
+        };
+        let (service, server) = start_serving(&socket, start).await.unwrap();
+        probe.release(repository_id);
+        service.wait_for_activations().await.unwrap();
+        server.abort();
+        let _ = server.await;
+        drop(service);
+
+        // A path the app cannot bind fails startup without starting the service.
+        let _ = std::fs::remove_file(&socket);
+        std::fs::write(&socket, "not a socket").unwrap();
+        let started = Arc::new(AtomicBool::new(false));
+        let start = {
+            let (started, support) = (Arc::clone(&started), support.clone());
+            move || async move {
+                started.store(true, Ordering::SeqCst);
+                TollgateService::start(support).await
+            }
+        };
+        assert!(start_serving(&socket, start).await.is_err());
+        assert!(!started.load(Ordering::SeqCst));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_socket_serves_status_and_doctor_while_a_repository_activation_blocks() {
         let temporary = tempfile::tempdir().unwrap();
@@ -1823,11 +1893,12 @@ mod startup_ipc_tests {
 
         let probe = ActivationProbe::default();
         probe.hold(blocked_id);
-        let service = TollgateService::start_with_probe(support.clone(), probe.clone())
-            .await
-            .unwrap();
         let socket = support.join("tollgate.sock");
-        let server = tokio::spawn(serve_ipc(service.clone(), socket.clone()));
+        let (service, server) = start_serving(&socket, || {
+            TollgateService::start_with_probe(support.clone(), probe.clone())
+        })
+        .await
+        .unwrap();
         let mut client = connect(&socket).await;
 
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);

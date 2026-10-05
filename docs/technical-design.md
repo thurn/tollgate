@@ -723,7 +723,7 @@ File watching exists only to make pending changes visible promptly. Before const
 
 Dock-launched macOS apps do not reliably inherit the Terminal toolchain environment. At app startup, Tollgate resolves the configured login shell and invokes a shell-family adapter in interactive login mode to execute a small bundled environment-dump helper. The helper emits a magic-framed, length-safe environment representation, avoiding assumptions about `env -0` support or startup noise.
 
-v1 supplies adapters for zsh, bash, and fish and permits explicit bootstrap argv for other shells. Bootstrap has a short timeout. A prompt, hang, nonzero exit, invalid frame, or missing shell blocks new CI until the user repairs it or explicitly accepts the clearly labeled minimal fallback.
+v1 supplies adapters for zsh, bash, and fish and permits explicit bootstrap argv for other shells. Bootstrap has a short timeout. A prompt, hang, nonzero exit, invalid frame, or missing shell blocks new CI until the user repairs it or explicitly accepts the clearly labeled minimal fallback. A successful reload lifts that block from every repository, including one still activating: activation rechecks the environment as it publishes the repository.
 
 Each successful bootstrap creates an immutable in-memory environment snapshot with an ID and salted/redacted fingerprint. Values are not stored in SQLite or logs; history stores variable names, snapshot ID, and fingerprint. A buildset freezes one snapshot before its first step, and every step in that buildset uses it. Explicit project variables from the active configuration override captured variables. Diagnostics show effective `PATH`, shell adapter, and executable resolution without revealing values marked sensitive.
 
@@ -1134,7 +1134,7 @@ A diagnostics bundle is local, redacted, previewable, and user-shared only. It c
 
 ### 19.1 Startup reconciliation
 
-The app acquires its single-instance lock, opens/migrates global preferences, and binds its IPC socket before any repository work. It then activates registered repositories independently in the background, at most three at a time. Until a repository finishes every step below it is *activating*: the app snapshot, `tg status`, `tg doctor`, and `tg repo activation` report its phase (`queued`, `opening`, `recovering`, or `resuming`) and current step, and every other command for it returns the retryable `repository-activating` error. Its runtime becomes visible to commands only after recovery completes, so no command observes a half-recovered repository. For each repository it:
+The app acquires its single-instance lock, opens/migrates global preferences, and binds its IPC socket before any repository work; if the socket cannot bind, startup fails before any repository activates. It then activates registered repositories independently in the background, at most three at a time. Until a repository finishes every step below it is *activating*: the app snapshot, `tg status`, `tg doctor`, and `tg repo activation` report its phase (`queued`, `opening`, `recovering`, or `resuming`) and current step, and every other command for it returns the retryable `repository-activating` error. Its runtime becomes visible to commands only after recovery completes, so no command observes a half-recovered repository. For each repository it:
 
 1. Acquires the repository ownership lock.
 2. Opens SQLite, checks integrity, and reads the last clean-shutdown marker.
@@ -1145,7 +1145,7 @@ The app acquires its single-instance lock, opens/migrates global preferences, an
 7. Reloads the trusted local configuration and captures a new shell-environment snapshot.
 8. Blocks or resumes the repository based on proof, never on optimistic inference.
 
-One corrupt/blocked repository does not prevent other registered repositories or the app UI from starting: an activation failure marks only that repository unavailable, with its error and recovery action. Activation never prunes expired artifacts; the maintenance sweep owns artifact retention.
+One corrupt/blocked repository does not prevent other registered repositories or the app UI from starting: an activation failure marks only that repository unavailable, with its error and recovery action. The repository is recorded unavailable before it stops being activating, so every snapshot and registry save lists it in one of the two states. Activation never prunes expired artifacts; the maintenance sweep owns artifact retention.
 
 Intent reconciliation uses this evidence matrix:
 

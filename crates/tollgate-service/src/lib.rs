@@ -909,15 +909,62 @@ enum ActivationProbeAction {
 }
 
 /// Test seam that pauses or fails a repository's activation once its runtime exists and before
-/// recovery starts. Production startup uses an empty probe, which never waits.
+/// recovery starts, holds a failed activation once it is recorded unavailable, and replaces the
+/// login-shell environment capture. Production startup uses an empty probe, which never waits and
+/// captures the real login shell.
 #[doc(hidden)]
 #[derive(Clone, Default)]
 pub struct ActivationProbe {
     actions: Arc<Mutex<HashMap<RepositoryId, ActivationProbeAction>>>,
+    settled_holds: Arc<Mutex<HashSet<RepositoryId>>>,
+    login_shell: Arc<Mutex<Option<Result<(), String>>>>,
     changed: Arc<Notify>,
 }
 
 impl ActivationProbe {
+    /// Holds a failed activation of `repository_id` after the failure is recorded and before its
+    /// activation task returns.
+    pub fn hold_failure(&self, repository_id: RepositoryId) {
+        self.settled_holds.lock().insert(repository_id);
+        self.changed.notify_waiters();
+    }
+
+    pub fn release_failure(&self, repository_id: RepositoryId) {
+        self.settled_holds.lock().remove(&repository_id);
+        self.changed.notify_waiters();
+    }
+
+    /// Makes every login-shell environment capture fail with `message`.
+    pub fn fail_login_shell(&self, message: impl Into<String>) {
+        *self.login_shell.lock() = Some(Err(message.into()));
+    }
+
+    /// Makes every login-shell environment capture succeed with the process environment.
+    pub fn use_process_environment(&self) {
+        *self.login_shell.lock() = Some(Ok(()));
+    }
+
+    async fn capture_login_shell(&self) -> Result<EnvironmentSnapshot, RunnerError> {
+        let configured = self.login_shell.lock().clone();
+        match configured {
+            None => EnvironmentSnapshot::capture_login_shell().await,
+            Some(Ok(())) => Ok(EnvironmentSnapshot::capture()),
+            Some(Err(message)) => Err(RunnerError::Environment(message)),
+        }
+    }
+
+    async fn failed(&self, repository_id: RepositoryId) {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if !self.settled_holds.lock().contains(&repository_id) {
+                return;
+            }
+            changed.await;
+        }
+    }
+
     pub fn hold(&self, repository_id: RepositoryId) {
         self.actions
             .lock()
@@ -1486,14 +1533,13 @@ impl TollgateService {
         activation_probe: ActivationProbe,
     ) -> Result<Arc<Self>, ServiceError> {
         tokio::fs::create_dir_all(&support_root).await?;
-        let (environment, environment_error) =
-            match EnvironmentSnapshot::capture_login_shell().await {
-                Ok(environment) => (environment, None),
-                Err(error) => {
-                    eprintln!("Tollgate login-shell capture failed: {error}");
-                    (EnvironmentSnapshot::capture(), Some(error.to_string()))
-                }
-            };
+        let (environment, environment_error) = match activation_probe.capture_login_shell().await {
+            Ok(environment) => (environment, None),
+            Err(error) => {
+                eprintln!("Tollgate login-shell capture failed: {error}");
+                (EnvironmentSnapshot::capture(), Some(error.to_string()))
+            }
+        };
         let global_command_path = support_root.join("global-command-results.json");
         let global_commands = if global_command_path.exists() {
             let bytes = tokio::fs::read(&global_command_path).await?;
@@ -1610,31 +1656,20 @@ impl TollgateService {
 
     async fn activate_registered(self: &Arc<Self>, record: RegisteredRepository) {
         let started = Instant::now();
-        match self.activate_existing(&record.path, Some(record.id)).await {
+        match self.activate_existing(&record.path, Some(&record)).await {
             Ok(id) => eprintln!(
                 "Tollgate activated repository {id} at {} in {} ms",
                 record.path.display(),
                 started.elapsed().as_millis()
             ),
             Err(error) => {
-                self.activations.write().await.remove(&record.id);
-                {
-                    let mut unavailable = self.unavailable.write().await;
-                    unavailable.retain(|entry| entry.id != record.id);
-                    unavailable.push(UnavailableRepository {
-                        id: record.id,
-                        name: record.name.clone(),
-                        path: record.path.clone(),
-                        error: error.to_string(),
-                        recovery_action: "Preserve the repository-local tollgate directory, repair the reported condition, then reopen the repository or run Doctor.".into(),
-                    });
-                }
                 eprintln!(
                     "Tollgate could not activate repository {} at {} after {} ms: {error}",
                     record.id,
                     record.path.display(),
                     started.elapsed().as_millis()
                 );
+                self.activation_probe.failed(record.id).await;
             }
         }
     }
@@ -2015,21 +2050,37 @@ impl TollgateService {
         self.repository_snapshot(id).await
     }
 
-    /// Opens, recovers, and publishes one existing repository. `registered` names the activation
-    /// entry created from the registry at startup; a re-registration from `tg init` creates its
+    /// Opens, recovers, and publishes one existing repository. `registered` names the registry
+    /// record whose activation entry startup created; a re-registration from `tg init` creates its
     /// entry once the database reveals the repository ID. Nothing outside this task can resolve
     /// the runtime until recovery has finished and the runtime is published.
+    ///
+    /// A failed startup activation records the repository unavailable before its activation entry
+    /// disappears, under the activation lock. Readers take activations before unavailable
+    /// repositories, so none observes the repository in neither list.
     async fn activate_existing(
         self: &Arc<Self>,
         path: &Path,
-        registered: Option<RepositoryId>,
+        registered: Option<&RegisteredRepository>,
     ) -> Result<RepositoryId, ServiceError> {
-        let mut key = registered;
+        let mut key = registered.map(|record| record.id);
         let result = self.activate_existing_inner(path, &mut key).await;
-        if result.is_err()
-            && let Some(id) = key
-        {
-            self.activations.write().await.remove(&id);
+        if let Err(error) = &result {
+            let mut activations = self.activations.write().await;
+            if let Some(record) = registered {
+                let mut unavailable = self.unavailable.write().await;
+                unavailable.retain(|entry| entry.id != record.id);
+                unavailable.push(UnavailableRepository {
+                    id: record.id,
+                    name: record.name.clone(),
+                    path: record.path.clone(),
+                    error: error.to_string(),
+                    recovery_action: "Preserve the repository-local tollgate directory, repair the reported condition, then reopen the repository or run Doctor.".into(),
+                });
+            }
+            if let Some(id) = key {
+                activations.remove(&id);
+            }
         }
         result
     }
@@ -2203,6 +2254,19 @@ impl TollgateService {
             .await?;
         {
             let mut runtimes = self.runtimes.write().await;
+            // An environment reload that ran during recovery cleared only published runtimes.
+            // It clears the error before it reads the published runtimes, so reading the error
+            // under the publication lock either sees the reload or is seen by it.
+            let environment_blocked = runtime
+                .data
+                .lock()
+                .state
+                .block_reasons
+                .iter()
+                .any(|reason| reason.code == "environment-bootstrap-failed");
+            if environment_blocked && self.environment_error.read().await.is_none() {
+                Self::clear_environment_block(&runtime)?;
+            }
             runtimes.insert(id, Arc::clone(&runtime));
             self.activations.write().await.remove(&id);
         }
@@ -5411,6 +5475,17 @@ impl TollgateService {
         Vec<storage::SlotStorage>,
         Vec<storage::SeedStorage>,
     ) {
+        // An activating repository owns its cache root even though its runtime is unpublished.
+        // Activations are read first: activation publishes a runtime, or records the repository
+        // unavailable, before it removes the activation entry, so every repository appears in at
+        // least one of the three reads.
+        let mut registered = self
+            .activations
+            .read()
+            .await
+            .keys()
+            .copied()
+            .collect::<HashSet<_>>();
         let runtimes = self
             .runtimes
             .read()
@@ -5418,15 +5493,13 @@ impl TollgateService {
             .values()
             .cloned()
             .collect::<Vec<_>>();
-        // An activating repository owns its cache root even though its runtime is unpublished.
-        let mut registered = self
-            .unavailable
-            .read()
-            .await
-            .iter()
-            .map(|repository| repository.id)
-            .collect::<HashSet<_>>();
-        registered.extend(self.activations.read().await.keys().copied());
+        registered.extend(
+            self.unavailable
+                .read()
+                .await
+                .iter()
+                .map(|repository| repository.id),
+        );
         let mut slots = Vec::new();
         let mut seeds = Vec::new();
         for runtime in runtimes {
@@ -13835,7 +13908,7 @@ impl TollgateService {
         {
             return Ok(serde_json::from_value(response)?);
         }
-        let snapshot = EnvironmentSnapshot::capture_login_shell().await?;
+        let snapshot = self.activation_probe.capture_login_shell().await?;
         let view = EnvironmentView {
             snapshot_id: snapshot.id.clone(),
             fingerprint: snapshot.fingerprint.clone(),
@@ -13853,25 +13926,34 @@ impl TollgateService {
             .collect::<Vec<_>>();
         for runtime in runtimes {
             let _mutation = runtime.mutation.lock().await;
-            let state = {
-                let mut data = runtime.data.lock();
-                data.state
-                    .block_reasons
-                    .retain(|reason| reason.code != "environment-bootstrap-failed");
-                if data.state.execution_state == RepositoryExecutionState::Blocked
-                    && data.state.block_reasons.is_empty()
-                {
-                    data.state.execution_state = RepositoryExecutionState::Active;
-                }
-                data.state.clone()
-            };
-            runtime.store.update_repository_state(&state)?;
+            let state = Self::clear_environment_block(&runtime)?;
             if state.execution_state == RepositoryExecutionState::Active {
                 self.spawn_eligible(state.id, &runtime);
             }
         }
         self.complete_global_command(command_id, &view).await?;
         Ok(view)
+    }
+
+    /// Removes the `environment-bootstrap-failed` block reason and persists the result,
+    /// reactivating a repository that it alone blocked.
+    fn clear_environment_block(
+        runtime: &RepositoryRuntime,
+    ) -> Result<RepositoryState, ServiceError> {
+        let state = {
+            let mut data = runtime.data.lock();
+            data.state
+                .block_reasons
+                .retain(|reason| reason.code != "environment-bootstrap-failed");
+            if data.state.execution_state == RepositoryExecutionState::Blocked
+                && data.state.block_reasons.is_empty()
+            {
+                data.state.execution_state = RepositoryExecutionState::Active;
+            }
+            data.state.clone()
+        };
+        runtime.store.update_repository_state(&state)?;
+        Ok(state)
     }
 
     pub async fn shutdown(self: &Arc<Self>) -> Result<(), ServiceError> {
@@ -14560,6 +14642,20 @@ impl TollgateService {
     }
 
     async fn save_registry(&self) -> Result<(), ServiceError> {
+        // Activations are read first: activation publishes a runtime, or records the repository
+        // unavailable, before it removes the activation entry, so a save never drops a repository
+        // that settles while the registry is being read.
+        let activating = self
+            .activations
+            .read()
+            .await
+            .values()
+            .map(|entry| RegisteredRepository {
+                id: entry.view.id,
+                name: entry.view.name.clone(),
+                path: entry.view.path.clone(),
+            })
+            .collect::<Vec<_>>();
         let mut records = {
             let runtimes = self.runtimes.read().await;
             runtimes
@@ -14574,17 +14670,7 @@ impl TollgateService {
                 })
                 .collect::<Vec<_>>()
         };
-        records.extend(
-            self.activations
-                .read()
-                .await
-                .values()
-                .map(|entry| RegisteredRepository {
-                    id: entry.view.id,
-                    name: entry.view.name.clone(),
-                    path: entry.view.path.clone(),
-                }),
-        );
+        records.extend(activating);
         records.extend(
             self.unavailable
                 .read()
@@ -24760,6 +24846,156 @@ run = "true"
         // The failed activation released the repository's ownership lock with its runtime.
         let common_dir = GitRepository::discover(&failing).await.unwrap().common_dir;
         drop(acquire_repository_lock(&common_dir).unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_failed_activation_is_unavailable_once_it_stops_activating() {
+        let temporary = tempfile::tempdir().unwrap();
+        let support = temporary.path().join("support");
+        let failing = committed_repository(temporary.path(), "failing");
+        let failing_id = registered_repositories(&support, &[&failing]).await[0];
+
+        let probe = ActivationProbe::default();
+        probe.fail(failing_id, "injected recovery failure");
+        probe.hold_failure(failing_id);
+        let service = TollgateService::start_with_probe(support.clone(), probe.clone())
+            .await
+            .unwrap();
+        // The failed activation task is held before it returns, so every read below happens
+        // while the failure settles.
+        let snapshot = wait_for_snapshot(&service, "the activation to stop", |snapshot| {
+            !snapshot
+                .activating_repositories
+                .iter()
+                .any(|activation| activation.id == failing_id)
+        })
+        .await;
+        let unavailable = snapshot
+            .unavailable_repositories
+            .iter()
+            .find(|repository| repository.id == failing_id)
+            .expect("a repository that stopped activating must be active or unavailable");
+        assert!(unavailable.error.contains("injected recovery failure"));
+        service.save_registry().await.unwrap();
+        let registry: Vec<RegisteredRepository> =
+            serde_json::from_slice(&std::fs::read(support.join("repositories.json")).unwrap())
+                .unwrap();
+        assert!(registry.iter().any(|record| record.id == failing_id));
+
+        probe.release_failure(failing_id);
+        service.wait_for_activations().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_environment_reload_during_activation_unblocks_the_repository() {
+        let temporary = tempfile::tempdir().unwrap();
+        let support = temporary.path().join("support");
+        let repository = committed_repository(temporary.path(), "repository");
+        let id = registered_repositories(&support, &[&repository]).await[0];
+
+        let probe = ActivationProbe::default();
+        probe.fail_login_shell("injected login-shell failure");
+        probe.hold(id);
+        let service = TollgateService::start_with_probe(support.clone(), probe.clone())
+            .await
+            .unwrap();
+        wait_for_snapshot(&service, "the held repository to recover", |snapshot| {
+            snapshot.activating_repositories.iter().any(|activation| {
+                activation.id == id && activation.phase == ActivationPhase::Recovering
+            })
+        })
+        .await;
+        let runtime = service.activations.read().await[&id]
+            .runtime
+            .clone()
+            .unwrap();
+        let held_state = runtime.store.repository_state().unwrap();
+        assert_eq!(
+            held_state.execution_state,
+            RepositoryExecutionState::Blocked
+        );
+        assert!(
+            held_state
+                .block_reasons
+                .iter()
+                .any(|reason| reason.code == "environment-bootstrap-failed")
+        );
+
+        probe.use_process_environment();
+        service.reload_environment().await.unwrap();
+        probe.release(id);
+        service.wait_for_activations().await.unwrap();
+
+        let state = service.repository_snapshot(id).await.unwrap().state;
+        assert_eq!(state.execution_state, RepositoryExecutionState::Active);
+        assert!(state.block_reasons.is_empty());
+        let durable = runtime.store.repository_state().unwrap();
+        assert_eq!(durable.execution_state, RepositoryExecutionState::Active);
+        assert!(durable.block_reasons.is_empty());
+    }
+
+    #[tokio::test]
+    async fn activations_beyond_the_concurrency_limit_stay_queued() {
+        let temporary = tempfile::tempdir().unwrap();
+        let support = temporary.path().join("support");
+        let repositories = (0..=MAX_CONCURRENT_ACTIVATIONS)
+            .map(|index| committed_repository(temporary.path(), &format!("repository-{index}")))
+            .collect::<Vec<_>>();
+        let ids = registered_repositories(
+            &support,
+            &repositories
+                .iter()
+                .map(PathBuf::as_path)
+                .collect::<Vec<_>>(),
+        )
+        .await;
+
+        let probe = ActivationProbe::default();
+        for id in &ids {
+            probe.hold(*id);
+        }
+        let service = TollgateService::start_with_probe(support.clone(), probe.clone())
+            .await
+            .unwrap();
+        let recovering = |snapshot: &AppSnapshot| {
+            snapshot
+                .activating_repositories
+                .iter()
+                .filter(|activation| activation.phase == ActivationPhase::Recovering)
+                .map(|activation| activation.id)
+                .collect::<Vec<_>>()
+        };
+        let snapshot =
+            wait_for_snapshot(&service, "every slot to hold an activation", |snapshot| {
+                recovering(snapshot).len() == MAX_CONCURRENT_ACTIVATIONS
+            })
+            .await;
+        let held = recovering(&snapshot);
+        let queued = snapshot
+            .activating_repositories
+            .iter()
+            .filter(|activation| !held.contains(&activation.id))
+            .collect::<Vec<_>>();
+        assert_eq!(queued.len(), 1, "{:?}", snapshot.activating_repositories);
+        assert_eq!(queued[0].phase, ActivationPhase::Queued);
+        let queued_id = queued[0].id;
+
+        // Releasing one slot lets the queued activation reach the held recovery.
+        probe.release(held[0]);
+        wait_for_snapshot(
+            &service,
+            "the queued activation to take the slot",
+            |snapshot| recovering(snapshot).contains(&queued_id),
+        )
+        .await;
+        for id in &ids {
+            probe.release(*id);
+        }
+        service.wait_for_activations().await.unwrap();
+        assert_eq!(
+            service.snapshot().await.unwrap().repositories.len(),
+            ids.len()
+        );
     }
 
     #[tokio::test]
