@@ -653,8 +653,17 @@ pub fn run() {
         .to_owned();
     let _authority = acquire_user_authority_lock(&support_root.join("app-authority.lock"))
         .expect("another Tollgate app authority is already active");
-    let service = tauri::async_runtime::block_on(TollgateService::open_default())
+    // Repositories activate in the background, so the IPC socket binds before any repository
+    // work and answers status and doctor while activation runs.
+    let service = tauri::async_runtime::block_on(TollgateService::start_default())
         .expect("Tollgate service initialization failed");
+    let ipc_service = service.clone();
+    let ipc_path = support_root.join("tollgate.sock");
+    tauri::async_runtime::spawn(async move {
+        if let Err(error) = serve_ipc(ipc_service, ipc_path).await {
+            eprintln!("Tollgate IPC server stopped: {error}");
+        }
+    });
     let notification_path = support_root.join("notification-preferences.json");
     let initial_notification_preferences = if notification_path.exists() {
         match std::fs::read(&notification_path)
@@ -688,8 +697,7 @@ pub fn run() {
         .manage(quit.clone())
         .manage(notification_state)
         .setup(|app| {
-            let service = app.state::<Service>().inner().clone();
-            let notifications = service.clone();
+            let notifications = app.state::<Service>().inner().clone();
             let notification_preferences = app
                 .state::<Arc<NotificationPreferencesState>>()
                 .inner()
@@ -698,15 +706,6 @@ pub fn run() {
             tauri::async_runtime::spawn(async move {
                 monitor_failure_notifications(notifications, app_handle, notification_preferences)
                     .await;
-            });
-            let path = ProjectDirs::from("dev", "Tollgate", "Tollgate")
-                .expect("application support directory")
-                .data_dir()
-                .join("tollgate.sock");
-            tauri::async_runtime::spawn(async move {
-                if let Err(error) = serve_ipc(service, path).await {
-                    eprintln!("Tollgate IPC server stopped: {error}");
-                }
             });
             Ok(())
         })
@@ -1045,13 +1044,10 @@ fn ipc_response_frame(
 async fn execute_ipc_command(service: &Service, command: IpcCommand) -> IpcResponse {
     let result: Result<serde_json::Value, String> = async {
         match command {
-            IpcCommand::Snapshot => serde_json::to_value(
-                service
-                    .snapshot()
-                    .await
-                    .map_err(|error| error.to_string())?,
-            )
-            .map_err(|error| error.to_string()),
+            IpcCommand::Snapshot => {
+                serde_json::to_value(service.snapshot().await.map_err(encode_service_error)?)
+                    .map_err(|error| error.to_string())
+            }
             IpcCommand::ItemStatus {
                 repository_id,
                 item_id,
@@ -1059,7 +1055,7 @@ async fn execute_ipc_command(service: &Service, command: IpcCommand) -> IpcRespo
                 service
                     .item_status(repository_id, item_id)
                     .await
-                    .map_err(|error| error.to_string())?,
+                    .map_err(encode_service_error)?,
             )
             .map_err(|error| error.to_string()),
             IpcCommand::ItemDetails {
@@ -1069,14 +1065,14 @@ async fn execute_ipc_command(service: &Service, command: IpcCommand) -> IpcRespo
                 service
                     .item_details_by_id(repository_id, item_id)
                     .await
-                    .map_err(|error| error.to_string())?,
+                    .map_err(encode_service_error)?,
             )
             .map_err(|error| error.to_string()),
             IpcCommand::RepositoryDeliveryContext { repository_id } => serde_json::to_value(
                 service
                     .repository_delivery_context(repository_id)
                     .await
-                    .map_err(|error| error.to_string())?,
+                    .map_err(encode_service_error)?,
             )
             .map_err(|error| error.to_string()),
             IpcCommand::ItemWaitStatus {
@@ -1086,7 +1082,7 @@ async fn execute_ipc_command(service: &Service, command: IpcCommand) -> IpcRespo
                 service
                     .item_wait_status(repository_id, item_id)
                     .await
-                    .map_err(|error| error.to_string())?,
+                    .map_err(encode_service_error)?,
             )
             .map_err(|error| error.to_string()),
             IpcCommand::Initialize {
@@ -1098,7 +1094,7 @@ async fn execute_ipc_command(service: &Service, command: IpcCommand) -> IpcRespo
                 service
                     .initialize_repository_with_policy(path, run, bootstrap, detach_master)
                     .await
-                    .map_err(|error| error.to_string())?,
+                    .map_err(encode_service_error)?,
             )
             .map_err(|error| error.to_string()),
             IpcCommand::Approve {
@@ -1123,7 +1119,7 @@ async fn execute_ipc_command(service: &Service, command: IpcCommand) -> IpcRespo
                         command_id,
                     )
                     .await
-                    .map_err(encode_candidate_submission_error)?,
+                    .map_err(encode_service_error)?,
             )
             .map_err(|error| error.to_string()),
             IpcCommand::Candidate {
@@ -1146,7 +1142,7 @@ async fn execute_ipc_command(service: &Service, command: IpcCommand) -> IpcRespo
                         command_id,
                     )
                     .await
-                    .map_err(encode_candidate_submission_error)?,
+                    .map_err(encode_service_error)?,
             )
             .map_err(|error| error.to_string()),
             IpcCommand::AuthorizeCandidate {
@@ -1158,7 +1154,7 @@ async fn execute_ipc_command(service: &Service, command: IpcCommand) -> IpcRespo
                 service
                     .authorize_candidate(repository_id, item_id, expected_revision, command_id)
                     .await
-                    .map_err(encode_candidate_submission_error)?,
+                    .map_err(encode_service_error)?,
             )
             .map_err(|error| error.to_string()),
             IpcCommand::Check {
@@ -1170,7 +1166,7 @@ async fn execute_ipc_command(service: &Service, command: IpcCommand) -> IpcRespo
                 service
                     .check_from(repository_id, revision, worktree_path, command_id)
                     .await
-                    .map_err(|error| error.to_string())?,
+                    .map_err(encode_service_error)?,
             )
             .map_err(|error| error.to_string()),
             IpcCommand::Diagnose {
@@ -1183,7 +1179,7 @@ async fn execute_ipc_command(service: &Service, command: IpcCommand) -> IpcRespo
                 service
                     .diagnose_failure(repository_id, item_id, replay, verify_repair, command_id)
                     .await
-                    .map_err(|error| error.to_string())?,
+                    .map_err(encode_service_error)?,
             )
             .map_err(|error| error.to_string()),
             IpcCommand::Cancel {
@@ -1195,7 +1191,7 @@ async fn execute_ipc_command(service: &Service, command: IpcCommand) -> IpcRespo
                 let result = service
                     .cancel_command(repository_id, item_id, expected_revision, command_id)
                     .await
-                    .map_err(|error| error.to_string())?;
+                    .map_err(encode_service_error)?;
                 serde_json::to_value(result).map_err(|error| error.to_string())
             }
             IpcCommand::Retry {
@@ -1207,7 +1203,7 @@ async fn execute_ipc_command(service: &Service, command: IpcCommand) -> IpcRespo
                 service
                     .retry(repository_id, item_id, cold, command_id)
                     .await
-                    .map_err(|error| error.to_string())?,
+                    .map_err(encode_service_error)?,
             )
             .map_err(|error| error.to_string()),
             IpcCommand::Reorder {
@@ -1219,7 +1215,7 @@ async fn execute_ipc_command(service: &Service, command: IpcCommand) -> IpcRespo
                 service
                     .reorder_queue(repository_id, selected_ids, expected_revision, command_id)
                     .await
-                    .map_err(|error| error.to_string())?,
+                    .map_err(encode_service_error)?,
             )
             .map_err(|error| error.to_string()),
             IpcCommand::Pull {
@@ -1229,7 +1225,7 @@ async fn execute_ipc_command(service: &Service, command: IpcCommand) -> IpcRespo
                 service
                     .pull(repository_id, command_id)
                     .await
-                    .map_err(|error| error.to_string())?,
+                    .map_err(encode_service_error)?,
             )
             .map_err(|error| error.to_string()),
             IpcCommand::Push {
@@ -1239,7 +1235,7 @@ async fn execute_ipc_command(service: &Service, command: IpcCommand) -> IpcRespo
                 service
                     .push(repository_id, command_id)
                     .await
-                    .map_err(|error| error.to_string())?,
+                    .map_err(encode_service_error)?,
             )
             .map_err(|error| error.to_string()),
             IpcCommand::Reconcile {
@@ -1256,7 +1252,7 @@ async fn execute_ipc_command(service: &Service, command: IpcCommand) -> IpcRespo
                         command_id,
                     )
                     .await
-                    .map_err(|error| error.to_string())?,
+                    .map_err(encode_service_error)?,
             )
             .map_err(|error| error.to_string()),
             IpcCommand::Update {
@@ -1267,7 +1263,7 @@ async fn execute_ipc_command(service: &Service, command: IpcCommand) -> IpcRespo
                 service
                     .update_feature_worktree(repository_id, worktree_path, command_id)
                     .await
-                    .map_err(|error| error.to_string())?,
+                    .map_err(encode_service_error)?,
             )
             .map_err(|error| error.to_string()),
             IpcCommand::WorktreeCreate {
@@ -1279,7 +1275,7 @@ async fn execute_ipc_command(service: &Service, command: IpcCommand) -> IpcRespo
                 service
                     .create_worktree(repository_id, branch, destination, command_id)
                     .await
-                    .map_err(|error| error.to_string())?,
+                    .map_err(encode_service_error)?,
             )
             .map_err(|error| error.to_string()),
             IpcCommand::WorktreeRemove {
@@ -1290,7 +1286,7 @@ async fn execute_ipc_command(service: &Service, command: IpcCommand) -> IpcRespo
                 service
                     .remove_worktree(repository_id, path, command_id)
                     .await
-                    .map_err(|error| error.to_string())?,
+                    .map_err(encode_service_error)?,
             )
             .map_err(|error| error.to_string()),
             IpcCommand::RemoveRepository {
@@ -1300,7 +1296,7 @@ async fn execute_ipc_command(service: &Service, command: IpcCommand) -> IpcRespo
                 service
                     .unregister_repository_command(repository_id, command_id)
                     .await
-                    .map_err(|error| error.to_string())?,
+                    .map_err(encode_service_error)?,
             )
             .map_err(|error| error.to_string()),
             IpcCommand::ApplyConfiguration {
@@ -1310,14 +1306,14 @@ async fn execute_ipc_command(service: &Service, command: IpcCommand) -> IpcRespo
                 service
                     .apply_configuration(repository_id, command_id)
                     .await
-                    .map_err(|error| error.to_string())?,
+                    .map_err(encode_service_error)?,
             )
             .map_err(|error| error.to_string()),
             IpcCommand::ValidateConfiguration { repository_id } => serde_json::to_value(
                 service
                     .validate_configuration(repository_id)
                     .await
-                    .map_err(|error| error.to_string())?,
+                    .map_err(encode_service_error)?,
             )
             .map_err(|error| error.to_string()),
             IpcCommand::RegenerateConfiguration {
@@ -1327,7 +1323,7 @@ async fn execute_ipc_command(service: &Service, command: IpcCommand) -> IpcRespo
                 service
                     .regenerate_configuration(repository_id, command_id)
                     .await
-                    .map_err(|error| error.to_string())?,
+                    .map_err(encode_service_error)?,
             )
             .map_err(|error| error.to_string()),
             IpcCommand::ResetSlot {
@@ -1338,7 +1334,7 @@ async fn execute_ipc_command(service: &Service, command: IpcCommand) -> IpcRespo
                 service
                     .reset_slot(repository_id, slot_id, command_id)
                     .await
-                    .map_err(|error| error.to_string())?,
+                    .map_err(encode_service_error)?,
             )
             .map_err(|error| error.to_string()),
             IpcCommand::SnapshotCache {
@@ -1348,7 +1344,7 @@ async fn execute_ipc_command(service: &Service, command: IpcCommand) -> IpcRespo
                 service
                     .snapshot_cache(repository_id, command_id)
                     .await
-                    .map_err(|error| error.to_string())?,
+                    .map_err(encode_service_error)?,
             )
             .map_err(|error| error.to_string()),
             IpcCommand::PurgeCache {
@@ -1359,21 +1355,21 @@ async fn execute_ipc_command(service: &Service, command: IpcCommand) -> IpcRespo
                 service
                     .purge_cache(repository_id, all_slots, command_id)
                     .await
-                    .map_err(|error| error.to_string())?,
+                    .map_err(encode_service_error)?,
             )
             .map_err(|error| error.to_string()),
             IpcCommand::StorageStatus => serde_json::to_value(
                 service
                     .storage_status()
                     .await
-                    .map_err(|error| error.to_string())?,
+                    .map_err(encode_service_error)?,
             )
             .map_err(|error| error.to_string()),
             IpcCommand::StoragePrune { force, command_id } => serde_json::to_value(
                 service
                     .prune_storage(force, command_id)
                     .await
-                    .map_err(|error| error.to_string())?,
+                    .map_err(encode_service_error)?,
             )
             .map_err(|error| error.to_string()),
             IpcCommand::ArtifactPin {
@@ -1385,7 +1381,7 @@ async fn execute_ipc_command(service: &Service, command: IpcCommand) -> IpcRespo
                 service
                     .set_artifact_pinned(repository_id, artifact_id, pinned, command_id)
                     .await
-                    .map_err(|error| error.to_string())?,
+                    .map_err(encode_service_error)?,
             )
             .map_err(|error| error.to_string()),
             IpcCommand::ArtifactPrune {
@@ -1396,7 +1392,7 @@ async fn execute_ipc_command(service: &Service, command: IpcCommand) -> IpcRespo
                 service
                     .prune_artifact(repository_id, artifact_id, command_id)
                     .await
-                    .map_err(|error| error.to_string())?,
+                    .map_err(encode_service_error)?,
             )
             .map_err(|error| error.to_string()),
             IpcCommand::Artifacts {
@@ -1407,7 +1403,7 @@ async fn execute_ipc_command(service: &Service, command: IpcCommand) -> IpcRespo
                 service
                     .artifacts_page(repository_id, offset, limit)
                     .await
-                    .map_err(|error| error.to_string())?,
+                    .map_err(encode_service_error)?,
             )
             .map_err(|error| error.to_string()),
             IpcCommand::Logs {
@@ -1427,14 +1423,14 @@ async fn execute_ipc_command(service: &Service, command: IpcCommand) -> IpcRespo
                         10_000,
                     )
                     .await
-                    .map_err(|error| error.to_string())?,
+                    .map_err(encode_service_error)?,
             )
             .map_err(|error| error.to_string()),
             IpcCommand::Doctor { repository_id } => serde_json::to_value(
                 service
                     .doctor(repository_id)
                     .await
-                    .map_err(|error| error.to_string())?,
+                    .map_err(encode_service_error)?,
             )
             .map_err(|error| error.to_string()),
             IpcCommand::Pause {
@@ -1444,7 +1440,7 @@ async fn execute_ipc_command(service: &Service, command: IpcCommand) -> IpcRespo
                 let result = service
                     .set_paused_command(repository_id, true, command_id)
                     .await
-                    .map_err(|error| error.to_string())?;
+                    .map_err(encode_service_error)?;
                 serde_json::to_value(result).map_err(|error| error.to_string())
             }
             IpcCommand::Resume {
@@ -1454,14 +1450,14 @@ async fn execute_ipc_command(service: &Service, command: IpcCommand) -> IpcRespo
                 let result = service
                     .set_paused_command(repository_id, false, command_id)
                     .await
-                    .map_err(|error| error.to_string())?;
+                    .map_err(encode_service_error)?;
                 serde_json::to_value(result).map_err(|error| error.to_string())
             }
             IpcCommand::ReloadEnvironment { command_id } => serde_json::to_value(
                 service
                     .reload_environment_command(command_id)
                     .await
-                    .map_err(|error| error.to_string())?,
+                    .map_err(encode_service_error)?,
             )
             .map_err(|error| error.to_string()),
         }
@@ -1492,9 +1488,17 @@ async fn execute_ipc_command(service: &Service, command: IpcCommand) -> IpcRespo
     }
 }
 
-fn encode_candidate_submission_error(error: ServiceError) -> String {
+/// Encodes service errors that carry retry or recovery context as structured IPC errors; every
+/// other error crosses IPC as its message and is classified by `classify_service_error`.
+fn encode_service_error(error: ServiceError) -> String {
     let message = error.to_string();
     let structured = match error {
+        ServiceError::RepositoryActivating(activation) => Some(StructuredError {
+            code: "repository-activating".into(),
+            message: message.clone(),
+            retryable: true,
+            details: serde_json::to_value(&activation).ok(),
+        }),
         ServiceError::StaleQueuePrefix {
             source_parent_oid,
             release_oid,
@@ -1610,7 +1614,7 @@ mod ipc_error_tests {
             GitOid::from_hex("2222222222222222222222222222222222222222").unwrap();
         let current_prefix_oid =
             GitOid::from_hex("3333333333333333333333333333333333333333").unwrap();
-        let encoded = encode_candidate_submission_error(ServiceError::StaleQueuePrefix {
+        let encoded = encode_service_error(ServiceError::StaleQueuePrefix {
             source_parent_oid: source_parent_oid.clone(),
             release_oid: release_oid.clone(),
             queue_revision: 42,
@@ -1648,7 +1652,7 @@ mod ipc_error_tests {
     #[test]
     fn terminal_candidate_error_preserves_state_and_reason() {
         let item_id = QueueItemId::new();
-        let encoded = encode_candidate_submission_error(ServiceError::CandidateTerminal {
+        let encoded = encode_service_error(ServiceError::CandidateTerminal {
             item_id,
             state: tollgate_domain::QueueItemState::MergeConflict,
             reason: "conflict in fixture.txt".into(),
@@ -1676,7 +1680,7 @@ mod ipc_error_tests {
     fn unpromoted_source_error_never_exposes_the_speculative_prefix_as_a_base() {
         let release_oid = GitOid::from_hex("1111111111111111111111111111111111111111").unwrap();
         let ancestor = GitOid::from_hex("2222222222222222222222222222222222222222").unwrap();
-        let encoded = encode_candidate_submission_error(ServiceError::UnpromotedSourceAncestor {
+        let encoded = encode_service_error(ServiceError::UnpromotedSourceAncestor {
             ancestor: ancestor.clone(),
             release_oid: release_oid.clone(),
         });
@@ -1702,5 +1706,205 @@ mod ipc_error_tests {
                 .unwrap()
                 .contains("prefix")
         );
+    }
+}
+
+#[cfg(test)]
+mod startup_ipc_tests {
+    use super::*;
+    use std::path::Path;
+    use tollgate_service::{ActivationPhase, ActivationProbe};
+
+    fn git(directory: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(directory)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn committed_repository(root: &Path, name: &str) -> PathBuf {
+        let repository = root.join(name);
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", "master"]);
+        std::fs::write(repository.join("base.txt"), "base\n").unwrap();
+        git(&repository, &["add", "base.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+        repository
+    }
+
+    async fn connect(path: &Path) -> Framed<tokio::net::UnixStream, FrameCodec> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let stream = loop {
+            match tokio::net::UnixStream::connect(path).await {
+                Ok(stream) => break stream,
+                Err(error) => {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "socket never bound: {error}"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            }
+        };
+        let mut framed = Framed::new(stream, FrameCodec);
+        let correlation = uuid::Uuid::now_v7();
+        let handshake = Handshake {
+            client_instance_id: tollgate_domain::ClientInstanceId::new(),
+            client_version: "test".into(),
+            protocol_min: PROTOCOL_VERSION,
+            protocol_max: PROTOCOL_VERSION,
+            schema_version: 1,
+            max_control_payload: MAX_CONTROL_PAYLOAD as u32,
+            max_log_payload: MAX_LOG_PAYLOAD as u32,
+            supported_frame_kinds: vec![
+                FrameKind::Handshake,
+                FrameKind::HandshakeAck,
+                FrameKind::Request,
+                FrameKind::Response,
+            ],
+        };
+        framed
+            .send(Frame::control(FrameKind::Handshake, correlation, &handshake).unwrap())
+            .await
+            .unwrap();
+        let ack = framed.next().await.unwrap().unwrap();
+        assert_eq!(ack.kind, FrameKind::HandshakeAck);
+        framed
+    }
+
+    async fn request(
+        framed: &mut Framed<tokio::net::UnixStream, FrameCodec>,
+        command: IpcCommand,
+    ) -> IpcResponse {
+        let correlation = uuid::Uuid::now_v7();
+        framed
+            .send(Frame::control(FrameKind::Request, correlation, &command).unwrap())
+            .await
+            .unwrap();
+        let frame = framed.next().await.unwrap().unwrap();
+        assert_eq!(frame.kind, FrameKind::Response);
+        assert_eq!(frame.correlation_id, correlation);
+        frame.decode_json().unwrap()
+    }
+
+    async fn snapshot(framed: &mut Framed<tokio::net::UnixStream, FrameCodec>) -> AppSnapshot {
+        let response = request(framed, IpcCommand::Snapshot).await;
+        assert!(response.ok, "{:?}", response.error);
+        serde_json::from_value(response.result.unwrap()).unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_socket_serves_status_and_doctor_while_a_repository_activation_blocks() {
+        let temporary = tempfile::tempdir().unwrap();
+        let support = temporary.path().join("support");
+        let serving = committed_repository(temporary.path(), "serving");
+        let blocked = committed_repository(temporary.path(), "blocked");
+        let (serving_id, blocked_id) = {
+            let setup = TollgateService::open(support.clone()).await.unwrap();
+            let mut ids = Vec::new();
+            for repository in [&serving, &blocked] {
+                ids.push(
+                    setup
+                        .initialize_repository_with_options(repository, Some("true".into()), false)
+                        .await
+                        .unwrap()
+                        .state
+                        .id,
+                );
+            }
+            (ids[0], ids[1])
+        };
+
+        let probe = ActivationProbe::default();
+        probe.hold(blocked_id);
+        let service = TollgateService::start_with_probe(support.clone(), probe.clone())
+            .await
+            .unwrap();
+        let socket = support.join("tollgate.sock");
+        let server = tokio::spawn(serve_ipc(service.clone(), socket.clone()));
+        let mut client = connect(&socket).await;
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let snapshot = snapshot(&mut client).await;
+            let serving_active = snapshot
+                .repositories
+                .iter()
+                .any(|repository| repository.state.id == serving_id);
+            let blocked_recovering = snapshot.activating_repositories.iter().any(|activation| {
+                activation.id == blocked_id && activation.phase == ActivationPhase::Recovering
+            });
+            if serving_active && blocked_recovering {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "activation never reached the held recovery: {:?}",
+                snapshot.activating_repositories
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        let doctor = request(
+            &mut client,
+            IpcCommand::Doctor {
+                repository_id: blocked_id,
+            },
+        )
+        .await;
+        assert!(doctor.ok, "{:?}", doctor.error);
+        let report: DoctorReport = serde_json::from_value(doctor.result.unwrap()).unwrap();
+        assert!(!report.healthy);
+        assert_eq!(report.activation.unwrap().id, blocked_id);
+        let doctor = request(
+            &mut client,
+            IpcCommand::Doctor {
+                repository_id: serving_id,
+            },
+        )
+        .await;
+        assert!(doctor.ok, "{:?}", doctor.error);
+        let report: DoctorReport = serde_json::from_value(doctor.result.unwrap()).unwrap();
+        assert!(report.activation.is_none());
+
+        let paused = request(
+            &mut client,
+            IpcCommand::Pause {
+                repository_id: blocked_id,
+                command_id: CommandId::new(),
+            },
+        )
+        .await;
+        assert!(!paused.ok);
+        let error = paused.error.unwrap();
+        assert_eq!(error.code, "repository-activating");
+        assert!(error.retryable);
+        assert_eq!(error.details.unwrap()["phase"], "recovering");
+        for command in [
+            IpcCommand::Pause {
+                repository_id: serving_id,
+                command_id: CommandId::new(),
+            },
+            IpcCommand::Resume {
+                repository_id: serving_id,
+                command_id: CommandId::new(),
+            },
+        ] {
+            let response = request(&mut client, command).await;
+            assert!(response.ok, "{:?}", response.error);
+        }
+
+        probe.release(blocked_id);
+        service.wait_for_activations().await.unwrap();
+        let snapshot = snapshot(&mut client).await;
+        assert!(snapshot.activating_repositories.is_empty());
+        assert_eq!(snapshot.repositories.len(), 2);
+        server.abort();
     }
 }

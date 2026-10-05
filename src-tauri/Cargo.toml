@@ -26,5 +26,8 @@ tollgate-ipc = { path = "../crates/tollgate-ipc" }
 tollgate-service = { path = "../crates/tollgate-service" }
 uuid.workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

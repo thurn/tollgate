@@ -31,8 +31,13 @@ git pull --ff-only
 ```
 
 The script installs to `/Applications/Tollgate.app`, updates `~/.local/bin/tg`,
-restarts Tollgate, and verifies the service with `tg --no-launch doctor`. Set
-`TOLLGATE_INSTALL_DIR` to use a different Applications directory.
+and restarts Tollgate. The app binds its socket before activating repositories, so
+the script treats a bound socket plus a passing `tg --no-launch doctor` as healthy.
+It then prints each repository's activation progress (`tg repo activation --wait`)
+until every repository is active or has failed; a failed repository is reported
+with its error and recovery action. Set `TOLLGATE_INSTALL_DIR` to use a different
+Applications directory and `TOLLGATE_ACTIVATION_TIMEOUT` (seconds, default 900) to
+bound the progress wait.
 
 Artifact patterns may contain `{{buildset_id}}`, resolved from Tollgate's execution
 identity rather than the shell environment. For example,

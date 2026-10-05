@@ -855,10 +855,10 @@ impl RepositoryStore {
         retained_path: &Path,
         hash: &str,
         size: u64,
+        expires_at: OffsetDateTime,
     ) -> Result<(), StoreError> {
         let size = i64::try_from(size).map_err(|_| StoreError::ArtifactTooLarge(size))?;
         let created_at = OffsetDateTime::now_utc();
-        let expires_at = created_at + time::Duration::days(30);
         self.connection.lock().execute(
             "INSERT INTO artifacts (artifact_id, buildset_id, step_id, source_path, retained_path, hash, size, retention_state, created_at, expires_at) VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, 'retained', ?7, ?8)",
             params![uuid::Uuid::now_v7().to_string(), buildset_id.to_string(), source_path.to_string_lossy(), retained_path.to_string_lossy(), hash, size, encode_time(created_at), encode_time(expires_at)],

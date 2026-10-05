@@ -101,18 +101,31 @@ mkdir -p "$(dirname -- "$cli_link")"
 ln -sfn "$installed_app/Contents/MacOS/tg" "$cli_link"
 
 echo "Launching Tollgate..."
+launched_at=$(date +%s)
 open "$installed_app"
 
+# The app binds its IPC socket before activating any repository, so a bound socket and a
+# passing doctor mean the service is healthy even while repositories are still activating.
 attempts=0
 startup_timeout=120
 until [ -n "$(installed_pid)" ] && "$cli_link" --no-launch repo list >/dev/null 2>&1; do
   attempts=$((attempts + 1))
   if [ "$attempts" -ge "$startup_timeout" ]; then
-    echo "Tollgate was installed, but it did not become healthy within $startup_timeout seconds." >&2
+    echo "Tollgate was installed, but its socket did not answer within $startup_timeout seconds." >&2
     exit 1
   fi
   sleep 1
 done
+echo "Tollgate socket answered $(($(date +%s) - launched_at))s after launch."
 
 (cd "$authority_checkout" && "$cli_link" --no-launch doctor)
+echo "Tollgate is healthy $(($(date +%s) - launched_at))s after launch: socket bound and doctor passed."
+
+activation_timeout=${TOLLGATE_ACTIVATION_TIMEOUT:-900}
+echo "Repository activation progress:"
+if "$cli_link" --no-launch repo activation --wait --timeout "$activation_timeout"; then
+  echo "Every repository activated $(($(date +%s) - launched_at))s after launch."
+else
+  echo "Warning: some repositories failed to activate or were still activating after ${activation_timeout}s; see the errors and recovery actions above." >&2
+fi
 echo "Installed and running: $installed_app"

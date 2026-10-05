@@ -11,6 +11,7 @@ directories.workspace = true
 futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+time.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tollgate-domain = { path = "../../crates/tollgate-domain" }

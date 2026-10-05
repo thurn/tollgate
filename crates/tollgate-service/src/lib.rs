@@ -89,6 +89,14 @@ pub enum ServiceError {
     NonUtf8Path,
     #[error("repository cannot execute while it is {0:?}")]
     RepositoryUnavailable(RepositoryExecutionState),
+    #[error(
+        "repository {} ({}) is still activating: {} ({}); retry after activation completes",
+        .0.name,
+        .0.id,
+        .0.phase.as_str(),
+        .0.step
+    )]
+    RepositoryActivating(Box<ActivatingRepository>),
     #[error("diagnostic replay cannot start: {0}")]
     DiagnosticReplayUnavailable(String),
     #[error("configuration file is missing; initialize the repository first")]
@@ -154,6 +162,8 @@ pub struct AppSnapshot {
     pub version: String,
     pub generated_at: OffsetDateTime,
     pub repositories: Vec<RepositorySnapshot>,
+    #[serde(default)]
+    pub activating_repositories: Vec<ActivatingRepository>,
     pub unavailable_repositories: Vec<UnavailableRepository>,
     pub environment: EnvironmentView,
 }
@@ -179,6 +189,50 @@ pub struct UnavailableRepository {
     pub error: String,
     pub recovery_action: String,
 }
+
+/// Startup progress of one registered repository. A repository is listed here from the moment the
+/// app reads its registry until its recovery finishes and it is published to commands.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ActivationPhase {
+    /// Waiting for one of the bounded activation slots.
+    Queued,
+    /// Opening the repository, its ownership lock, its database, and its configuration.
+    Opening,
+    /// Reconciling durable intents left by the previous app process.
+    Recovering,
+    /// Resuming promotion of ready work before the repository accepts commands.
+    Resuming,
+}
+
+impl ActivationPhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Opening => "opening",
+            Self::Recovering => "recovering",
+            Self::Resuming => "resuming",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ActivatingRepository {
+    pub id: RepositoryId,
+    pub name: String,
+    pub path: PathBuf,
+    pub phase: ActivationPhase,
+    /// The startup step currently running, such as `integrity-check` or `seed-intents`.
+    pub step: String,
+    pub queued_at: OffsetDateTime,
+    pub phase_started_at: OffsetDateTime,
+}
+
+/// Retention of verified repair patches recorded by `tg diagnose --verify-repair`.
+const REPAIR_ARTIFACT_RETENTION_DAYS: i64 = 30;
+
+/// At most this many repositories open and recover at once during app startup.
+pub const MAX_CONCURRENT_ACTIVATIONS: usize = 3;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EnvironmentView {
@@ -209,6 +263,9 @@ pub struct DoctorReport {
     pub generated_at: OffsetDateTime,
     pub checks: Vec<DiagnosticCheck>,
     pub healthy: bool,
+    /// Present while the repository is still activating; its checks then describe startup only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activation: Option<ActivatingRepository>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -770,10 +827,78 @@ enum MissingLogKind {
     Unavailable(String),
 }
 
+tokio::task_local! {
+    /// The repository whose activation the current task performs. Only that task resolves the
+    /// repository's unpublished runtime; every other caller receives `RepositoryActivating`.
+    static ACTIVATING_REPOSITORY: RepositoryId;
+}
+
+struct ActivationEntry {
+    view: ActivatingRepository,
+    common_dir: Option<PathBuf>,
+    runtime: Option<Arc<RepositoryRuntime>>,
+}
+
+#[derive(Clone, Debug)]
+enum ActivationProbeAction {
+    Hold,
+    Fail(String),
+}
+
+/// Test seam that pauses or fails a repository's activation once its runtime exists and before
+/// recovery starts. Production startup uses an empty probe, which never waits.
+#[doc(hidden)]
+#[derive(Clone, Default)]
+pub struct ActivationProbe {
+    actions: Arc<Mutex<HashMap<RepositoryId, ActivationProbeAction>>>,
+    changed: Arc<Notify>,
+}
+
+impl ActivationProbe {
+    pub fn hold(&self, repository_id: RepositoryId) {
+        self.actions
+            .lock()
+            .insert(repository_id, ActivationProbeAction::Hold);
+        self.changed.notify_waiters();
+    }
+
+    pub fn fail(&self, repository_id: RepositoryId, message: impl Into<String>) {
+        self.actions
+            .lock()
+            .insert(repository_id, ActivationProbeAction::Fail(message.into()));
+        self.changed.notify_waiters();
+    }
+
+    pub fn release(&self, repository_id: RepositoryId) {
+        self.actions.lock().remove(&repository_id);
+        self.changed.notify_waiters();
+    }
+
+    async fn recovering(&self, repository_id: RepositoryId) -> Result<(), ServiceError> {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let action = self.actions.lock().get(&repository_id).cloned();
+            match action {
+                None => return Ok(()),
+                Some(ActivationProbeAction::Fail(message)) => {
+                    return Err(ServiceError::Invariant(message));
+                }
+                Some(ActivationProbeAction::Hold) => changed.await,
+            }
+        }
+    }
+}
+
 pub struct TollgateService {
     support_root: PathBuf,
     registry_path: PathBuf,
     runtimes: RwLock<HashMap<RepositoryId, Arc<RepositoryRuntime>>>,
+    activations: RwLock<HashMap<RepositoryId, ActivationEntry>>,
+    activation_driver:
+        tokio::sync::Mutex<Option<tokio::task::JoinHandle<Result<(), ServiceError>>>>,
+    activation_probe: ActivationProbe,
     unavailable: RwLock<Vec<UnavailableRepository>>,
     environment: RwLock<EnvironmentSnapshot>,
     environment_error: RwLock<Option<String>>,
@@ -1268,14 +1393,35 @@ async fn retain_speculative_generations(
 }
 
 impl TollgateService {
-    pub async fn open_default() -> Result<Arc<Self>, ServiceError> {
+    /// Starts the service in the per-user application-support directory. Registered repositories
+    /// activate in the background; see [`Self::start`].
+    pub async fn start_default() -> Result<Arc<Self>, ServiceError> {
         let directories = ProjectDirs::from("dev", "Tollgate", "Tollgate").ok_or_else(|| {
             ServiceError::Invariant("application support directory is unavailable".into())
         })?;
-        Self::open(directories.data_dir().to_owned()).await
+        Self::start(directories.data_dir().to_owned()).await
     }
 
+    /// Opens the service and waits until every registered repository has activated or failed.
     pub async fn open(support_root: PathBuf) -> Result<Arc<Self>, ServiceError> {
+        let service = Self::start(support_root).await?;
+        service.wait_for_activations().await?;
+        Ok(service)
+    }
+
+    /// Opens the service without touching any repository, then activates registered repositories
+    /// in the background, at most [`MAX_CONCURRENT_ACTIVATIONS`] at a time. Until a repository is
+    /// published its commands return [`ServiceError::RepositoryActivating`]; a failed activation
+    /// makes only that repository unavailable.
+    pub async fn start(support_root: PathBuf) -> Result<Arc<Self>, ServiceError> {
+        Self::start_with_probe(support_root, ActivationProbe::default()).await
+    }
+
+    #[doc(hidden)]
+    pub async fn start_with_probe(
+        support_root: PathBuf,
+        activation_probe: ActivationProbe,
+    ) -> Result<Arc<Self>, ServiceError> {
         tokio::fs::create_dir_all(&support_root).await?;
         let (environment, environment_error) =
             match EnvironmentSnapshot::capture_login_shell().await {
@@ -1308,6 +1454,9 @@ impl TollgateService {
             registry_path: support_root.join("repositories.json"),
             support_root,
             runtimes: RwLock::new(HashMap::new()),
+            activations: RwLock::new(HashMap::new()),
+            activation_driver: tokio::sync::Mutex::new(None),
+            activation_probe,
             unavailable: RwLock::new(Vec::new()),
             environment: RwLock::new(environment),
             environment_error: RwLock::new(environment_error),
@@ -1325,11 +1474,124 @@ impl TollgateService {
             volume_reservations: tokio::sync::Mutex::new(()),
             shutting_down: AtomicBool::new(false),
         });
-        service.load_registry().await?;
-        service.reconcile_global_commands().await?;
+        let records = service.load_registry().await?;
+        service.spawn_activations(records).await;
         service.spawn_initial_storage_scan();
         service.spawn_maintenance();
         Ok(service)
+    }
+
+    /// Waits for startup activation and the global-command reconciliation that follows it.
+    pub async fn wait_for_activations(&self) -> Result<(), ServiceError> {
+        let driver = self.activation_driver.lock().await.take();
+        match driver {
+            Some(driver) => driver
+                .await
+                .map_err(|error| ServiceError::Invariant(format!("activation driver: {error}")))?,
+            None => Ok(()),
+        }
+    }
+
+    async fn spawn_activations(self: &Arc<Self>, records: Vec<RegisteredRepository>) {
+        {
+            let mut activations = self.activations.write().await;
+            let now = OffsetDateTime::now_utc();
+            for record in &records {
+                activations.insert(
+                    record.id,
+                    ActivationEntry {
+                        view: ActivatingRepository {
+                            id: record.id,
+                            name: record.name.clone(),
+                            path: record.path.clone(),
+                            phase: ActivationPhase::Queued,
+                            step: "waiting-for-slot".into(),
+                            queued_at: now,
+                            phase_started_at: now,
+                        },
+                        common_dir: None,
+                        runtime: None,
+                    },
+                );
+            }
+        }
+        let service = Arc::clone(self);
+        let driver = tokio::spawn(async move {
+            let slots = Arc::new(Semaphore::new(MAX_CONCURRENT_ACTIVATIONS));
+            let mut activations = tokio::task::JoinSet::new();
+            for record in records {
+                let service = Arc::clone(&service);
+                let slots = Arc::clone(&slots);
+                activations.spawn(async move {
+                    let Ok(_slot) = slots.acquire_owned().await else {
+                        return;
+                    };
+                    service.activate_registered(record).await;
+                });
+            }
+            while let Some(result) = activations.join_next().await {
+                if let Err(error) = result {
+                    eprintln!("Tollgate repository activation task failed: {error}");
+                }
+            }
+            // Prepared global commands (such as a repository removal) inspect repository
+            // runtimes, so they reconcile only after every activation has settled.
+            let result = service.reconcile_global_commands().await;
+            if let Err(error) = &result {
+                eprintln!("Tollgate global command reconciliation failed: {error}");
+            }
+            result
+        });
+        *self.activation_driver.lock().await = Some(driver);
+    }
+
+    async fn activate_registered(self: &Arc<Self>, record: RegisteredRepository) {
+        let started = Instant::now();
+        match self.activate_existing(&record.path, Some(record.id)).await {
+            Ok(id) => eprintln!(
+                "Tollgate activated repository {id} at {} in {} ms",
+                record.path.display(),
+                started.elapsed().as_millis()
+            ),
+            Err(error) => {
+                self.activations.write().await.remove(&record.id);
+                {
+                    let mut unavailable = self.unavailable.write().await;
+                    unavailable.retain(|entry| entry.id != record.id);
+                    unavailable.push(UnavailableRepository {
+                        id: record.id,
+                        name: record.name.clone(),
+                        path: record.path.clone(),
+                        error: error.to_string(),
+                        recovery_action: "Preserve the repository-local tollgate directory, repair the reported condition, then reopen the repository or run Doctor.".into(),
+                    });
+                }
+                eprintln!(
+                    "Tollgate could not activate repository {} at {} after {} ms: {error}",
+                    record.id,
+                    record.path.display(),
+                    started.elapsed().as_millis()
+                );
+            }
+        }
+    }
+
+    async fn set_activation_progress(
+        &self,
+        id: Option<RepositoryId>,
+        phase: ActivationPhase,
+        step: &str,
+    ) {
+        let Some(id) = id else {
+            return;
+        };
+        if let Some(entry) = self.activations.write().await.get_mut(&id) {
+            if entry.view.phase != phase {
+                entry.view.phase = phase;
+                entry.view.phase_started_at = OffsetDateTime::now_utc();
+            }
+            step.clone_into(&mut entry.view.step);
+        }
     }
 
     fn spawn_initial_storage_scan(self: &Arc<Self>) {
@@ -1470,7 +1732,10 @@ impl TollgateService {
         _legacy_detach_master: bool,
     ) -> Result<RepositorySnapshot, ServiceError> {
         let git = GitRepository::discover(path).await?;
-        if let Some(id) = self.registered_common_directory(&git.common_dir).await {
+        if let Some(id) = self
+            .registered_common_directory(&git.common_dir, None)
+            .await
+        {
             return self.repository_snapshot(id).await;
         }
         let tollgate_root = git.common_dir.join("tollgate");
@@ -1582,22 +1847,83 @@ impl TollgateService {
         self.repository_snapshot(repository_id).await
     }
 
-    pub async fn register_existing(
+    async fn register_existing(
         self: &Arc<Self>,
         path: impl AsRef<Path>,
     ) -> Result<RepositorySnapshot, ServiceError> {
-        let git = GitRepository::discover(path).await?;
-        if let Some(id) = self.registered_common_directory(&git.common_dir).await {
-            return self.repository_snapshot(id).await;
+        let id = self.activate_existing(path.as_ref(), None).await?;
+        self.repository_snapshot(id).await
+    }
+
+    /// Opens, recovers, and publishes one existing repository. `registered` names the activation
+    /// entry created from the registry at startup; a re-registration from `tg init` creates its
+    /// entry once the database reveals the repository ID. Nothing outside this task can resolve
+    /// the runtime until recovery has finished and the runtime is published.
+    async fn activate_existing(
+        self: &Arc<Self>,
+        path: &Path,
+        registered: Option<RepositoryId>,
+    ) -> Result<RepositoryId, ServiceError> {
+        let mut key = registered;
+        let result = self.activate_existing_inner(path, &mut key).await;
+        if result.is_err()
+            && let Some(id) = key
+        {
+            self.activations.write().await.remove(&id);
         }
+        result
+    }
+
+    async fn activate_existing_inner(
+        self: &Arc<Self>,
+        path: &Path,
+        key: &mut Option<RepositoryId>,
+    ) -> Result<RepositoryId, ServiceError> {
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err(ServiceError::Invariant(
+                "Tollgate is shutting down; activation resumes at the next launch".into(),
+            ));
+        }
+        self.set_activation_progress(*key, ActivationPhase::Opening, "discover-repository")
+            .await;
+        let git = GitRepository::discover(path).await?;
+        if let Some(id) = self
+            .registered_common_directory(&git.common_dir, *key)
+            .await
+        {
+            if let Some(stale) = key.take()
+                && stale != id
+            {
+                self.activations.write().await.remove(&stale);
+            }
+            return Ok(id);
+        }
+        if let Some(id) = *key
+            && let Some(entry) = self.activations.write().await.get_mut(&id)
+        {
+            entry.common_dir = Some(git.common_dir.clone());
+        }
+        self.set_activation_progress(*key, ActivationPhase::Opening, "ownership-lock")
+            .await;
         let ownership_lock = acquire_repository_lock(&git.common_dir)?;
         let store_path = git.common_dir.join("tollgate/state.sqlite3");
         if !store_path.exists() {
             return Err(ServiceError::MissingConfiguration);
         }
+        self.set_activation_progress(*key, ActivationPhase::Opening, "open-store")
+            .await;
         let store = self.open_repository_store(&store_path).await?;
-        store.full_integrity_check()?;
+        self.set_activation_progress(*key, ActivationPhase::Opening, "integrity-check")
+            .await;
+        let store =
+            tokio::task::spawn_blocking(move || store.full_integrity_check().map(|()| store))
+                .await
+                .map_err(|error| {
+                    ServiceError::Invariant(format!("integrity check task: {error}"))
+                })??;
         let mut state = store.repository_state()?;
+        self.set_activation_progress(*key, ActivationPhase::Opening, "integration-refs")
+            .await;
         if state.integration_ref == USER_BRANCH_REF {
             git.migrate_integration_ref_from_master().await?;
             state.integration_ref = INTEGRATION_REF.into();
@@ -1647,6 +1973,8 @@ impl TollgateService {
             }
             Err(error) => return Err(error.into()),
         }
+        self.set_activation_progress(*key, ActivationPhase::Opening, "configuration")
+            .await;
         prepare_configuration_root(&git).await?;
         let disk_config_text = read_or_migrate_configuration(&git, None).await?;
         let disk_config = EffectiveConfig::parse(&disk_config_text)?;
@@ -1695,38 +2023,133 @@ impl TollgateService {
             store.update_repository_state(&state)?;
         }
         let id = state.id;
+        self.claim_activation_entry(key, id, &state.name, &git)
+            .await?;
+        self.set_activation_progress(*key, ActivationPhase::Opening, "create-runtime")
+            .await;
         let runtime = {
             let _storage = self.storage_maintenance.lock().await;
-            let runtime = self
-                .make_runtime(git, store, state, config, ownership_lock)
-                .await?;
-            self.runtimes.write().await.insert(id, Arc::clone(&runtime));
-            self.unavailable
-                .write()
-                .await
-                .retain(|entry| entry.id != id);
-            runtime
+            self.make_runtime(git, store, state, config, ownership_lock)
+                .await?
         };
+        if let Some(entry) = self.activations.write().await.get_mut(&id) {
+            entry.runtime = Some(Arc::clone(&runtime));
+        }
+        self.set_activation_progress(*key, ActivationPhase::Recovering, "start")
+            .await;
+        self.activation_probe.recovering(id).await?;
+        ACTIVATING_REPOSITORY
+            .scope(id, self.recover_runtime(id, &runtime))
+            .await?;
+        {
+            let mut runtimes = self.runtimes.write().await;
+            runtimes.insert(id, Arc::clone(&runtime));
+            self.activations.write().await.remove(&id);
+        }
+        self.unavailable
+            .write()
+            .await
+            .retain(|entry| entry.id != id);
         self.reconfigure_global_scheduler().await;
-        self.reconcile_seed_intents(&runtime).await?;
-        self.reconcile_backup_intents(&runtime).await?;
-        self.reconcile_cache_purge_intents(&runtime).await?;
-        self.reconcile_artifact_intents(&runtime).await?;
-        self.reconcile_promotion_intent(&runtime).await?;
-        self.reconcile_remote_intents(&runtime).await?;
-        self.reconcile_master(&runtime).await?;
-        self.reconcile_approval_intents(&runtime).await?;
-        let _resumable = self.recover_interrupted(&runtime)?;
-        self.reconcile_mutation_intents(&runtime).await?;
-        self.reconcile_failed_prefixes(id, &runtime).await?;
-        self.recover_cold_retry_policy(&runtime)?;
-        self.prune_expired_artifacts(id).await?;
-        self.enforce_log_retention(&runtime).await?;
         if runtime.data.lock().state.execution_state == RepositoryExecutionState::Active {
             self.spawn_eligible(id, &runtime);
+        }
+        Ok(id)
+    }
+
+    /// Moves a startup activation entry to the repository's durable ID, or creates the entry for a
+    /// re-registration that had none. A re-registration never displaces another activation.
+    async fn claim_activation_entry(
+        &self,
+        key: &mut Option<RepositoryId>,
+        id: RepositoryId,
+        name: &str,
+        git: &GitRepository,
+    ) -> Result<(), ServiceError> {
+        let mut activations = self.activations.write().await;
+        let existing = match *key {
+            Some(registered) => activations.remove(&registered),
+            None => {
+                if let Some(entry) = activations.get(&id) {
+                    return Err(ServiceError::RepositoryActivating(Box::new(
+                        entry.view.clone(),
+                    )));
+                }
+                None
+            }
+        };
+        let now = OffsetDateTime::now_utc();
+        let mut entry = existing.unwrap_or_else(|| ActivationEntry {
+            view: ActivatingRepository {
+                id,
+                name: name.to_owned(),
+                path: git.worktree_root.clone(),
+                phase: ActivationPhase::Opening,
+                step: "create-runtime".into(),
+                queued_at: now,
+                phase_started_at: now,
+            },
+            common_dir: None,
+            runtime: None,
+        });
+        entry.view.id = id;
+        entry.common_dir = Some(git.common_dir.clone());
+        activations.insert(id, entry);
+        *key = Some(id);
+        Ok(())
+    }
+
+    /// Startup recovery for one unpublished runtime. It runs inside the activation task scope, so
+    /// the service methods it calls resolve this runtime while commands still see an activating
+    /// repository. Expired-artifact pruning belongs to maintenance, never to activation.
+    async fn recover_runtime(
+        self: &Arc<Self>,
+        id: RepositoryId,
+        runtime: &Arc<RepositoryRuntime>,
+    ) -> Result<(), ServiceError> {
+        // Recovery steps are individually crash-safe, so a quit stops activation between them.
+        let step = |name: &'static str| async move {
+            if self.shutting_down.load(Ordering::Acquire) {
+                return Err(ServiceError::Invariant(
+                    "Tollgate is shutting down; activation resumes at the next launch".into(),
+                ));
+            }
+            self.set_activation_progress(Some(id), ActivationPhase::Recovering, name)
+                .await;
+            Ok(())
+        };
+        step("seed-intents").await?;
+        self.reconcile_seed_intents(runtime).await?;
+        step("backup-intents").await?;
+        self.reconcile_backup_intents(runtime).await?;
+        step("cache-purge-intents").await?;
+        self.reconcile_cache_purge_intents(runtime).await?;
+        step("artifact-intents").await?;
+        self.reconcile_artifact_intents(runtime).await?;
+        step("promotion-intent").await?;
+        self.reconcile_promotion_intent(runtime).await?;
+        step("remote-intents").await?;
+        self.reconcile_remote_intents(runtime).await?;
+        step("master").await?;
+        self.reconcile_master(runtime).await?;
+        step("approval-intents").await?;
+        self.reconcile_approval_intents(runtime).await?;
+        step("interrupted-buildsets").await?;
+        let _resumable = self.recover_interrupted(runtime)?;
+        step("mutation-intents").await?;
+        self.reconcile_mutation_intents(runtime).await?;
+        step("failed-prefixes").await?;
+        self.reconcile_failed_prefixes(id, runtime).await?;
+        step("cold-retry-policy").await?;
+        self.recover_cold_retry_policy(runtime)?;
+        step("log-retention").await?;
+        self.enforce_log_retention(runtime).await?;
+        if runtime.data.lock().state.execution_state == RepositoryExecutionState::Active {
+            self.set_activation_progress(Some(id), ActivationPhase::Resuming, "promote-ready")
+                .await;
             self.promote_ready(id).await?;
         }
-        self.repository_snapshot(id).await
+        Ok(())
     }
 
     async fn reconcile_mutation_intents(
@@ -3192,6 +3615,19 @@ impl TollgateService {
             }
             let staging_exists = tokio::fs::try_exists(&evidence.staging).await?;
             let destination_exists = tokio::fs::try_exists(&evidence.destination).await?;
+            // A generation recorded by a different seed can never be published for this intent:
+            // the intent's manifest pins its generation, and generations are unique per profile.
+            let generation_owner = runtime
+                .data
+                .lock()
+                .seeds
+                .iter()
+                .find(|seed| {
+                    seed.profile == "default"
+                        && seed.generation == evidence.generation
+                        && seed.id != evidence.seed_id
+                })
+                .map(|seed| seed.id.clone());
             let record = match (staging_exists, destination_exists) {
                 (false, false) => {
                     runtime.store.set_intent_state(
@@ -3201,15 +3637,52 @@ impl TollgateService {
                     )?;
                     continue;
                 }
-                (true, false) => {
-                    verify_seed_publication(&evidence.staging, &evidence)?;
-                    tokio::fs::rename(&evidence.staging, &evidence.destination).await?;
-                    if let Some(parent) = evidence.destination.parent() {
-                        sync_directory(parent)?;
+                (true, false) | (false, true) => {
+                    let path = if staging_exists {
+                        &evidence.staging
+                    } else {
+                        &evidence.destination
+                    };
+                    let verified = match &generation_owner {
+                        Some(owner) => Err(format!(
+                            "generation {} already belongs to seed {owner}",
+                            evidence.generation
+                        )),
+                        None => verify_seed_publication(path, &evidence)
+                            .map_err(|error| error.to_string()),
+                    };
+                    match verified {
+                        Ok(record) if destination_exists => record,
+                        Ok(_) => {
+                            tokio::fs::rename(&evidence.staging, &evidence.destination).await?;
+                            if let Some(parent) = evidence.destination.parent() {
+                                sync_directory(parent)?;
+                            }
+                            verify_seed_publication(&evidence.destination, &evidence)?
+                        }
+                        Err(reason) => {
+                            // Seeds are disposable caches: an unpublishable generation is moved
+                            // to reclaimable quarantine and the next validation provisions cold.
+                            let recovery = if staging_exists {
+                                "unpublished-seed-discarded"
+                            } else {
+                                "unrecorded-seed-quarantined"
+                            };
+                            let quarantine = self
+                                .discard_seed_generation(
+                                    runtime, command_id, path, recovery, &reason,
+                                )
+                                .await?;
+                            eprintln!(
+                                "Tollgate discarded seed {} for repository {} into {}: {reason}",
+                                evidence.seed_id,
+                                evidence.repository_id,
+                                quarantine.display()
+                            );
+                            continue;
+                        }
                     }
-                    verify_seed_publication(&evidence.destination, &evidence)?
                 }
-                (false, true) => verify_seed_publication(&evidence.destination, &evidence)?,
                 (true, true) => {
                     let state = {
                         let mut data = runtime.data.lock();
@@ -3264,6 +3737,52 @@ impl TollgateService {
             let _ = runtime.events.send(event);
         }
         Ok(())
+    }
+
+    /// Moves an owned seed generation that will never be recorded into the reclaimable
+    /// `.pruned-` quarantine of the cache root and cancels its publication intent.
+    async fn discard_seed_generation(
+        &self,
+        runtime: &Arc<RepositoryRuntime>,
+        command_id: CommandId,
+        path: &Path,
+        recovery: &str,
+        reason: &str,
+    ) -> Result<PathBuf, ServiceError> {
+        let seeds_root = std::fs::canonicalize(runtime.cache_root.join("seeds/default"))?;
+        let metadata = std::fs::symlink_metadata(path)?;
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| ServiceError::Invariant("seed generation name is not UTF-8".into()))?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_dir()
+            || std::fs::canonicalize(path)?.parent() != Some(seeds_root.as_path())
+        {
+            return Err(ServiceError::Invariant(
+                "seed generation to discard is not an owned direct child of its profile root"
+                    .into(),
+            ));
+        }
+        let cache_root = std::fs::canonicalize(self.support_root.join("cache"))?;
+        let quarantine = cache_root.join(format!(
+            ".pruned-seed-{}-{}",
+            name.trim_start_matches('.'),
+            uuid::Uuid::now_v7()
+        ));
+        tokio::fs::rename(path, &quarantine).await?;
+        sync_directory(&seeds_root)?;
+        sync_directory(&cache_root)?;
+        runtime.store.set_intent_state(
+            command_id,
+            IntentState::Canceled,
+            &serde_json::json!({
+                "recovery": recovery,
+                "reason": reason,
+                "quarantine": quarantine,
+            }),
+        )?;
+        Ok(quarantine)
     }
 
     async fn reconcile_backup_intents(
@@ -4459,6 +4978,15 @@ impl TollgateService {
     }
 
     pub async fn snapshot(&self) -> Result<AppSnapshot, ServiceError> {
+        // Read activations before runtimes: a repository published in between then appears in
+        // both reads and is reported once, as active.
+        let mut activating_repositories = self
+            .activations
+            .read()
+            .await
+            .values()
+            .map(|entry| entry.view.clone())
+            .collect::<Vec<_>>();
         let runtimes = self
             .runtimes
             .read()
@@ -4493,6 +5021,22 @@ impl TollgateService {
                 .to_lowercase()
                 .cmp(&right.state.name.to_lowercase())
         });
+        activating_repositories.retain(|activating| {
+            !repositories
+                .iter()
+                .any(|repository| repository.state.id == activating.id)
+        });
+        activating_repositories.sort_by(|left, right| {
+            left.name
+                .to_lowercase()
+                .cmp(&right.name.to_lowercase())
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        unavailable_repositories.retain(|unavailable| {
+            !activating_repositories
+                .iter()
+                .any(|activating| activating.id == unavailable.id)
+        });
         unavailable_repositories.sort_by(|left, right| {
             left.name
                 .to_lowercase()
@@ -4504,6 +5048,7 @@ impl TollgateService {
             version: env!("CARGO_PKG_VERSION").into(),
             generated_at: OffsetDateTime::now_utc(),
             repositories,
+            activating_repositories,
             unavailable_repositories,
             environment: EnvironmentView {
                 snapshot_id: environment.id.clone(),
@@ -4717,6 +5262,7 @@ impl TollgateService {
             .values()
             .cloned()
             .collect::<Vec<_>>();
+        // An activating repository owns its cache root even though its runtime is unpublished.
         let mut registered = self
             .unavailable
             .read()
@@ -4724,6 +5270,7 @@ impl TollgateService {
             .iter()
             .map(|repository| repository.id)
             .collect::<HashSet<_>>();
+        registered.extend(self.activations.read().await.keys().copied());
         let mut slots = Vec::new();
         let mut seeds = Vec::new();
         for runtime in runtimes {
@@ -5118,7 +5665,21 @@ impl TollgateService {
         }
         match matched_repository {
             Some(repository_id) => self.item_details(repository_id, item_id).await,
-            None => Err(ServiceError::ItemNotFound(item_id)),
+            None => {
+                // The item may belong to a repository that has not finished activating; report
+                // that retryable state rather than a terminal not-found.
+                let activating = self
+                    .activations
+                    .read()
+                    .await
+                    .values()
+                    .map(|entry| entry.view.clone())
+                    .min_by(|left, right| left.queued_at.cmp(&right.queued_at));
+                Err(match activating {
+                    Some(activation) => ServiceError::RepositoryActivating(Box::new(activation)),
+                    None => ServiceError::ItemNotFound(item_id),
+                })
+            }
         }
     }
 
@@ -5597,6 +6158,7 @@ impl TollgateService {
                     &path,
                     &hash,
                     patch.len() as u64,
+                    OffsetDateTime::now_utc() + Duration::days(REPAIR_ARTIFACT_RETENTION_DAYS),
                 )?;
             }
             Ok(RepairArtifact {
@@ -8402,7 +8964,11 @@ impl TollgateService {
             .await
             .records
             .contains_key(&command_id.to_string());
-        let runtime = self.runtime(repository_id).await.ok();
+        let runtime = match self.runtime(repository_id).await {
+            Ok(runtime) => Some(runtime),
+            Err(error @ ServiceError::RepositoryActivating(_)) => return Err(error),
+            Err(_) => None,
+        };
         if runtime.is_none()
             && !command_prepared
             && !self
@@ -8735,7 +9301,13 @@ impl TollgateService {
     }
 
     pub async fn doctor(&self, repository_id: RepositoryId) -> Result<DoctorReport, ServiceError> {
-        let runtime = self.runtime(repository_id).await?;
+        let runtime = match self.runtime(repository_id).await {
+            Ok(runtime) => runtime,
+            Err(ServiceError::RepositoryActivating(activation)) => {
+                return Ok(activating_doctor_report(*activation));
+            }
+            Err(error) => return Err(error),
+        };
         let (state, config, slots) = {
             let data = runtime.data.lock();
             (
@@ -8949,6 +9521,7 @@ impl TollgateService {
             generated_at: OffsetDateTime::now_utc(),
             checks,
             healthy,
+            activation: None,
         })
     }
 
@@ -9415,15 +9988,7 @@ impl TollgateService {
         {
             return Ok(response);
         }
-        let generation = runtime
-            .data
-            .lock()
-            .seeds
-            .iter()
-            .map(|seed| seed.generation)
-            .max()
-            .unwrap_or(0)
-            + 1;
+        let generation = next_seed_generation(runtime)?;
         let seed_id = uuid::Uuid::now_v7().to_string();
         let seeds_root = runtime
             .slots_root
@@ -9475,55 +10040,82 @@ impl TollgateService {
             return Err(error);
         }
         tokio::fs::create_dir(&staging).await?;
-        let mut entries = Vec::new();
-        let mut logical_size = 0u64;
-        for relative in &selected {
-            let source = std::fs::canonicalize(donor.path.join(relative))?;
-            if !source.starts_with(&donor_root) || !source.is_dir() {
-                return Err(ServiceError::Invariant(format!(
-                    "cache path `{}` is not a real directory beneath the donor slot",
-                    relative.display()
-                )));
+        let staged = async {
+            let mut entries = Vec::new();
+            let mut logical_size = 0u64;
+            for relative in &selected {
+                let source = std::fs::canonicalize(donor.path.join(relative))?;
+                if !source.starts_with(&donor_root) || !source.is_dir() {
+                    return Err(ServiceError::Invariant(format!(
+                        "cache path `{}` is not a real directory beneath the donor slot",
+                        relative.display()
+                    )));
+                }
+                let target = staging.join(relative);
+                if let Some(parent) = target.parent() {
+                    tokio::fs::create_dir_all(parent).await?;
+                }
+                let manifest = force_clone_tree(&source, &target)
+                    .map_err(|error| ServiceError::Invariant(error.to_string()))?;
+                logical_size = logical_size.saturating_add(manifest.logical_size);
+                entries.push(serde_json::json!({
+                    "path": relative,
+                    "clone_manifest": manifest,
+                }));
             }
-            let target = staging.join(relative);
-            if let Some(parent) = target.parent() {
-                tokio::fs::create_dir_all(parent).await?;
-            }
-            let manifest = force_clone_tree(&source, &target)
-                .map_err(|error| ServiceError::Invariant(error.to_string()))?;
-            logical_size = logical_size.saturating_add(manifest.logical_size);
-            entries.push(serde_json::json!({
-                "path": relative,
-                "clone_manifest": manifest,
-            }));
+            let manifest = serde_json::json!({
+                "version": 1,
+                "seed_id": seed_id,
+                "generation": generation,
+                "repository_id": repository_id,
+                "profile": "default",
+                "cache_epoch": config.cache.epoch,
+                "cache_policy_digest": cache_policy_digest,
+                "configuration_digest": config.digest,
+                "os": std::env::consts::OS,
+                "architecture": std::env::consts::ARCH,
+                "source_slot": donor.id,
+                "source_oid": donor.checkout_oid,
+                "logical_size": logical_size,
+                "entries": entries,
+            });
+            let manifest_path = staging.join(".tollgate-seed-manifest.json");
+            let mut file = tokio::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&manifest_path)
+                .await?;
+            file.write_all(&serde_json::to_vec_pretty(&manifest)?)
+                .await?;
+            file.sync_all().await?;
+            sync_tree_directories(&staging)?;
+            let staged_record = verify_seed_publication(&staging, &evidence)?;
+            Ok::<_, ServiceError>((logical_size, staged_record))
         }
-        let manifest = serde_json::json!({
-            "version": 1,
-            "seed_id": seed_id,
-            "generation": generation,
-            "repository_id": repository_id,
-            "profile": "default",
-            "cache_epoch": config.cache.epoch,
-            "cache_policy_digest": cache_policy_digest,
-            "configuration_digest": config.digest,
-            "os": std::env::consts::OS,
-            "architecture": std::env::consts::ARCH,
-            "source_slot": donor.id,
-            "source_oid": donor.checkout_oid,
-            "logical_size": logical_size,
-            "entries": entries,
-        });
-        let manifest_path = staging.join(".tollgate-seed-manifest.json");
-        let mut file = tokio::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&manifest_path)
-            .await?;
-        file.write_all(&serde_json::to_vec_pretty(&manifest)?)
-            .await?;
-        file.sync_all().await?;
-        sync_tree_directories(&staging)?;
-        let staged_record = verify_seed_publication(&staging, &evidence)?;
+        .await;
+        // A generation that never reached its final path is discarded at once, so a failed
+        // snapshot leaves neither staging data nor an unfinished intent holding its generation.
+        let (logical_size, staged_record) = match staged {
+            Ok(staged) => staged,
+            Err(error) => {
+                if let Err(discard_error) = self
+                    .discard_seed_generation(
+                        runtime,
+                        command_id,
+                        &staging,
+                        "unpublished-seed-discarded",
+                        &error.to_string(),
+                    )
+                    .await
+                {
+                    eprintln!(
+                        "Tollgate could not discard failed seed staging {}: {discard_error}",
+                        staging.display()
+                    );
+                }
+                return Err(error);
+            }
+        };
         tokio::fs::rename(&staging, &destination).await?;
         sync_directory(&seeds_root)?;
         runtime.store.set_intent_state(
@@ -11637,6 +12229,13 @@ impl TollgateService {
         if self.shutting_down.load(Ordering::Acquire) {
             return;
         }
+        // Recovery may queue work, but execution starts only after the runtime is published.
+        if ACTIVATING_REPOSITORY
+            .try_with(|activating| *activating == repository_id)
+            .unwrap_or(false)
+        {
+            return;
+        }
         let eligible = {
             let data = runtime.data.lock();
             let mut eligible = data
@@ -13430,7 +14029,25 @@ impl TollgateService {
         Ok(())
     }
 
+    /// Resolves a published runtime. While a repository activates, only its own activation task
+    /// may resolve the unpublished runtime; every other caller receives `RepositoryActivating`.
     async fn runtime(&self, id: RepositoryId) -> Result<Arc<RepositoryRuntime>, ServiceError> {
+        if let Some(runtime) = self.runtimes.read().await.get(&id).cloned() {
+            return Ok(runtime);
+        }
+        if let Some(entry) = self.activations.read().await.get(&id) {
+            let own_activation = ACTIVATING_REPOSITORY
+                .try_with(|activating| *activating == id)
+                .unwrap_or(false);
+            return match (&entry.runtime, own_activation) {
+                (Some(runtime), true) => Ok(Arc::clone(runtime)),
+                _ => Err(ServiceError::RepositoryActivating(Box::new(
+                    entry.view.clone(),
+                ))),
+            };
+        }
+        // Publication inserts the runtime before it removes the activation entry, so a miss in
+        // both maps can only race with a publication that has now completed.
         self.runtimes
             .read()
             .await
@@ -13573,10 +14190,26 @@ impl TollgateService {
         Ok(())
     }
 
-    async fn registered_common_directory(&self, common_dir: &Path) -> Option<RepositoryId> {
-        self.runtimes.read().await.values().find_map(|runtime| {
+    async fn registered_common_directory(
+        &self,
+        common_dir: &Path,
+        excluding_activation: Option<RepositoryId>,
+    ) -> Option<RepositoryId> {
+        let published = self.runtimes.read().await.values().find_map(|runtime| {
             (runtime.git.common_dir == common_dir).then(|| runtime.data.lock().state.id)
-        })
+        });
+        if published.is_some() {
+            return published;
+        }
+        self.activations
+            .read()
+            .await
+            .iter()
+            .find_map(|(id, entry)| {
+                (Some(*id) != excluding_activation
+                    && entry.common_dir.as_deref() == Some(common_dir))
+                .then_some(*id)
+            })
     }
 
     async fn prepare_global_command(
@@ -13768,9 +14401,9 @@ impl TollgateService {
         });
     }
 
-    async fn load_registry(self: &Arc<Self>) -> Result<(), ServiceError> {
+    async fn load_registry(&self) -> Result<Vec<RegisteredRepository>, ServiceError> {
         if !self.registry_path.exists() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let bytes = tokio::fs::read(&self.registry_path).await?;
         let records: Vec<RegisteredRepository> = match serde_json::from_slice(&bytes) {
@@ -13787,24 +14420,11 @@ impl TollgateService {
                 Vec::new()
             }
         };
-        for record in records {
-            if let Err(error) = self.register_existing(&record.path).await {
-                self.runtimes.write().await.remove(&record.id);
-                self.unavailable.write().await.push(UnavailableRepository {
-                    id: record.id,
-                    name: record.name.clone(),
-                    path: record.path.clone(),
-                    error: error.to_string(),
-                    recovery_action: "Preserve the repository-local tollgate directory, repair the reported condition, then reopen the repository or run Doctor.".into(),
-                });
-                eprintln!(
-                    "Tollgate could not activate repository {} at {}: {error}",
-                    record.id,
-                    record.path.display()
-                );
-            }
-        }
-        Ok(())
+        let mut seen = HashSet::new();
+        Ok(records
+            .into_iter()
+            .filter(|record| seen.insert(record.id))
+            .collect())
     }
 
     async fn save_registry(&self) -> Result<(), ServiceError> {
@@ -13823,6 +14443,17 @@ impl TollgateService {
                 .collect::<Vec<_>>()
         };
         records.extend(
+            self.activations
+                .read()
+                .await
+                .values()
+                .map(|entry| RegisteredRepository {
+                    id: entry.view.id,
+                    name: entry.view.name.clone(),
+                    path: entry.view.path.clone(),
+                }),
+        );
+        records.extend(
             self.unavailable
                 .read()
                 .await
@@ -13833,6 +14464,8 @@ impl TollgateService {
                     path: entry.path.clone(),
                 }),
         );
+        let mut seen = HashSet::new();
+        records.retain(|record| seen.insert(record.id));
         records.sort_by_key(|record| record.id);
         let parent = self
             .registry_path
@@ -14398,6 +15031,57 @@ fn ensure_owned_artifact_path(root: &Path, candidate: &Path) -> Result<(), Servi
         }
     }
     Ok(())
+}
+
+/// The next seed generation for a repository's default profile. Generations still named by an
+/// unfinished publication intent stay reserved: recovery may yet publish that exact generation.
+fn next_seed_generation(runtime: &RepositoryRuntime) -> Result<u64, ServiceError> {
+    let recorded = runtime
+        .data
+        .lock()
+        .seeds
+        .iter()
+        .filter(|seed| seed.profile == "default")
+        .map(|seed| seed.generation)
+        .max()
+        .unwrap_or(0);
+    let mut reserved = recorded;
+    for (_, _, evidence, _) in runtime.store.unfinished_operations(&["cache-snapshot"])? {
+        let evidence: SeedSnapshotEvidence = serde_json::from_value(evidence)?;
+        reserved = reserved.max(evidence.generation);
+    }
+    Ok(reserved + 1)
+}
+
+fn activating_doctor_report(activation: ActivatingRepository) -> DoctorReport {
+    let now = OffsetDateTime::now_utc();
+    let elapsed = (now - activation.queued_at).whole_seconds().max(0);
+    DoctorReport {
+        repository_id: activation.id,
+        generated_at: now,
+        checks: vec![
+            DiagnosticCheck {
+                name: "app-service".into(),
+                status: DiagnosticStatus::Healthy,
+                detail: format!("Tollgate {} is serving requests", env!("CARGO_PKG_VERSION")),
+                recovery_action: None,
+            },
+            DiagnosticCheck {
+                name: "repository-activation".into(),
+                status: DiagnosticStatus::Attention,
+                detail: format!(
+                    "activating for {elapsed}s: {} ({})",
+                    activation.phase.as_str(),
+                    activation.step
+                ),
+                recovery_action: Some(
+                    "Wait for activation to finish; `tg repo activation --wait` reports progress. Repository checks run once it is active.".into(),
+                ),
+            },
+        ],
+        healthy: false,
+        activation: Some(activation),
+    }
 }
 
 fn verify_owned_directory(root: &Path, candidate: &Path) -> Result<(), ServiceError> {
@@ -23381,5 +24065,514 @@ run = "true"
             event.payload["snapshot_truncated"] == true
                 && event.payload["original_payload_bytes"].as_u64().unwrap() > 1024 * 1024
         }));
+    }
+
+    fn committed_repository(root: &Path, name: &str) -> PathBuf {
+        let repository = root.join(name);
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("base.txt"), "base\n").unwrap();
+        git(&repository, &["add", "base.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+        repository
+    }
+
+    async fn registered_repositories(support: &Path, repositories: &[&Path]) -> Vec<RepositoryId> {
+        let service = TollgateService::open(support.to_owned()).await.unwrap();
+        let mut ids = Vec::new();
+        for repository in repositories {
+            ids.push(
+                service
+                    .initialize_repository_with_options(repository, Some("true".into()), false)
+                    .await
+                    .unwrap()
+                    .state
+                    .id,
+            );
+        }
+        ids
+    }
+
+    async fn wait_for_snapshot(
+        service: &TollgateService,
+        description: &str,
+        condition: impl Fn(&AppSnapshot) -> bool,
+    ) -> AppSnapshot {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let snapshot = service.snapshot().await.unwrap();
+            if condition(&snapshot) {
+                return snapshot;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for {description}: active={:?} activating={:?} unavailable={:?}",
+                snapshot
+                    .repositories
+                    .iter()
+                    .map(|repository| repository.state.id)
+                    .collect::<Vec<_>>(),
+                snapshot.activating_repositories,
+                snapshot.unavailable_repositories
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_blocked_activation_reports_activating_while_other_repositories_serve() {
+        let temporary = tempfile::tempdir().unwrap();
+        let support = temporary.path().join("support");
+        let serving = committed_repository(temporary.path(), "serving");
+        let blocked = committed_repository(temporary.path(), "blocked");
+        let ids = registered_repositories(&support, &[&serving, &blocked]).await;
+        let (serving_id, blocked_id) = (ids[0], ids[1]);
+
+        let probe = ActivationProbe::default();
+        probe.hold(blocked_id);
+        let service = TollgateService::start_with_probe(support.clone(), probe.clone())
+            .await
+            .unwrap();
+        let snapshot = wait_for_snapshot(&service, "the held repository to recover", |snapshot| {
+            snapshot
+                .repositories
+                .iter()
+                .any(|repository| repository.state.id == serving_id)
+                && snapshot.activating_repositories.iter().any(|activation| {
+                    activation.id == blocked_id && activation.phase == ActivationPhase::Recovering
+                })
+        })
+        .await;
+        assert!(
+            !snapshot
+                .repositories
+                .iter()
+                .any(|repository| repository.state.id == blocked_id)
+        );
+        assert!(snapshot.unavailable_repositories.is_empty());
+
+        let report = service.doctor(blocked_id).await.unwrap();
+        assert!(!report.healthy);
+        assert_eq!(report.activation.as_ref().unwrap().id, blocked_id);
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.name == "repository-activation"
+                    && matches!(check.status, DiagnosticStatus::Attention)
+                    && check.recovery_action.is_some())
+        );
+        let serving_report = service.doctor(serving_id).await.unwrap();
+        assert!(serving_report.activation.is_none());
+
+        // Neither reads nor commands can reach the half-recovered runtime.
+        match service.repository_snapshot(blocked_id).await {
+            Err(ServiceError::RepositoryActivating(activation)) => {
+                assert_eq!(activation.id, blocked_id);
+                assert_eq!(activation.phase, ActivationPhase::Recovering);
+            }
+            other => panic!(
+                "expected an activating repository, got {:?}",
+                other.map(|_| ())
+            ),
+        }
+        assert!(matches!(
+            service
+                .set_paused_command(blocked_id, true, CommandId::new())
+                .await,
+            Err(ServiceError::RepositoryActivating(_))
+        ));
+        assert!(matches!(
+            service
+                .unregister_repository_command(blocked_id, CommandId::new())
+                .await,
+            Err(ServiceError::RepositoryActivating(_))
+        ));
+        service
+            .set_paused_command(serving_id, true, CommandId::new())
+            .await
+            .unwrap();
+        service
+            .set_paused_command(serving_id, false, CommandId::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            service
+                .repository_snapshot(serving_id)
+                .await
+                .unwrap()
+                .state
+                .execution_state,
+            RepositoryExecutionState::Active
+        );
+        let registry: Vec<RegisteredRepository> =
+            serde_json::from_slice(&std::fs::read(support.join("repositories.json")).unwrap())
+                .unwrap();
+        assert!(registry.iter().any(|record| record.id == blocked_id));
+
+        probe.release(blocked_id);
+        service.wait_for_activations().await.unwrap();
+        let snapshot = service.snapshot().await.unwrap();
+        assert!(snapshot.activating_repositories.is_empty());
+        assert_eq!(snapshot.repositories.len(), 2);
+        assert_eq!(
+            service
+                .repository_snapshot(blocked_id)
+                .await
+                .unwrap()
+                .state
+                .execution_state,
+            RepositoryExecutionState::Active
+        );
+    }
+
+    #[tokio::test]
+    async fn one_failed_activation_leaves_other_repositories_active() {
+        let temporary = tempfile::tempdir().unwrap();
+        let support = temporary.path().join("support");
+        let healthy = committed_repository(temporary.path(), "healthy");
+        let failing = committed_repository(temporary.path(), "failing");
+        let ids = registered_repositories(&support, &[&healthy, &failing]).await;
+        let (healthy_id, failing_id) = (ids[0], ids[1]);
+
+        let probe = ActivationProbe::default();
+        probe.fail(failing_id, "injected recovery failure");
+        let service = TollgateService::start_with_probe(support.clone(), probe)
+            .await
+            .unwrap();
+        service.wait_for_activations().await.unwrap();
+
+        let snapshot = service.snapshot().await.unwrap();
+        assert!(snapshot.activating_repositories.is_empty());
+        assert_eq!(
+            snapshot
+                .repositories
+                .iter()
+                .map(|repository| repository.state.id)
+                .collect::<Vec<_>>(),
+            vec![healthy_id]
+        );
+        let unavailable = snapshot
+            .unavailable_repositories
+            .iter()
+            .find(|repository| repository.id == failing_id)
+            .unwrap();
+        assert!(unavailable.error.contains("injected recovery failure"));
+        assert!(!unavailable.recovery_action.is_empty());
+        service
+            .set_paused_command(healthy_id, true, CommandId::new())
+            .await
+            .unwrap();
+        // The failed activation released the repository's ownership lock with its runtime.
+        let common_dir = GitRepository::discover(&failing).await.unwrap().common_dir;
+        drop(acquire_repository_lock(&common_dir).unwrap());
+    }
+
+    #[tokio::test]
+    async fn activation_never_prunes_expired_artifacts() {
+        let temporary = tempfile::tempdir().unwrap();
+        let support = temporary.path().join("support");
+        let repository = committed_repository(temporary.path(), "repository");
+        let service = TollgateService::open(support.clone()).await.unwrap();
+        let id = service
+            .initialize_repository_with_options(&repository, Some("true".into()), false)
+            .await
+            .unwrap()
+            .state
+            .id;
+        let check = service
+            .check_from(
+                id,
+                "HEAD".into(),
+                Some(repository.to_string_lossy().into_owned()),
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        let buildset_id = loop {
+            let details = service.item_details(id, check.item_id).await.unwrap();
+            if details.item.state == QueueItemState::CheckPassed {
+                break details.buildset.unwrap().id;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        };
+        let runtime = service.runtime(id).await.unwrap();
+        let retained = runtime
+            .git
+            .common_dir
+            .join("tollgate/artifacts/expired/report.txt");
+        std::fs::create_dir_all(retained.parent().unwrap()).unwrap();
+        std::fs::write(&retained, "expired\n").unwrap();
+        runtime
+            .store
+            .record_artifact(
+                buildset_id,
+                Path::new("report.txt"),
+                &retained,
+                &blake3::hash(b"expired\n").to_hex(),
+                8,
+                OffsetDateTime::now_utc() - Duration::days(1),
+            )
+            .unwrap();
+        drop(runtime);
+        drop(service);
+
+        let reopened = TollgateService::open(support).await.unwrap();
+        let runtime = reopened.runtime(id).await.unwrap();
+        let expired = runtime
+            .store
+            .expired_artifacts(OffsetDateTime::now_utc())
+            .unwrap();
+        assert_eq!(
+            expired.len(),
+            1,
+            "activation must leave expiry to maintenance"
+        );
+        assert_eq!(expired[0].retention_state, "retained");
+        assert!(retained.exists());
+    }
+
+    async fn repository_with_published_seed(
+        root: &Path,
+        support: &Path,
+    ) -> (Arc<TollgateService>, RepositoryId, SeedRecord) {
+        let repository = committed_repository(root, "repository");
+        let service = TollgateService::open(support.to_owned()).await.unwrap();
+        let initialized = service
+            .initialize_repository_with_options(&repository, Some("true".into()), false)
+            .await
+            .unwrap();
+        std::fs::write(
+            repository.join(".tollgate/config.toml"),
+            r#"version = 1
+
+[[step]]
+name = "ci"
+run = "mkdir -p target && echo cached > target/cache"
+
+[[cache.paths]]
+path = "target"
+policy = "clone"
+"#,
+        )
+        .unwrap();
+        service
+            .apply_configuration(initialized.state.id, CommandId::new())
+            .await
+            .unwrap();
+        let check = service
+            .check_from(
+                initialized.state.id,
+                "HEAD".into(),
+                Some(repository.to_string_lossy().into_owned()),
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        while service
+            .item_details(initialized.state.id, check.item_id)
+            .await
+            .unwrap()
+            .item
+            .state
+            != QueueItemState::CheckPassed
+        {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        service
+            .snapshot_cache(initialized.state.id, CommandId::new())
+            .await
+            .unwrap();
+        let seed = service
+            .runtime(initialized.state.id)
+            .await
+            .unwrap()
+            .data
+            .lock()
+            .seeds
+            .iter()
+            .find(|seed| seed.state == "published")
+            .cloned()
+            .unwrap();
+        (service, initialized.state.id, seed)
+    }
+
+    fn seed_evidence_like(
+        seed: &SeedRecord,
+        seed_id: &str,
+        generation: u64,
+        staging: PathBuf,
+        destination: PathBuf,
+    ) -> SeedSnapshotEvidence {
+        let manifest = &seed.manifest;
+        let text = |name: &str| manifest[name].as_str().unwrap().to_owned();
+        SeedSnapshotEvidence {
+            repository_id: seed.repository_id,
+            request_digest: "interrupted-snapshot".into(),
+            seed_id: seed_id.into(),
+            generation,
+            staging,
+            destination,
+            source_slot: text("source_slot").parse().unwrap(),
+            source_oid: serde_json::from_value(manifest["source_oid"].clone()).unwrap(),
+            selected: manifest["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|entry| serde_json::from_value(entry["path"].clone()).unwrap())
+                .collect(),
+            cache_epoch: manifest["cache_epoch"].as_u64().unwrap(),
+            cache_policy_digest: text("cache_policy_digest"),
+            configuration_digest: text("configuration_digest"),
+            os: text("os"),
+            architecture: text("architecture"),
+        }
+    }
+
+    // Regression: an interrupted snapshot left a verified staging generation whose generation a
+    // later seed had already recorded. Startup recovery then failed activation with
+    // `UNIQUE constraint failed: seed_generations.repository_id, seed_generations.profile,
+    // seed_generations.generation` on every restart.
+    #[tokio::test]
+    async fn recovery_discards_a_staged_seed_whose_generation_is_already_recorded() {
+        let temporary = tempfile::tempdir().unwrap();
+        let support = temporary.path().join("support");
+        let (service, id, published) =
+            repository_with_published_seed(temporary.path(), &support).await;
+        assert_eq!(published.generation, 1);
+        let runtime = service.runtime(id).await.unwrap();
+        let published_path = PathBuf::from(&published.path);
+        let seeds_root = published_path.parent().unwrap().to_owned();
+        let staged_id = uuid::Uuid::now_v7().to_string();
+        let staging = seeds_root.join(format!(".staging-{staged_id}"));
+        let status = StdCommand::new("cp")
+            .arg("-Rp")
+            .arg(&published_path)
+            .arg(&staging)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let manifest_path = staging.join(".tollgate-seed-manifest.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["seed_id"] = serde_json::json!(staged_id);
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        let evidence = seed_evidence_like(
+            &published,
+            &staged_id,
+            published.generation,
+            staging.clone(),
+            seeds_root.join(format!("0-{staged_id}")),
+        );
+        verify_seed_publication(&staging, &evidence)
+            .expect("the fabricated staging generation is exact apart from its generation");
+        let command_id = CommandId::new();
+        runtime
+            .store
+            .prepare_operation(id, "cache-snapshot", command_id, &evidence)
+            .unwrap();
+        drop(runtime);
+        drop(service);
+
+        let reopened = TollgateService::open(support.clone()).await.unwrap();
+        let snapshot = reopened.snapshot().await.unwrap();
+        assert!(
+            snapshot.unavailable_repositories.is_empty(),
+            "{:?}",
+            snapshot.unavailable_repositories
+        );
+        let repository = reopened.repository_snapshot(id).await.unwrap();
+        assert_eq!(
+            repository.state.execution_state,
+            RepositoryExecutionState::Active
+        );
+        assert_eq!(
+            repository
+                .seeds
+                .iter()
+                .map(|seed| seed.id.clone())
+                .collect::<Vec<_>>(),
+            vec![published.id.clone()]
+        );
+        assert!(published_path.exists());
+        assert!(!staging.exists());
+        assert!(!evidence.destination.exists());
+        let runtime = reopened.runtime(id).await.unwrap();
+        assert!(
+            runtime
+                .store
+                .unfinished_operations(&["cache-snapshot"])
+                .unwrap()
+                .is_empty()
+        );
+        let quarantined = std::fs::read_dir(support.join("cache"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".pruned-seed-"))
+            .collect::<Vec<_>>();
+        assert_eq!(quarantined.len(), 1);
+        drop(runtime);
+        let storage = reopened.storage_status().await.unwrap();
+        assert!(storage.entries.iter().any(|entry| {
+            entry.class == "prune-quarantine"
+                && entry.reclaimable
+                && entry.path.ends_with(&quarantined[0])
+        }));
+    }
+
+    #[tokio::test]
+    async fn seed_generations_reserved_by_unfinished_intents_are_never_reused() {
+        let temporary = tempfile::tempdir().unwrap();
+        let support = temporary.path().join("support");
+        let (service, id, published) =
+            repository_with_published_seed(temporary.path(), &support).await;
+        let runtime = service.runtime(id).await.unwrap();
+        let seeds_root = PathBuf::from(&published.path).parent().unwrap().to_owned();
+        let reserved_id = uuid::Uuid::now_v7().to_string();
+        let evidence = seed_evidence_like(
+            &published,
+            &reserved_id,
+            published.generation + 1,
+            seeds_root.join(format!(".staging-{reserved_id}")),
+            seeds_root.join(format!("0-{reserved_id}")),
+        );
+        runtime
+            .store
+            .prepare_operation(id, "cache-snapshot", CommandId::new(), &evidence)
+            .unwrap();
+        drop(runtime);
+
+        let result = service.snapshot_cache(id, CommandId::new()).await.unwrap();
+        let runtime = service.runtime(id).await.unwrap();
+        let generation = runtime
+            .data
+            .lock()
+            .seeds
+            .iter()
+            .find(|seed| seed.id == result.seed_ids[0])
+            .unwrap()
+            .generation;
+        assert_eq!(generation, published.generation + 2);
+        drop(runtime);
+        drop(service);
+
+        let reopened = TollgateService::open(support).await.unwrap();
+        assert_eq!(
+            reopened
+                .repository_snapshot(id)
+                .await
+                .unwrap()
+                .state
+                .execution_state,
+            RepositoryExecutionState::Active
+        );
     }
 }

@@ -999,6 +999,7 @@ The initial CLI surface is:
 | --- | --- |
 | `tg init` | Register repository, create Tollgate-owned local `release` at the exact local `master` OID without changing the checkout, create the trusted local config, validate Git/shell/APFS/ref ownership, configure resources, provision a slot, and offer bootstrap CI. |
 | `tg repo add/remove/list` | Explicit registry management. Remove unregisters by default; it does not erase durable repository state. |
+| `tg repo activation [--wait] [--timeout <seconds>]` | Report each registered repository as active, activating (with phase and step), or unavailable (with error and recovery action); `--wait` prints progress until no repository is activating and exits `4` when any repository failed. |
 | `tg candidate [<rev>] [--wait] [--retain-worktree]` | Capture clean immutable source without promotion authority; optionally wait for validation and optionally preserve the source worktree after promotion. |
 | `tg approve [<rev>] [--wait] [--retain-worktree]` | Capture clean immutable source with promotion authority, enqueue, return item ID; optionally wait. Candidate-ID authorization uses the cleanup policy captured at submission. |
 | `tg push-master [--wait\|--status]` | Rebase a clean stale local `master` range onto certified `release` when needed, authorize each linear commit oldest-first, and return after scheduling by default. While validation runs, project an unchanged clean local tip onto rebuilt speculative history whenever certified `release` advances; `--wait` additionally waits for the tail result, while read-only `--status` reports the latest durably identified master push and any failed step. |
@@ -1111,6 +1112,7 @@ Initialization is resumable and includes:
 Diagnostics verify:
 
 - app/CLI/protocol versions and single-instance lock;
+- startup activation: while the repository is still activating, Doctor reports the serving app and the activation phase and step instead of repository checks;
 - repository/common-dir identity and permissions;
 - SQLite integrity/schema/backups;
 - integration ref ownership and external movement;
@@ -1128,7 +1130,7 @@ A diagnostics bundle is local, redacted, previewable, and user-shared only. It c
 
 ### 19.1 Startup reconciliation
 
-The app acquires its single-instance lock, opens/migrates global preferences, then activates registered repositories independently. For each repository it:
+The app acquires its single-instance lock, opens/migrates global preferences, and binds its IPC socket before any repository work. It then activates registered repositories independently in the background, at most three at a time. Until a repository finishes every step below it is *activating*: the app snapshot, `tg status`, `tg doctor`, and `tg repo activation` report its phase (`queued`, `opening`, `recovering`, or `resuming`) and current step, and every other command for it returns the retryable `repository-activating` error. Its runtime becomes visible to commands only after recovery completes, so no command observes a half-recovered repository. For each repository it:
 
 1. Acquires the repository ownership lock.
 2. Opens SQLite, checks integrity, and reads the last clean-shutdown marker.
@@ -1139,7 +1141,7 @@ The app acquires its single-instance lock, opens/migrates global preferences, th
 7. Reloads the trusted local configuration and captures a new shell-environment snapshot.
 8. Blocks or resumes the repository based on proof, never on optimistic inference.
 
-One corrupt/blocked repository does not prevent other registered repositories or the app UI from starting.
+One corrupt/blocked repository does not prevent other registered repositories or the app UI from starting: an activation failure marks only that repository unavailable, with its error and recovery action. Activation never prunes expired artifacts; the maintenance sweep owns artifact retention.
 
 Intent reconciliation uses this evidence matrix:
 
@@ -1155,6 +1157,8 @@ Intent reconciliation uses this evidence matrix:
 | Seed publication | generation path, completed intent, manifest, entry metadata, and per-file clone-success records agree | final generation absent and only owned staging exists | quarantine and provision cold |
 | Pruning | tombstone and owned quarantine path identify the exact generation/artifact selected | original still exists unchanged and quarantine does not | block on identity mismatch; deletion may resume only inside verified quarantine |
 | Migration/backup | schema version, migration journal, and verified online-backup identity agree | old schema and database identity remain intact | preserve both database/backup and block |
+
+Seed generations are unique per repository and profile. A live snapshot never allocates a generation still named by an unfinished seed intent, and a snapshot that fails before its final rename discards its staging at once. A seed intent whose generation another seed already records can never complete exactly, so recovery moves its staging or final path to reclaimable `.pruned-` cache quarantine and cancels the intent; the same applies to a seed path that fails verification.
 
 Completion based on recovery evidence emits the same idempotent domain result as the uninterrupted path, with actor `recovery`. Recovery never uses a worker interruption marker as success evidence and never treats a transport exit code, filename prefix, or SQLite intent alone as proof of an external effect.
 

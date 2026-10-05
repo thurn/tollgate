@@ -72,6 +72,7 @@ completedCheck.item.promotion_authorized = false;
 export const demoSnapshot: AppSnapshot = {
   version: "0.1.0",
   generated_at: now.toISOString(),
+  activating_repositories: [],
   unavailable_repositories: [],
   environment: { snapshot_id: "env-019fef58", fingerprint: "44acbc2fa591b40e", path: "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin", variable_count: 42 },
   repositories: [

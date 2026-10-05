@@ -13,7 +13,7 @@ use tollgate_ipc::{
     MAX_CONTROL_PAYLOAD, MAX_LOG_PAYLOAD, PROTOCOL_VERSION, StructuredError, verify_peer_uid,
 };
 use tollgate_service::{
-    AppSnapshot, ArtifactPage, DiagnoseResult, ItemWaitStatus, QueueItemView,
+    ActivatingRepository, AppSnapshot, ArtifactPage, DiagnoseResult, ItemWaitStatus, QueueItemView,
     RepositoryDeliveryContext, RepositorySnapshot, UnavailableRepository,
 };
 use uuid::Uuid;
@@ -188,6 +188,18 @@ enum RepoCommand {
         id: RepositoryId,
     },
     List,
+    /// Report startup activation of every registered repository
+    Activation {
+        #[arg(long, help = "Print progress until no repository is still activating")]
+        wait: bool,
+        #[arg(
+            long,
+            value_name = "SECONDS",
+            requires = "wait",
+            help = "Fail when activation is still running after this many seconds"
+        )]
+        timeout: Option<u64>,
+    },
 }
 #[derive(Subcommand)]
 enum WorktreeCommand {
@@ -339,15 +351,76 @@ async fn run(cli: Cli) -> anyhow::Result<u8> {
             let snapshot = client.snapshot().await?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&snapshot.repositories)?);
-            } else if snapshot.repositories.is_empty() {
+            } else if snapshot.repositories.is_empty()
+                && snapshot.activating_repositories.is_empty()
+                && snapshot.unavailable_repositories.is_empty()
+            {
                 println!("No registered repositories.");
             } else {
-                for repository in snapshot.repositories {
+                for repository in &snapshot.repositories {
                     println!(
                         "{:<20} {}  {}",
                         repository.state.name, repository.state.id, repository.state.path
                     );
                 }
+                for repository in &snapshot.activating_repositories {
+                    println!(
+                        "{:<20} {}  {}  ({})",
+                        repository.name,
+                        repository.id,
+                        repository.path.display(),
+                        activation_progress(repository, snapshot.generated_at)
+                    );
+                }
+                for repository in &snapshot.unavailable_repositories {
+                    println!(
+                        "{:<20} {}  {}  (unavailable)",
+                        repository.name,
+                        repository.id,
+                        repository.path.display()
+                    );
+                }
+            }
+        }
+        TopCommand::Repo(RepoCommand::Activation { wait, timeout }) => {
+            let deadline =
+                timeout.map(|seconds| tokio::time::Instant::now() + Duration::from_secs(seconds));
+            let mut reported = HashMap::<RepositoryId, String>::new();
+            loop {
+                let snapshot = client.snapshot().await?;
+                let report = activation_report(&snapshot);
+                if !cli.json {
+                    for entry in &report {
+                        let line = activation_report_line(entry);
+                        if reported.get(&entry.id) != Some(&line) {
+                            println!("{line}");
+                            reported.insert(entry.id, line);
+                        }
+                    }
+                }
+                let activating = snapshot.activating_repositories.len();
+                if !wait || activating == 0 {
+                    if cli.json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "repositories": report
+                            }))?
+                        );
+                    }
+                    return Ok(if wait && !snapshot.unavailable_repositories.is_empty() {
+                        4
+                    } else {
+                        0
+                    });
+                }
+                if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+                    return Err(anyhow!(
+                        "{activating} repositories were still activating after {} seconds",
+                        timeout.unwrap_or_default()
+                    ));
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
             }
         }
         TopCommand::Repo(RepoCommand::Remove { id }) => {
@@ -639,11 +712,32 @@ async fn run(cli: Cli) -> anyhow::Result<u8> {
                     }
                 }
             } else {
-                let repository = select_repository(&mut client, cli.repository).await?;
-                if cli.json {
-                    println!("{}", serde_json::to_string_pretty(&repository)?);
-                } else {
-                    print_status(&repository, None);
+                match select_repository_target(&mut client, cli.repository).await? {
+                    RepositoryTarget::Active(repository) => {
+                        if cli.json {
+                            println!("{}", serde_json::to_string_pretty(&repository)?);
+                        } else {
+                            print_status(&repository, None);
+                        }
+                    }
+                    RepositoryTarget::Activating(activation, now) => {
+                        if cli.json {
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&serde_json::json!({
+                                    "status": "activating",
+                                    "activation": activation,
+                                }))?
+                            );
+                        } else {
+                            println!(
+                                "{} · {}\n  activating  {}\n  commands for this repository wait until activation completes",
+                                activation.name,
+                                activation.id,
+                                activation_progress(&activation, now)
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -1237,16 +1331,18 @@ async fn run(cli: Cli) -> anyhow::Result<u8> {
             }
         }
         TopCommand::Doctor => {
-            let repository = select_repository(&mut client, cli.repository).await?;
-            let report = client
-                .request(IpcCommand::Doctor {
-                    repository_id: repository.state.id,
-                })
-                .await?;
+            let (repository_id, name) =
+                match select_repository_target(&mut client, cli.repository).await? {
+                    RepositoryTarget::Active(repository) => {
+                        (repository.state.id, repository.state.name)
+                    }
+                    RepositoryTarget::Activating(activation, _) => (activation.id, activation.name),
+                };
+            let report = client.request(IpcCommand::Doctor { repository_id }).await?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
-                println!("Tollgate doctor · {}", repository.state.name);
+                println!("Tollgate doctor · {name}");
                 for check in report["checks"].as_array().into_iter().flatten() {
                     let healthy = check["status"].as_str() == Some("healthy");
                     println!(
@@ -1750,21 +1846,61 @@ fn master_push_failed_steps(view: &QueueItemView) -> Vec<serde_json::Value> {
         .collect()
 }
 
+/// A selected repository: either published and serving, or still activating at app startup.
+enum RepositoryTarget {
+    Active(Box<RepositorySnapshot>),
+    Activating(ActivatingRepository, time::OffsetDateTime),
+}
+
 async fn select_repository(
     client: &mut IpcClient,
     selected: Option<RepositoryId>,
 ) -> anyhow::Result<RepositorySnapshot> {
+    match select_repository_target(client, selected).await? {
+        RepositoryTarget::Active(repository) => Ok(*repository),
+        RepositoryTarget::Activating(activation, now) => {
+            Err(activating_repository_error(&activation, now))
+        }
+    }
+}
+
+async fn select_repository_target(
+    client: &mut IpcClient,
+    selected: Option<RepositoryId>,
+) -> anyhow::Result<RepositoryTarget> {
     let snapshot = client.snapshot().await?;
+    let current = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| std::fs::canonicalize(cwd).ok());
+    resolve_repository_target(snapshot, selected, current.as_deref())
+}
+
+fn resolve_repository_target(
+    snapshot: AppSnapshot,
+    selected: Option<RepositoryId>,
+    current: Option<&std::path::Path>,
+) -> anyhow::Result<RepositoryTarget> {
+    let now = snapshot.generated_at;
+    let AppSnapshot {
+        repositories,
+        activating_repositories,
+        unavailable_repositories,
+        ..
+    } = snapshot;
     if let Some(id) = selected {
-        if let Some(repository) = snapshot
-            .repositories
+        if let Some(repository) = repositories
             .into_iter()
             .find(|repository| repository.state.id == id)
         {
-            return Ok(repository);
+            return Ok(RepositoryTarget::Active(Box::new(repository)));
         }
-        if let Some(repository) = snapshot
-            .unavailable_repositories
+        if let Some(activation) = activating_repositories
+            .into_iter()
+            .find(|activation| activation.id == id)
+        {
+            return Ok(RepositoryTarget::Activating(activation, now));
+        }
+        if let Some(repository) = unavailable_repositories
             .iter()
             .find(|repository| repository.id == id)
         {
@@ -1772,30 +1908,163 @@ async fn select_repository(
         }
         return Err(anyhow!("repository {id} is not registered"));
     }
-    let current = std::env::current_dir()
-        .ok()
-        .and_then(|cwd| std::fs::canonicalize(cwd).ok());
-    if let Some(repository) = snapshot.repositories.iter().find(|repository| {
-        current
-            .as_ref()
-            .is_some_and(|cwd| cwd.starts_with(&repository.state.path))
-    }) {
-        return Ok(repository.clone());
+    let contains = |path: &std::path::Path| current.is_some_and(|cwd| cwd.starts_with(path));
+    if let Some(index) = repositories
+        .iter()
+        .position(|repository| contains(std::path::Path::new(&repository.state.path)))
+    {
+        return Ok(RepositoryTarget::Active(Box::new(
+            repositories.into_iter().nth(index).unwrap(),
+        )));
     }
-    if let Some(repository) = snapshot.unavailable_repositories.iter().find(|repository| {
-        current
-            .as_ref()
-            .is_some_and(|cwd| cwd.starts_with(&repository.path))
-    }) {
+    if let Some(index) = activating_repositories
+        .iter()
+        .position(|activation| contains(&activation.path))
+    {
+        return Ok(RepositoryTarget::Activating(
+            activating_repositories.into_iter().nth(index).unwrap(),
+            now,
+        ));
+    }
+    if let Some(repository) = unavailable_repositories
+        .iter()
+        .find(|repository| contains(&repository.path))
+    {
         return Err(unavailable_repository_error(repository));
     }
-    if snapshot.repositories.len() == 1 {
-        return Ok(snapshot.repositories.into_iter().next().unwrap());
+    let registered = repositories.len() + activating_repositories.len();
+    if registered == 1 {
+        return Ok(match repositories.into_iter().next() {
+            Some(repository) => RepositoryTarget::Active(Box::new(repository)),
+            None => RepositoryTarget::Activating(
+                activating_repositories.into_iter().next().unwrap(),
+                now,
+            ),
+        });
     }
     Err(anyhow!(
-        "select a repository with --repository <ID> ({} registered)",
-        snapshot.repositories.len()
+        "select a repository with --repository <ID> ({registered} registered)"
     ))
+}
+
+fn activation_progress(activation: &ActivatingRepository, now: time::OffsetDateTime) -> String {
+    format!(
+        "{} · {} · {}s",
+        activation.phase.as_str(),
+        activation.step,
+        (now - activation.queued_at).whole_seconds().max(0)
+    )
+}
+
+fn activating_repository_error(
+    activation: &ActivatingRepository,
+    now: time::OffsetDateTime,
+) -> anyhow::Error {
+    anyhow!(IpcRequestError(StructuredError {
+        code: "repository-activating".into(),
+        message: format!(
+            "repository {} at {} is still activating ({}); retry after activation completes",
+            activation.id,
+            activation.path.display(),
+            activation_progress(activation, now)
+        ),
+        retryable: true,
+        details: serde_json::to_value(activation).ok(),
+    }))
+}
+
+#[derive(serde::Serialize)]
+struct ActivationReportEntry {
+    id: RepositoryId,
+    name: String,
+    path: PathBuf,
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phase: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    step: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    elapsed_seconds: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recovery_action: Option<String>,
+}
+
+fn activation_report(snapshot: &AppSnapshot) -> Vec<ActivationReportEntry> {
+    let mut entries = snapshot
+        .repositories
+        .iter()
+        .map(|repository| ActivationReportEntry {
+            id: repository.state.id,
+            name: repository.state.name.clone(),
+            path: PathBuf::from(&repository.state.path),
+            status: "active",
+            phase: None,
+            step: None,
+            elapsed_seconds: None,
+            error: None,
+            recovery_action: None,
+        })
+        .collect::<Vec<_>>();
+    entries.extend(snapshot.activating_repositories.iter().map(|activation| {
+        ActivationReportEntry {
+            id: activation.id,
+            name: activation.name.clone(),
+            path: activation.path.clone(),
+            status: "activating",
+            phase: Some(activation.phase.as_str()),
+            step: Some(activation.step.clone()),
+            elapsed_seconds: Some(
+                (snapshot.generated_at - activation.queued_at)
+                    .whole_seconds()
+                    .max(0),
+            ),
+            error: None,
+            recovery_action: None,
+        }
+    }));
+    entries.extend(snapshot.unavailable_repositories.iter().map(|repository| {
+        ActivationReportEntry {
+            id: repository.id,
+            name: repository.name.clone(),
+            path: repository.path.clone(),
+            status: "unavailable",
+            phase: None,
+            step: None,
+            elapsed_seconds: None,
+            error: Some(repository.error.clone()),
+            recovery_action: Some(repository.recovery_action.clone()),
+        }
+    }));
+    entries.sort_by(|left, right| {
+        left.name
+            .to_lowercase()
+            .cmp(&right.name.to_lowercase())
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    entries
+}
+
+/// One human-readable line per repository state; `--wait` reprints a repository only when its
+/// phase or step changes.
+fn activation_report_line(entry: &ActivationReportEntry) -> String {
+    match entry.status {
+        "activating" => format!(
+            "{:<20} activating   {} · {}",
+            entry.name,
+            entry.phase.unwrap_or_default(),
+            entry.step.as_deref().unwrap_or_default()
+        ),
+        "unavailable" => format!(
+            "{:<20} unavailable  {}\n{:<20} recovery     {}",
+            entry.name,
+            entry.error.as_deref().unwrap_or_default(),
+            "",
+            entry.recovery_action.as_deref().unwrap_or_default()
+        ),
+        status => format!("{:<20} {status}", entry.name),
+    }
 }
 
 fn unavailable_repository_error(repository: &UnavailableRepository) -> anyhow::Error {
@@ -2474,6 +2743,7 @@ fn classify_exit(error: &anyhow::Error) -> u8 {
                 | "candidate-terminal"
                 | "revision-conflict"
                 | "repository-blocked"
+                | "repository-activating"
         )
     {
         return 4;
@@ -2502,6 +2772,102 @@ mod tests {
     #[test]
     fn missing_tested_oid_is_rendered_as_unavailable() {
         assert_eq!(oid_value(&serde_json::Value::Null), "—");
+    }
+
+    fn activating_snapshot(path: &str) -> (AppSnapshot, ActivatingRepository) {
+        let now = time::OffsetDateTime::now_utc();
+        let activation = ActivatingRepository {
+            id: "019ffe40-a60d-7722-a369-2635222d1204".parse().unwrap(),
+            name: "starting".into(),
+            path: PathBuf::from(path),
+            phase: tollgate_service::ActivationPhase::Recovering,
+            step: "seed-intents".into(),
+            queued_at: now - time::Duration::seconds(12),
+            phase_started_at: now,
+        };
+        let snapshot = AppSnapshot {
+            version: "test".into(),
+            generated_at: now,
+            repositories: Vec::new(),
+            activating_repositories: vec![activation.clone()],
+            unavailable_repositories: Vec::new(),
+            environment: tollgate_service::EnvironmentView {
+                snapshot_id: "environment".into(),
+                fingerprint: "fingerprint".into(),
+                path: "/usr/bin".into(),
+                variable_count: 1,
+            },
+        };
+        (snapshot, activation)
+    }
+
+    #[test]
+    fn an_activating_repository_resolves_by_id_and_working_directory() {
+        let (snapshot, activation) = activating_snapshot("/tmp/starting");
+        assert!(matches!(
+            resolve_repository_target(snapshot.clone(), Some(activation.id), None).unwrap(),
+            RepositoryTarget::Activating(found, _) if found.id == activation.id
+        ));
+        assert!(matches!(
+            resolve_repository_target(
+                snapshot.clone(),
+                None,
+                Some(std::path::Path::new("/tmp/starting/nested"))
+            )
+            .unwrap(),
+            RepositoryTarget::Activating(found, _) if found.id == activation.id
+        ));
+        let other = "019ffe40-a60d-7722-a369-2635222d1205".parse().unwrap();
+        assert!(resolve_repository_target(snapshot, Some(other), None).is_err());
+    }
+
+    #[test]
+    fn commands_for_an_activating_repository_fail_with_a_retryable_structured_error() {
+        let (snapshot, activation) = activating_snapshot("/tmp/starting");
+        let error = activating_repository_error(&activation, snapshot.generated_at);
+        let structured = error.downcast_ref::<IpcRequestError>().unwrap();
+        assert_eq!(structured.0.code, "repository-activating");
+        assert!(structured.0.retryable);
+        assert_eq!(
+            structured.0.details.as_ref().unwrap()["phase"],
+            "recovering"
+        );
+        assert_eq!(classify_exit(&error), 4);
+    }
+
+    #[test]
+    fn activation_report_lists_each_repository_state() {
+        let (mut snapshot, activation) = activating_snapshot("/tmp/starting");
+        snapshot
+            .unavailable_repositories
+            .push(UnavailableRepository {
+                id: "019ffe40-a60d-7722-a369-2635222d1206".parse().unwrap(),
+                name: "damaged".into(),
+                path: PathBuf::from("/tmp/damaged"),
+                error: "integrity check failed".into(),
+                recovery_action: "Restore the newest backup.".into(),
+            });
+        let report = activation_report(&snapshot);
+        let statuses = report
+            .iter()
+            .map(|entry| (entry.id, entry.status))
+            .collect::<Vec<_>>();
+        assert!(statuses.contains(&(activation.id, "activating")));
+        assert!(statuses.contains(&(
+            "019ffe40-a60d-7722-a369-2635222d1206".parse().unwrap(),
+            "unavailable"
+        )));
+        let activating = report
+            .iter()
+            .find(|entry| entry.id == activation.id)
+            .unwrap();
+        assert_eq!(activating.phase, Some("recovering"));
+        assert_eq!(activating.elapsed_seconds, Some(12));
+        let unavailable = report
+            .iter()
+            .find(|entry| entry.status == "unavailable")
+            .unwrap();
+        assert!(unavailable.recovery_action.is_some());
     }
 
     #[test]
