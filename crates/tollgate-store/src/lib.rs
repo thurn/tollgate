@@ -18,8 +18,24 @@ use tollgate_domain::{
     RepositoryId, RepositoryState, StepAttemptId, StepId, ValidationGeneration,
 };
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 pub type PromotionEdge = (Vec<u8>, Vec<u8>);
+
+/// Operation-intent kind for one batch of artifact pruning.
+pub const ARTIFACT_PRUNE_BATCH_KIND: &str = "artifact-prune-batch";
+
+const ARTIFACT_COLUMNS: &str = "artifact_id, buildset_id, source_path, retained_path, hash, size, retention_state, created_at, expires_at";
+type ArtifactRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    i64,
+    String,
+    String,
+    String,
+);
 
 #[derive(Clone, Debug, Serialize)]
 pub struct StepAttemptRecord {
@@ -81,6 +97,8 @@ pub enum StoreError {
     ArtifactTooLarge(u64),
     #[error("command UUID was replayed with a different kind or payload")]
     CommandReplayMismatch,
+    #[error("command UUID {0} already names a recorded operation")]
+    CommandAlreadyRecorded(String),
     #[error("another {kind} operation is already in progress")]
     OperationInProgress { kind: String },
     #[error("database schema version {actual} is newer than this Tollgate supports ({supported})")]
@@ -128,6 +146,14 @@ pub struct ArtifactRecord {
     pub expires_at: OffsetDateTime,
 }
 
+/// An artifact whose pruning failed. Automatic pruning skips it until a later explicit prune
+/// of that artifact succeeds.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
+pub struct ArtifactAttention {
+    pub artifact_id: String,
+    pub detail: String,
+}
+
 impl IntentState {
     fn as_str(&self) -> &'static str {
         match self {
@@ -155,10 +181,11 @@ impl RepositoryStore {
             return Ok(0);
         }
         let database_bytes = std::fs::metadata(path)?.len();
-        // Keep room for both the crash-recovery backup and SQLite's VACUUM rebuild. In the
-        // worst case neither is smaller than the source database.
+        // Keep room for the crash-recovery backup and, before version 3, SQLite's VACUUM
+        // rebuild. In the worst case neither is smaller than the source database.
+        let copies = if version < 3 { 2 } else { 1 };
         Ok(database_bytes
-            .saturating_mul(2)
+            .saturating_mul(copies)
             .saturating_add(512 * 1024 * 1024))
     }
 
@@ -944,72 +971,209 @@ impl RepositoryStore {
         limit: usize,
     ) -> Result<Vec<ArtifactRecord>, StoreError> {
         let connection = self.connection.lock();
-        let mut statement = connection.prepare(
-            "SELECT artifact_id, buildset_id, source_path, retained_path, hash, size, retention_state, created_at, expires_at FROM artifacts WHERE retention_state IN ('retained','pinned') ORDER BY retained_path LIMIT ?1 OFFSET ?2",
-        )?;
+        let mut statement = connection.prepare(&format!(
+            "SELECT {ARTIFACT_COLUMNS} FROM artifacts WHERE retention_state IN ('retained','pinned') ORDER BY retained_path LIMIT ?1 OFFSET ?2"
+        ))?;
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let offset = i64::try_from(offset).unwrap_or(i64::MAX);
-        let rows = statement.query_map(params![limit, offset], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, i64>(5)?,
-                row.get::<_, String>(6)?,
-                row.get::<_, String>(7)?,
-                row.get::<_, String>(8)?,
-            ))
-        })?;
-        let mut records = Vec::new();
-        for row in rows {
-            let (
-                artifact_id,
-                buildset_id,
-                source_path,
-                retained_path,
-                hash,
-                size,
-                retention_state,
-                created_at,
-                expires_at,
-            ) = row?;
-            records.push(ArtifactRecord {
-                artifact_id,
-                buildset_id: buildset_id.parse().map_err(|error| {
-                    StoreError::Integrity(format!("invalid artifact buildset ID: {error}"))
-                })?,
-                source_path,
-                retained_path,
-                hash,
-                size: u64::try_from(size).map_err(|_| {
-                    StoreError::Integrity("artifact has a negative retained size".into())
-                })?,
-                retention_state,
-                created_at: decode_time(&created_at)?,
-                expires_at: decode_time(&expires_at)?,
-            });
-        }
-        Ok(records)
+        let rows = statement.query_map(params![limit, offset], artifact_row)?;
+        rows.map(|row| decode_artifact(row?)).collect()
     }
 
+    /// The retained or pinned artifact with this ID, read by primary key.
     pub fn artifact(&self, artifact_id: &str) -> Result<Option<ArtifactRecord>, StoreError> {
-        Ok(self
-            .retained_artifacts()?
-            .into_iter()
-            .find(|record| record.artifact_id == artifact_id))
+        let row = self
+            .connection
+            .lock()
+            .query_row(
+                &format!(
+                    "SELECT {ARTIFACT_COLUMNS} FROM artifacts WHERE artifact_id=?1 AND retention_state IN ('retained','pinned')"
+                ),
+                [artifact_id],
+                artifact_row,
+            )
+            .optional()?;
+        row.map(decode_artifact).transpose()
     }
 
+    /// The artifact with this ID in any retention state, including `pruned`.
+    pub fn artifact_record(&self, artifact_id: &str) -> Result<Option<ArtifactRecord>, StoreError> {
+        let row = self
+            .connection
+            .lock()
+            .query_row(
+                &format!("SELECT {ARTIFACT_COLUMNS} FROM artifacts WHERE artifact_id=?1"),
+                [artifact_id],
+                artifact_row,
+            )
+            .optional()?;
+        row.map(decode_artifact).transpose()
+    }
+
+    /// At most `limit` timed-retention artifacts that expired at or before `now`, oldest expiry
+    /// first. Artifacts that need attention and artifacts of the excluded buildsets are skipped,
+    /// so every returned artifact is eligible for automatic pruning.
     pub fn expired_artifacts(
         &self,
         now: OffsetDateTime,
+        excluded_buildsets: &[tollgate_domain::BuildsetId],
+        limit: usize,
     ) -> Result<Vec<ArtifactRecord>, StoreError> {
-        Ok(self
-            .retained_artifacts()?
-            .into_iter()
-            .filter(|record| record.retention_state == "retained" && record.expires_at <= now)
-            .collect())
+        let excluded = std::iter::repeat_n("?", excluded_buildsets.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        // Timestamps are decimal Unix nanoseconds, which have 19 digits for every date between
+        // 2001 and 2286, so text order is time order and the expiry index serves this range.
+        let sql = format!(
+            "SELECT {ARTIFACT_COLUMNS} FROM artifacts
+             WHERE retention_state='retained' AND expires_at <= ?
+               AND artifact_id NOT IN (SELECT artifact_id FROM artifact_attention)
+               AND buildset_id NOT IN ({excluded})
+             ORDER BY expires_at LIMIT ?"
+        );
+        let mut values = vec![rusqlite::types::Value::Text(encode_time(now))];
+        values.extend(
+            excluded_buildsets
+                .iter()
+                .map(|buildset| rusqlite::types::Value::Text(buildset.to_string())),
+        );
+        values.push(rusqlite::types::Value::Integer(
+            i64::try_from(limit).unwrap_or(i64::MAX),
+        ));
+        let connection = self.connection.lock();
+        let mut statement = connection.prepare(&sql)?;
+        let rows = statement.query_map(rusqlite::params_from_iter(values), artifact_row)?;
+        rows.map(|row| decode_artifact(row?)).collect()
+    }
+
+    /// Artifacts whose pruning failed, in the order they were recorded, plus their total count.
+    pub fn artifacts_needing_attention(
+        &self,
+        limit: usize,
+    ) -> Result<(u64, Vec<ArtifactAttention>), StoreError> {
+        let connection = self.connection.lock();
+        let count: i64 =
+            connection.query_row("SELECT COUNT(*) FROM artifact_attention", [], |row| {
+                row.get(0)
+            })?;
+        let mut statement = connection.prepare(
+            "SELECT artifact_id, detail FROM artifact_attention ORDER BY recorded_at, artifact_id LIMIT ?1",
+        )?;
+        let rows = statement.query_map([i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
+            Ok(ArtifactAttention {
+                artifact_id: row.get(0)?,
+                detail: row.get(1)?,
+            })
+        })?;
+        Ok((
+            nonnegative_sqlite_count("artifact attention count", count)?,
+            rows.collect::<Result<Vec<_>, _>>()?,
+        ))
+    }
+
+    /// Records a prepared operation whose command ID must not already name any operation.
+    /// Batched pruning acts on the filesystem immediately afterward, so a replayed command ID
+    /// must fail rather than repeat external effects of an earlier intent.
+    pub fn prepare_unique_operation(
+        &self,
+        repository_id: RepositoryId,
+        kind: &str,
+        command_id: CommandId,
+        evidence: &impl Serialize,
+    ) -> Result<(), StoreError> {
+        let created = self.connection.lock().execute(
+            "INSERT INTO operation_intents (intent_id, repository_id, kind, state, command_id, expected_json, created_at, updated_at)
+             SELECT ?1, ?2, ?3, 'prepared', ?4, ?5, ?6, ?6
+             WHERE NOT EXISTS (SELECT 1 FROM operation_intents WHERE command_id=?4)",
+            params![uuid::Uuid::now_v7().to_string(), repository_id.to_string(), kind, command_id.to_string(), encode(evidence)?, now()],
+        )?;
+        if created != 1 {
+            return Err(StoreError::CommandAlreadyRecorded(command_id.to_string()));
+        }
+        Ok(())
+    }
+
+    /// Completes one artifact pruning batch in a single transaction: every pruned artifact
+    /// becomes `pruned` (clearing any earlier attention record), every failed artifact is
+    /// recorded as needing attention, the batch intent completes, and one `artifact.pruned`
+    /// event is appended. A replayable client command also records its result.
+    #[allow(clippy::too_many_arguments)]
+    pub fn complete_artifact_prune_batch<R: Serialize>(
+        &self,
+        state: &RepositoryState,
+        command_id: CommandId,
+        pruned: &[String],
+        attention: &[ArtifactAttention],
+        request_digest: Option<&str>,
+        response: &R,
+        actor: Actor,
+    ) -> Result<DomainEvent, StoreError> {
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let recorded_at = now();
+        {
+            let mut prune = transaction.prepare(
+                "UPDATE artifacts SET retention_state='pruned' WHERE artifact_id=?1 AND retention_state IN ('retained','pinned')",
+            )?;
+            let mut clear =
+                transaction.prepare("DELETE FROM artifact_attention WHERE artifact_id=?1")?;
+            for artifact_id in pruned {
+                if prune.execute([artifact_id])? != 1 {
+                    return Err(StoreError::Integrity(format!(
+                        "artifact {artifact_id} was not in the expected retention state"
+                    )));
+                }
+                clear.execute([artifact_id])?;
+            }
+            let mut record = transaction.prepare(
+                "INSERT INTO artifact_attention (artifact_id, command_id, detail, recorded_at) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(artifact_id) DO UPDATE SET command_id=excluded.command_id, detail=excluded.detail, recorded_at=excluded.recorded_at",
+            )?;
+            for entry in attention {
+                record.execute(params![
+                    entry.artifact_id,
+                    command_id.to_string(),
+                    entry.detail,
+                    recorded_at
+                ])?;
+            }
+        }
+        let sequence = state.event_sequence + 1;
+        let mut persisted_state = state.clone();
+        persisted_state.event_sequence = sequence;
+        transaction.execute(
+            "UPDATE repository_state SET state_json=?2, event_sequence=?3, updated_at=?4 WHERE repository_id=?1",
+            params![state.id.to_string(), encode(&persisted_state)?, sequence as i64, recorded_at],
+        )?;
+        let completed = transaction.execute(
+            "UPDATE operation_intents SET state='completed', observed_json=?2, updated_at=?3 WHERE repository_id=?1 AND command_id=?4 AND kind=?5 AND state IN ('prepared','external-applied')",
+            params![state.id.to_string(), encode(response)?, recorded_at, command_id.to_string(), ARTIFACT_PRUNE_BATCH_KIND],
+        )?;
+        if completed != 1 {
+            return Err(StoreError::Integrity(format!(
+                "artifact pruning batch {command_id} has no unfinished intent"
+            )));
+        }
+        compact_terminal_intent(&transaction, command_id)?;
+        let event = DomainEvent {
+            id: EventId::new(),
+            repository_id: state.id,
+            sequence,
+            actor,
+            command_id: Some(command_id),
+            kind: "artifact.pruned".into(),
+            payload: serde_json::to_value(response)?,
+            created_at: OffsetDateTime::now_utc(),
+        };
+        insert_event(&transaction, &event)?;
+        if let Some(request_digest) = request_digest {
+            transaction.execute(
+                "INSERT INTO command_results (command_id, command_kind, request_digest, response_json, event_sequence, created_at) VALUES (?1, 'artifact-prune', ?2, ?3, ?4, ?5)",
+                params![command_id.to_string(), request_digest, encode(response)?, sequence as i64, recorded_at],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(event)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1634,18 +1798,6 @@ impl RepositoryStore {
         Ok(())
     }
 
-    pub fn completed_operation_evidence(
-        &self,
-        kind: &str,
-    ) -> Result<Vec<serde_json::Value>, StoreError> {
-        let connection = self.connection.lock();
-        let mut statement = connection.prepare(
-            "SELECT expected_json FROM operation_intents WHERE kind=?1 AND state='completed' ORDER BY created_at",
-        )?;
-        let rows = statement.query_map([kind], |row| row.get::<_, String>(0))?;
-        rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
-    }
-
     pub fn unsettled_completed_operation_evidence(
         &self,
         kind: &str,
@@ -2258,7 +2410,7 @@ fn compact_terminal_intent(
                 )?;
             }
         }
-        "artifact" => {
+        "artifact" | ARTIFACT_PRUNE_BATCH_KIND => {
             transaction.execute(
                 "UPDATE operation_intents SET expected_json=?2 WHERE command_id=?1",
                 params![command_id.to_string(), compacted_payload(&expected)?],
@@ -2267,6 +2419,48 @@ fn compact_terminal_intent(
         _ => {}
     }
     Ok(())
+}
+
+fn artifact_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ArtifactRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+    ))
+}
+
+fn decode_artifact(row: ArtifactRow) -> Result<ArtifactRecord, StoreError> {
+    let (
+        artifact_id,
+        buildset_id,
+        source_path,
+        retained_path,
+        hash,
+        size,
+        retention_state,
+        created_at,
+        expires_at,
+    ) = row;
+    Ok(ArtifactRecord {
+        artifact_id,
+        buildset_id: buildset_id.parse().map_err(|error| {
+            StoreError::Integrity(format!("invalid artifact buildset ID: {error}"))
+        })?,
+        source_path,
+        retained_path,
+        hash,
+        size: u64::try_from(size)
+            .map_err(|_| StoreError::Integrity("artifact has a negative retained size".into()))?,
+        retention_state,
+        created_at: decode_time(&created_at)?,
+        expires_at: decode_time(&expires_at)?,
+    })
 }
 
 fn compacted_payload(encoded: &str) -> Result<String, StoreError> {
@@ -2287,7 +2481,7 @@ fn compacted_payload(encoded: &str) -> Result<String, StoreError> {
 fn compact_all_terminal_intents(transaction: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
     let command_ids = {
         let mut statement = transaction.prepare(
-            "SELECT command_id FROM operation_intents WHERE state IN ('completed','canceled') AND kind IN ('cache-snapshot','cache-purge','artifact')",
+            "SELECT command_id FROM operation_intents WHERE state IN ('completed','canceled') AND kind IN ('cache-snapshot','cache-purge','artifact','artifact-prune-batch')",
         )?;
         statement
             .query_map([], |row| row.get::<_, String>(0))?
@@ -2453,6 +2647,39 @@ fn migrate(connection: &Connection, database_path: Option<&Path>) -> Result<(), 
 
     let backup = database_path.map(|path| create_migration_backup(connection, path, version));
     let backup = backup.transpose()?;
+    if version < 3 {
+        migrate_to_compacted_payloads(connection, version)?;
+    }
+
+    // Version 4 adds the operation-intent and artifact-expiry indexes and the artifact attention
+    // table through SCHEMA. ANALYZE records planner statistics for the new indexes, so pruning
+    // and intent lookups on large existing databases read single rows instead of scanning.
+    let transaction = connection.unchecked_transaction()?;
+    transaction.execute_batch(SCHEMA)?;
+    transaction.execute_batch("DROP INDEX IF EXISTS queue_active_source")?;
+    transaction.execute_batch("ANALYZE")?;
+    transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    if let Some((path, hash)) = backup {
+        transaction.execute(
+            "INSERT INTO backup_records (backup_id, database_identity, schema_version, path, hash, verified, migration_id) VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6)",
+            params![uuid::Uuid::now_v7().to_string(), "repository-state", version, path.to_string_lossy(), hash, format!("schema-{version}-to-{SCHEMA_VERSION}")],
+        )?;
+    }
+    transaction.commit()?;
+    let integrity: String = connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    if integrity != "ok" {
+        return Err(StoreError::Integrity(format!(
+            "post-migration integrity check failed: {integrity}"
+        )));
+    }
+    Ok(())
+}
+
+/// Versions 1 and 2 carried disposable payloads (seed manifests, terminal intent evidence, and
+/// artifact event bodies) inline. This compacts them, converts the database to incremental
+/// auto-vacuum, and rebuilds it once. `user_version` is advanced only afterward by the caller,
+/// so an interrupted VACUUM retries this idempotent step on the next open.
+fn migrate_to_compacted_payloads(connection: &Connection, version: i64) -> Result<(), StoreError> {
     let artifact_columns = if version == 1 {
         let mut statement = connection.prepare("PRAGMA table_info(artifacts)")?;
         statement
@@ -2502,26 +2729,10 @@ fn migrate(connection: &Connection, database_path: Option<&Path>) -> Result<(), 
     transaction.commit()?;
 
     // Converting to incremental auto-vacuum plus this one-time rebuild releases the historical
-    // duplicate payload pages immediately. user_version is intentionally advanced afterward so
-    // an interrupted VACUUM retries this idempotent migration on the next open.
+    // duplicate payload pages immediately.
     connection.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
     connection.execute_batch("VACUUM")?;
 
-    let transaction = connection.unchecked_transaction()?;
-    transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-    if let Some((path, hash)) = backup {
-        transaction.execute(
-            "INSERT INTO backup_records (backup_id, database_identity, schema_version, path, hash, verified, migration_id) VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6)",
-            params![uuid::Uuid::now_v7().to_string(), "repository-state", version, path.to_string_lossy(), hash, format!("schema-{version}-to-{SCHEMA_VERSION}")],
-        )?;
-    }
-    transaction.commit()?;
-    let integrity: String = connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
-    if integrity != "ok" {
-        return Err(StoreError::Integrity(format!(
-            "post-migration integrity check failed: {integrity}"
-        )));
-    }
     Ok(())
 }
 
@@ -2670,6 +2881,10 @@ CREATE TABLE IF NOT EXISTS command_results (command_id TEXT PRIMARY KEY, command
 CREATE TABLE IF NOT EXISTS backup_records (backup_id TEXT PRIMARY KEY, database_identity TEXT NOT NULL, schema_version INTEGER NOT NULL, path TEXT NOT NULL, hash TEXT NOT NULL, verified INTEGER NOT NULL CHECK(verified IN (0,1)), migration_id TEXT) STRICT;
 CREATE TABLE IF NOT EXISTS events (event_id TEXT PRIMARY KEY, repository_id TEXT NOT NULL REFERENCES repository_state(repository_id), sequence INTEGER NOT NULL, actor TEXT NOT NULL, command_id TEXT, kind TEXT NOT NULL, event_json TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(repository_id,sequence)) STRICT;
 CREATE INDEX IF NOT EXISTS events_kind_time ON events(kind,created_at);
+CREATE INDEX IF NOT EXISTS operation_intent_command ON operation_intents(command_id,created_at);
+CREATE INDEX IF NOT EXISTS operation_intent_state ON operation_intents(state,kind);
+CREATE INDEX IF NOT EXISTS artifact_retention_expiry ON artifacts(retention_state,expires_at);
+CREATE TABLE IF NOT EXISTS artifact_attention (artifact_id TEXT PRIMARY KEY REFERENCES artifacts(artifact_id), command_id TEXT NOT NULL, detail TEXT NOT NULL, recorded_at TEXT NOT NULL) STRICT;
 "#;
 
 #[cfg(test)]
@@ -3358,5 +3573,502 @@ mod tests {
         assert_eq!(first.sequence, 2);
         assert_eq!(second.sequence, 3);
         assert_eq!(store.repository_state().unwrap().event_sequence, 3);
+    }
+
+    /// Statement-level counters from SQLite's trace hook for the current thread.
+    #[derive(Clone, Copy, Debug, Default)]
+    struct StatementTally {
+        statements: u64,
+        rows: u64,
+        fullscan_steps: u64,
+        vm_steps: u64,
+    }
+
+    thread_local! {
+        static TALLY: std::cell::Cell<StatementTally> = std::cell::Cell::new(StatementTally::default());
+    }
+
+    fn tally_statement(event: rusqlite::trace::TraceEvent<'_>) {
+        TALLY.with(|cell| {
+            let mut tally = cell.get();
+            match event {
+                rusqlite::trace::TraceEvent::Profile(statement, _) => {
+                    tally.statements += 1;
+                    tally.fullscan_steps += u64::try_from(
+                        statement.get_status(rusqlite::StatementStatus::FullscanStep),
+                    )
+                    .unwrap_or(0);
+                    tally.vm_steps +=
+                        u64::try_from(statement.get_status(rusqlite::StatementStatus::VmStep))
+                            .unwrap_or(0);
+                }
+                rusqlite::trace::TraceEvent::Row(_) => tally.rows += 1,
+                _ => {}
+            }
+            cell.set(tally);
+        });
+    }
+
+    /// Runs `operation` with statement tracing enabled and returns what SQLite executed. Status
+    /// counters of a statement executed repeatedly accumulate, so `vm_steps` is exact only for
+    /// operations that run each prepared statement once; `fullscan_steps` is zero either way
+    /// when no statement scans a table.
+    fn traced<T>(store: &RepositoryStore, operation: impl FnOnce() -> T) -> (T, StatementTally) {
+        TALLY.with(|cell| cell.set(StatementTally::default()));
+        store.connection.lock().trace_v2(
+            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_PROFILE
+                | rusqlite::trace::TraceEventCodes::SQLITE_TRACE_ROW,
+            Some(tally_statement),
+        );
+        let result = operation();
+        store
+            .connection
+            .lock()
+            .trace_v2(rusqlite::trace::TraceEventCodes::empty(), None);
+        (result, TALLY.with(std::cell::Cell::get))
+    }
+
+    struct SyntheticArtifacts {
+        buildset_id: tollgate_domain::BuildsetId,
+        expired: Vec<String>,
+        unexpired: Vec<String>,
+        completed_commands: Vec<CommandId>,
+    }
+
+    /// Loads `artifacts` retained artifacts (the first `expired` of them past expiry) and
+    /// `intents` completed single-artifact pruning intents, the shape of a long-lived store.
+    fn load_synthetic_artifacts(
+        store: &RepositoryStore,
+        state: &RepositoryState,
+        artifacts: usize,
+        expired: usize,
+        intents: usize,
+    ) -> SyntheticArtifacts {
+        let buildset_id = tollgate_domain::BuildsetId::new();
+        let now = OffsetDateTime::now_utc();
+        let mut result = SyntheticArtifacts {
+            buildset_id,
+            expired: Vec::new(),
+            unexpired: Vec::new(),
+            completed_commands: Vec::new(),
+        };
+        let mut connection = store.connection.lock();
+        let transaction = connection.transaction().unwrap();
+        transaction
+            .execute(
+                "INSERT INTO buildsets (buildset_id, item_id, generation_id, tested_format, tested_oid, expected_parent_oid, environment_fingerprint, slot_id, status, retry_of_buildset_id, attempt, buildset_json) VALUES (?1, NULL, NULL, 'sha1', x'00', x'00', 'environment', NULL, 'succeeded', NULL, 1, '{}')",
+                [buildset_id.to_string()],
+            )
+            .unwrap();
+        {
+            let mut insert = transaction
+                .prepare(
+                    "INSERT INTO artifacts (artifact_id, buildset_id, step_id, source_path, retained_path, hash, size, retention_state, created_at, expires_at) VALUES (?1, ?2, NULL, ?3, ?4, ?5, 8, 'retained', ?6, ?7)",
+                )
+                .unwrap();
+            for index in 0..artifacts {
+                let artifact_id = uuid::Uuid::now_v7().to_string();
+                let expires_at = if index < expired {
+                    now - time::Duration::days(1) - time::Duration::seconds(index as i64)
+                } else {
+                    now + time::Duration::days(30) + time::Duration::seconds(index as i64)
+                };
+                insert
+                    .execute(params![
+                        artifact_id,
+                        buildset_id.to_string(),
+                        format!("artifacts/{index}.txt"),
+                        format!("/artifacts/{buildset_id}/{index}.txt"),
+                        format!("{index:064x}"),
+                        encode_time(now - time::Duration::days(31)),
+                        encode_time(expires_at),
+                    ])
+                    .unwrap();
+                if index < expired {
+                    result.expired.push(artifact_id);
+                } else {
+                    result.unexpired.push(artifact_id);
+                }
+            }
+            let mut insert = transaction
+                .prepare(
+                    "INSERT INTO operation_intents (intent_id, repository_id, kind, state, command_id, expected_json, observed_json, created_at, updated_at) VALUES (?1, ?2, 'artifact-prune', 'completed', ?3, '{}', '{}', ?4, ?4)",
+                )
+                .unwrap();
+            for index in 0..intents {
+                let command_id = CommandId::new();
+                insert
+                    .execute(params![
+                        uuid::Uuid::now_v7().to_string(),
+                        state.id.to_string(),
+                        command_id.to_string(),
+                        (index as i64).to_string(),
+                    ])
+                    .unwrap();
+                if index % 10_000 == 0 {
+                    result.completed_commands.push(command_id);
+                }
+            }
+        }
+        transaction.commit().unwrap();
+        result
+    }
+
+    /// Returns the database to its version 3 shape: no pruning indexes, no attention table, and
+    /// no planner statistics.
+    fn downgrade_to_version_three(path: &Path) {
+        let connection = Connection::open(path).unwrap();
+        connection
+            .execute_batch(
+                "DROP INDEX operation_intent_command;
+                 DROP INDEX operation_intent_state;
+                 DROP INDEX artifact_retention_expiry;
+                 DROP TABLE artifact_attention;
+                 DROP TABLE IF EXISTS sqlite_stat1;",
+            )
+            .unwrap();
+        connection.pragma_update(None, "user_version", 3).unwrap();
+    }
+
+    fn assert_bounded_pruning_statements(
+        store: &RepositoryStore,
+        state: &mut RepositoryState,
+        synthetic: &SyntheticArtifacts,
+        expired_offset: usize,
+    ) {
+        let target = &synthetic.unexpired[synthetic.unexpired.len() / 2];
+        let (record, lookup) = traced(store, || store.artifact(target).unwrap());
+        assert_eq!(record.unwrap().artifact_id, *target);
+        assert_eq!(lookup.statements, 1, "{lookup:?}");
+        assert_eq!(lookup.rows, 1, "a lookup returns its one row: {lookup:?}");
+        assert_eq!(lookup.fullscan_steps, 0, "a lookup never scans: {lookup:?}");
+        assert!(
+            lookup.vm_steps < 100,
+            "a lookup reads one row, not the table: {lookup:?}"
+        );
+
+        let command = synthetic.completed_commands[1];
+        let (evidence, intent_lookup) = traced(store, || {
+            store.operation_evidence(command, "artifact-prune").unwrap()
+        });
+        assert!(evidence.is_some());
+        assert_eq!(intent_lookup.statements, 1, "{intent_lookup:?}");
+        assert_eq!(intent_lookup.fullscan_steps, 0, "{intent_lookup:?}");
+        assert!(intent_lookup.vm_steps < 100, "{intent_lookup:?}");
+
+        let batch_size = 200;
+        let command_id = CommandId::new();
+        let (pruned, prune) = traced(store, || {
+            let batch = store
+                .expired_artifacts(OffsetDateTime::now_utc(), &[], batch_size)
+                .unwrap();
+            store
+                .prepare_unique_operation(
+                    state.id,
+                    ARTIFACT_PRUNE_BATCH_KIND,
+                    command_id,
+                    &serde_json::json!({"artifacts": batch}),
+                )
+                .unwrap();
+            let pruned = batch
+                .iter()
+                .map(|record| record.artifact_id.clone())
+                .collect::<Vec<_>>();
+            let event = store
+                .complete_artifact_prune_batch(
+                    state,
+                    command_id,
+                    &pruned,
+                    &[],
+                    None,
+                    &serde_json::json!({"pruned": pruned}),
+                    Actor::App,
+                )
+                .unwrap();
+            state.event_sequence = event.sequence;
+            pruned
+        });
+        assert_eq!(pruned.len(), batch_size);
+        assert_eq!(
+            pruned,
+            synthetic.expired[expired_offset..expired_offset + batch_size]
+                .iter()
+                .rev()
+                .cloned()
+                .collect::<Vec<_>>(),
+            "the oldest expiry is pruned first"
+        );
+        let per_artifact = 2;
+        let per_batch = 16;
+        assert!(
+            prune.statements <= (per_artifact * batch_size + per_batch) as u64,
+            "a batch prune issues a bounded number of statements per artifact: {prune:?}"
+        );
+        assert_eq!(
+            prune.fullscan_steps, 0,
+            "no pruning statement scans a table: {prune:?}"
+        );
+        assert!(
+            prune.rows <= (batch_size + per_batch) as u64,
+            "only selecting the batch returns a row per artifact: {prune:?}"
+        );
+    }
+
+    #[test]
+    fn large_store_lookups_and_batch_prunes_issue_bounded_indexed_statements() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("state.sqlite3");
+        let mut state = test_state("large");
+        let synthetic = {
+            let store = RepositoryStore::open(&path).unwrap();
+            store.initialize_repository(&state).unwrap();
+            let synthetic = load_synthetic_artifacts(&store, &state, 100_000, 23_000, 90_000);
+            // A database created at the current schema has its indexes but no statistics.
+            assert_bounded_pruning_statements(&store, &mut state, &synthetic, 22_800);
+            synthetic
+        };
+        downgrade_to_version_three(&path);
+
+        let store = RepositoryStore::open(&path).unwrap();
+        // The version 4 migration adds the indexes and ANALYZE statistics.
+        assert_bounded_pruning_statements(&store, &mut state, &synthetic, 22_600);
+    }
+
+    #[test]
+    fn version_three_migration_adds_pruning_indexes_statistics_and_a_backup() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("state.sqlite3");
+        {
+            let store = RepositoryStore::open(&path).unwrap();
+            let state = test_state("migrated");
+            store.initialize_repository(&state).unwrap();
+            load_synthetic_artifacts(&store, &state, 50, 10, 50);
+        }
+        downgrade_to_version_three(&path);
+        assert!(RepositoryStore::migration_allowance(&path).unwrap() > 0);
+
+        let store = RepositoryStore::open(&path).unwrap();
+        assert_eq!(RepositoryStore::migration_allowance(&path).unwrap(), 0);
+        let connection = store.connection.lock();
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        for index in [
+            "operation_intent_command",
+            "operation_intent_state",
+            "artifact_retention_expiry",
+        ] {
+            let analyzed: bool = connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_stat1 WHERE idx=?1)",
+                    [index],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(analyzed, "{index} has planner statistics");
+        }
+        let attention: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='artifact_attention')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(attention);
+        let migration: String = connection
+            .query_row(
+                "SELECT migration_id FROM backup_records WHERE migration_id IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(migration, format!("schema-3-to-{SCHEMA_VERSION}"));
+        drop(connection);
+        let backups = std::fs::read_dir(temporary.path().join("backups"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("migration-v3-")
+            })
+            .count();
+        assert_eq!(backups, 1);
+    }
+
+    #[test]
+    fn pruning_batches_record_attention_and_skip_it_until_an_explicit_prune_succeeds() {
+        let store = RepositoryStore::open_in_memory().unwrap();
+        let mut state = test_state("attention");
+        store.initialize_repository(&state).unwrap();
+        let synthetic = load_synthetic_artifacts(&store, &state, 6, 4, 0);
+        let now = OffsetDateTime::now_utc();
+        assert_eq!(
+            store.expired_artifacts(now, &[], 10).unwrap().len(),
+            4,
+            "only expired artifacts are eligible"
+        );
+        assert!(
+            store
+                .expired_artifacts(now, &[synthetic.buildset_id], 10)
+                .unwrap()
+                .is_empty(),
+            "artifacts of an excluded buildset are never selected"
+        );
+
+        let failing = synthetic.expired[0].clone();
+        let pruned = synthetic.expired[1..].to_vec();
+        let command_id = CommandId::new();
+        store
+            .prepare_unique_operation(
+                state.id,
+                ARTIFACT_PRUNE_BATCH_KIND,
+                command_id,
+                &serde_json::json!({}),
+            )
+            .unwrap();
+        assert!(matches!(
+            store.prepare_unique_operation(
+                state.id,
+                ARTIFACT_PRUNE_BATCH_KIND,
+                command_id,
+                &serde_json::json!({}),
+            ),
+            Err(StoreError::CommandAlreadyRecorded(_))
+        ));
+        let attention = vec![ArtifactAttention {
+            artifact_id: failing.clone(),
+            detail: "hash mismatch".into(),
+        }];
+        let event = store
+            .complete_artifact_prune_batch(
+                &state,
+                command_id,
+                &pruned,
+                &attention,
+                None,
+                &serde_json::json!({}),
+                Actor::App,
+            )
+            .unwrap();
+        state.event_sequence = event.sequence;
+        assert_eq!(event.kind, "artifact.pruned");
+        assert!(
+            store
+                .unfinished_operations(&[ARTIFACT_PRUNE_BATCH_KIND])
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store.expired_artifacts(now, &[], 10).unwrap().is_empty(),
+            "an artifact that needs attention is not retried automatically"
+        );
+        assert_eq!(
+            store.artifacts_needing_attention(10).unwrap(),
+            (1, attention)
+        );
+        assert_eq!(
+            store.artifact(&failing).unwrap().unwrap().retention_state,
+            "retained"
+        );
+        assert!(store.artifact(&pruned[0]).unwrap().is_none());
+        assert_eq!(
+            store
+                .artifact_record(&pruned[0])
+                .unwrap()
+                .unwrap()
+                .retention_state,
+            "pruned"
+        );
+
+        let explicit = CommandId::new();
+        store
+            .prepare_unique_operation(
+                state.id,
+                ARTIFACT_PRUNE_BATCH_KIND,
+                explicit,
+                &serde_json::json!({}),
+            )
+            .unwrap();
+        store
+            .complete_artifact_prune_batch(
+                &state,
+                explicit,
+                std::slice::from_ref(&failing),
+                &[],
+                Some("digest"),
+                &serde_json::json!({"message": "pruned"}),
+                Actor::Cli,
+            )
+            .unwrap();
+        assert_eq!(store.artifacts_needing_attention(10).unwrap().0, 0);
+        assert_eq!(
+            store
+                .checked_command_response::<serde_json::Value>(explicit, "artifact-prune", "digest")
+                .unwrap(),
+            Some(serde_json::json!({"message": "pruned"}))
+        );
+    }
+
+    /// Measures batched pruning throughput on a file-backed synthetic store shaped like the
+    /// 2026-10-05 incident (100,000 retained artifacts, 23,000 expired, 90,000 completed
+    /// intents). It times database work only, so it is a measurement rather than a gate:
+    /// `cargo test --release -p tollgate-store measure_artifact_prune_throughput -- --ignored --nocapture`
+    #[test]
+    #[ignore = "measurement; run manually"]
+    fn measure_artifact_prune_throughput() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = RepositoryStore::open(temporary.path().join("state.sqlite3")).unwrap();
+        let mut state = test_state("measured");
+        store.initialize_repository(&state).unwrap();
+        load_synthetic_artifacts(&store, &state, 100_000, 23_000, 90_000);
+        let batches = 100;
+        let started = Instant::now();
+        let mut pruned_total = 0;
+        for _ in 0..batches {
+            assert!(
+                store
+                    .unfinished_operations(&[ARTIFACT_PRUNE_BATCH_KIND])
+                    .unwrap()
+                    .is_empty()
+            );
+            let batch = store
+                .expired_artifacts(OffsetDateTime::now_utc(), &[], 200)
+                .unwrap();
+            let command_id = CommandId::new();
+            store
+                .prepare_unique_operation(
+                    state.id,
+                    ARTIFACT_PRUNE_BATCH_KIND,
+                    command_id,
+                    &serde_json::json!({"entries": batch}),
+                )
+                .unwrap();
+            let pruned = batch
+                .iter()
+                .map(|record| record.artifact_id.clone())
+                .collect::<Vec<_>>();
+            let event = store
+                .complete_artifact_prune_batch(
+                    &state,
+                    command_id,
+                    &pruned,
+                    &[],
+                    None,
+                    &serde_json::json!({"pruned": pruned}),
+                    Actor::App,
+                )
+                .unwrap();
+            state.event_sequence = event.sequence;
+            pruned_total += pruned.len();
+        }
+        let elapsed = started.elapsed();
+        println!(
+            "batched pruning: {pruned_total} artifacts in {:.3} s = {:.0} prunes/s",
+            elapsed.as_secs_f64(),
+            pruned_total as f64 / elapsed.as_secs_f64()
+        );
     }
 }

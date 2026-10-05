@@ -267,7 +267,7 @@ The v1 schema must represent each of these logical entities. Migrations may spli
 - `configuration_snapshots`: schema version, canonical effective bytes, configuration and step-graph digests, activation event, and supersession lineage.
 - `operation_intents`: typed approval, tested-object, result, promotion, push, cleanup, artifact, seed, pruning, backup, and migration intents with expected identities/old values, independent intent state, timestamps, attempts, and recovery evidence. Promotion and push may use specialized child tables for their OID fields.
 - `slots`, `seed_generations`, and `cache_manifests`: ownership paths, compatibility keys, source OIDs, logical size, last use, health.
-- `artifacts`: run/step, source path, retained path, hash, size, retention/pin state.
+- `artifacts`: run/step, source path, retained path, hash, size, retention/pin state, and a needs-attention record for each artifact whose pruning failed.
 - `log_streams` and `log_chunks`: run/step/stream identity, per-stream offsets, broker sequences, sealed chunk hashes, compression/pruning state, and retained range metadata.
 - `remote_observations`: remote identity, exact ref, observed OID/nonexistence, observation method/time, and owning push/pull intent.
 - `volume_state` and `volume_reservations`: stable volume identity, path roles, warning/critical thresholds, emergency allowance, observed free space, and active operation allowances.
@@ -295,6 +295,9 @@ Every operation spanning SQLite and Git or the filesystem uses the same explicit
 - Queue, result, timing, promotion, push, configuration-digest, and audit metadata are retained indefinitely.
 - Full logs default to 90 days and 10 GiB per repository. Active-queue logs are never pruned. Completed logs are compressed in the background. Pruned log ranges remain explicit metadata.
 - Retained artifacts default to 30 days and 50 GiB per repository. Pinned runs/artifacts are exempt and reported separately.
+- The artifact retention sweep runs five minutes after startup and hourly afterward, on its own background task. It prunes expired, unpinned artifacts that no active queue item's buildset owns, oldest expiry first, in batches of at most 200 artifacts and, past a batch's first artifact, 256 MiB of artifact data. Each batch is one `artifact-prune-batch` intent and one completion transaction with one `artifact.pruned` event. The sweep holds a repository's mutation lock only while a batch runs and yields between batches, so configuration observation, pulls, and queue work for every repository continue during a long sweep. Each artifact's size and hash are verified once, in quarantine, immediately before deletion.
+- A pruning failure never stops the sweep or makes a repository unavailable. The failing artifact stays at its retained path and is recorded as needing attention; later sweeps skip it and Doctor reports it until an explicit `tg artifact prune` of that artifact succeeds. A batch-level failure, such as a database error, ends that repository's sweep, and the next sweep completes the unfinished batch first.
+- Storage maintenance (removing reclaimable cache quarantine and orphaned cache roots, and pressure pruning) runs every five minutes on its own background task.
 - Execution caches use a global default budget equal to the smaller of 200 GiB or 25% of currently free space. Minimum-free-space reserves are configured and enforced per underlying volume identity, because repository state, logs/artifacts, and execution caches may reside on different volumes.
 - Cache pressure prunes superseded seeds, excess cold idle slots, and older non-current seeds in that order. It never touches active slots, the last usable warm seed for an active repository, logs, artifacts, or audit state.
 
@@ -1122,6 +1125,7 @@ Diagnostics verify:
 - shell bootstrap, PATH, command executable resolution, and environment fingerprint;
 - APFS clone capability and seed manifests;
 - resource/storage budgets, stable volume-role mapping, and per-volume warning/critical/emergency free-space thresholds;
+- retained artifacts whose pruning needs attention;
 - remote URL, fetch reachability, credentials without exposing secrets, and lease state.
 
 A diagnostics bundle is local, redacted, previewable, and user-shared only. It contains no environment values or full logs by default.
@@ -1160,6 +1164,8 @@ Intent reconciliation uses this evidence matrix:
 
 Seed generations are unique per repository and profile. A live snapshot never allocates a generation still named by an unfinished seed intent, and a snapshot that fails before its final rename discards its staging at once. A seed intent whose generation another seed already records can never complete exactly, so recovery moves its staging or final path to reclaimable `.pruned-` cache quarantine and cancels the intent; the same applies to a seed path that fails verification.
 
+An artifact pruning batch completes from disk evidence, entry by entry. A quarantined file that matches its recorded size and hash is pruned. An artifact still at its retained path with no quarantined copy never moved and stays retained. A quarantined file that does not match is moved back to its retained path and, like an entry whose retained and quarantine paths both or neither exist, is recorded as needing attention. The batch then completes in one transaction, so a crash at any point yields the same outcome as an uninterrupted batch. Activation and every later batch first complete unfinished batches, then remove quarantined files named for artifacts already recorded as pruned once they verify.
+
 Completion based on recovery evidence emits the same idempotent domain result as the uninterrupted path, with actor `recovery`. Recovery never uses a worker interruption marker as success evidence and never treats a transport exit code, filename prefix, or SQLite intent alone as proof of an external effect.
 
 ### 19.2 Quit and crash
@@ -1182,7 +1188,7 @@ If integrity checks fail, freeze the repository and offer restore from the newes
 
 ### 19.5 App upgrades
 
-Schema migration creates and verifies an online backup first. The app has an `engine_compatibility_epoch` separate from semantic version. Routine UI/fix releases preserve completed certificates. A release that changes commit construction, config freezing, result meaning, or certificate rules increments the epoch and invalidates unpromoted buildsets.
+Schema migration creates and verifies an online backup first. A migration that adds indexes also runs `ANALYZE`, so the query planner uses them on large existing databases. The app has an `engine_compatibility_epoch` separate from semantic version. Routine UI/fix releases preserve completed certificates. A release that changes commit construction, config freezing, result meaning, or certificate rules increments the epoch and invalidates unpromoted buildsets.
 
 ## 20. Security and privacy
 

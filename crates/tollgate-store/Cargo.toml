@@ -16,4 +16,5 @@ tollgate-domain = { path = "../tollgate-domain" }
 uuid.workspace = true
 
 [dev-dependencies]
+rusqlite = { workspace = true, features = ["trace"] }
 tempfile.workspace = true

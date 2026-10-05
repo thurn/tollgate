@@ -39,9 +39,21 @@ use tollgate_scheduler::{
     DispatchRequest, GlobalScheduler, PriorityClass, ResourceCapacity, SchedulerError,
 };
 use tollgate_store::{
-    ArtifactRecord, BackupCopyStats, IntentState, RepositoryStore, SeedRecord, StepAttemptRecord,
-    StoreError,
+    ARTIFACT_PRUNE_BATCH_KIND, ArtifactAttention, ArtifactRecord, BackupCopyStats, IntentState,
+    RepositoryStore, SeedRecord, StepAttemptRecord, StoreError,
 };
+
+/// The most artifacts one pruning batch selects. Each batch is one durable intent, holds the
+/// repository mutation lock only while it runs, and completes in one transaction.
+const ARTIFACT_PRUNE_BATCH_SIZE: usize = 200;
+/// A batch also stops adding artifacts once their sizes reach this total, which bounds how long
+/// hashing holds the mutation lock. A batch always includes its first artifact.
+const ARTIFACT_PRUNE_BATCH_BYTES: u64 = 256 * 1024 * 1024;
+/// The delay before the first artifact retention sweep after startup. Self-installs restart
+/// the app often, so the first sweep does not wait a full interval.
+const ARTIFACT_RETENTION_FIRST_SWEEP: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+const ARTIFACT_RETENTION_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+const STORAGE_MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
 #[derive(Debug, Error)]
 #[error(
@@ -484,6 +496,8 @@ struct ArtifactRetentionEvidence {
     records: Vec<ArtifactRecord>,
 }
 
+/// Evidence of a single-artifact `artifact-prune` intent. Recovery completes any such intent a
+/// database holds; pruning records `artifact-prune-batch` intents.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct ArtifactPruneEvidence {
     repository_id: RepositoryId,
@@ -491,6 +505,55 @@ struct ArtifactPruneEvidence {
     record: ArtifactRecord,
     original_path: PathBuf,
     quarantine_path: PathBuf,
+}
+
+/// One artifact of a pruning batch and the exact owned quarantine path it moves to.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct ArtifactPruneEntry {
+    record: ArtifactRecord,
+    original_path: PathBuf,
+    quarantine_path: PathBuf,
+}
+
+/// Durable evidence for one batch of artifact pruning, recorded before any artifact moves.
+/// `entries` may move into quarantine; `rejected` failed the checks made before moving and are
+/// recorded as needing attention when the batch completes.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct ArtifactPruneBatchEvidence {
+    repository_id: RepositoryId,
+    /// Present for an explicit prune command, whose successful result is replayable.
+    request_digest: Option<String>,
+    quarantine_root: PathBuf,
+    entries: Vec<ArtifactPruneEntry>,
+    rejected: Vec<ArtifactAttention>,
+}
+
+/// The completed outcome of one pruning batch: its result payload and event.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct ArtifactPruneBatchResult {
+    repository_id: RepositoryId,
+    action: String,
+    message: String,
+    pruned: Vec<String>,
+    needs_attention: Vec<ArtifactAttention>,
+}
+
+/// How a quarantined batch entry settled when its batch completed.
+enum ArtifactEntrySettlement {
+    /// The verified artifact is in quarantine and is pruned.
+    Pruned,
+    /// The artifact never left its retained path, so it stays retained.
+    Retained,
+    NeedsAttention(String),
+}
+
+/// What one repository's artifact retention sweep did.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct ArtifactSweep {
+    batches: usize,
+    pruned: usize,
+    needs_attention: usize,
+    error: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1643,22 +1706,119 @@ impl TollgateService {
                             "Tollgate periodic remote observation failed for {repository_id}: {error}"
                         );
                     }
-                    if ticks.is_multiple_of(1_800)
-                        && let Err(error) = service.prune_expired_artifacts(repository_id).await
-                    {
-                        eprintln!(
-                            "Tollgate artifact retention sweep failed for {repository_id}: {error}"
-                        );
-                    }
-                }
-                if ticks.is_multiple_of(150)
-                    && let Err(error) = service.perform_storage_prune(false).await
-                {
-                    eprintln!("Tollgate storage maintenance failed: {error}");
                 }
                 ticks = ticks.wrapping_add(1);
             }
         });
+        self.spawn_storage_maintenance();
+        self.spawn_artifact_retention();
+    }
+
+    /// Storage pruning removes whole quarantined cache trees, which can take minutes, so it runs
+    /// on its own task and never delays configuration observation, pulls, or queue work.
+    fn spawn_storage_maintenance(self: &Arc<Self>) {
+        let service = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval_at(
+                tokio::time::Instant::now() + STORAGE_MAINTENANCE_INTERVAL,
+                STORAGE_MAINTENANCE_INTERVAL,
+            );
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                let Some(service) = service.upgrade() else {
+                    break;
+                };
+                if let Err(error) = service.perform_storage_prune(false).await {
+                    eprintln!("Tollgate storage maintenance failed: {error}");
+                }
+            }
+        });
+    }
+
+    /// Artifact retention runs on its own task: each repository is swept in bounded batches,
+    /// releasing the repository mutation lock and yielding between batches.
+    fn spawn_artifact_retention(self: &Arc<Self>) {
+        let service = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval_at(
+                tokio::time::Instant::now() + ARTIFACT_RETENTION_FIRST_SWEEP,
+                ARTIFACT_RETENTION_INTERVAL,
+            );
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                let Some(ids) = (match service.upgrade() {
+                    Some(service) => Some(
+                        service
+                            .runtimes
+                            .read()
+                            .await
+                            .keys()
+                            .copied()
+                            .collect::<Vec<_>>(),
+                    ),
+                    None => None,
+                }) else {
+                    break;
+                };
+                for repository_id in ids {
+                    Self::sweep_expired_artifacts(&service, repository_id).await;
+                }
+            }
+        });
+    }
+
+    /// Prunes a repository's expired artifacts batch by batch until none is eligible. The
+    /// service is held only while a batch runs, and the task yields between batches. A batch
+    /// failure ends this repository's sweep and is logged; the repository stays available, and
+    /// the next sweep settles any batch it left unfinished.
+    async fn sweep_expired_artifacts(
+        service: &std::sync::Weak<Self>,
+        repository_id: RepositoryId,
+    ) -> ArtifactSweep {
+        let started = Instant::now();
+        let mut sweep = ArtifactSweep::default();
+        loop {
+            let Some(service) = service.upgrade() else {
+                break;
+            };
+            if service.shutting_down.load(Ordering::Acquire) {
+                break;
+            }
+            match service.prune_expired_artifact_batch(repository_id).await {
+                Ok(Some(result)) => {
+                    sweep.batches += 1;
+                    sweep.pruned += result.pruned.len();
+                    sweep.needs_attention += result.needs_attention.len();
+                    // Every selected artifact is pruned or recorded for attention, so an empty
+                    // outcome can only mean another writer is racing this sweep.
+                    if result.pruned.is_empty() && result.needs_attention.is_empty() {
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    eprintln!(
+                        "Tollgate artifact retention sweep failed for {repository_id}: {error}"
+                    );
+                    sweep.error = Some(error.to_string());
+                    break;
+                }
+            }
+            drop(service);
+            tokio::task::yield_now().await;
+        }
+        if sweep.batches > 0 {
+            eprintln!(
+                "Tollgate artifact retention pruned {} artifact(s) for {repository_id} in {} batch(es) over {} ms; {} need attention",
+                sweep.pruned,
+                sweep.batches,
+                started.elapsed().as_millis(),
+                sweep.needs_attention
+            );
+        }
+        sweep
     }
 
     async fn observe_configuration(
@@ -3509,10 +3669,20 @@ impl TollgateService {
                         tokio::fs::create_dir_all(parent).await?;
                     }
                     tokio::fs::rename(&evidence.original_path, &evidence.quarantine_path).await?;
-                    verify_quarantined_artifact(&artifacts_root, &evidence).await?;
+                    verify_quarantined_artifact(
+                        &artifacts_root,
+                        &evidence.quarantine_path,
+                        &evidence.record,
+                    )
+                    .await?;
                 }
                 (false, true) => {
-                    verify_quarantined_artifact(&artifacts_root, &evidence).await?;
+                    verify_quarantined_artifact(
+                        &artifacts_root,
+                        &evidence.quarantine_path,
+                        &evidence.record,
+                    )
+                    .await?;
                 }
                 _ => {
                     let state = {
@@ -3575,27 +3745,13 @@ impl TollgateService {
                 sync_directory(parent)?;
             }
         }
-        for evidence in runtime
-            .store
-            .completed_operation_evidence("artifact-prune")?
-        {
-            let evidence: ArtifactPruneEvidence = serde_json::from_value(evidence)?;
-            let original_exists = tokio::fs::try_exists(&evidence.original_path).await?;
-            let quarantine_exists = tokio::fs::try_exists(&evidence.quarantine_path).await?;
-            if original_exists {
-                return Err(ServiceError::Invariant(format!(
-                    "completed artifact prune {} still has an authoritative source file",
-                    evidence.record.artifact_id
-                )));
-            }
-            if quarantine_exists {
-                let artifacts_root = runtime.git.common_dir.join("tollgate/artifacts");
-                verify_quarantined_artifact(&artifacts_root, &evidence).await?;
-                tokio::fs::remove_file(&evidence.quarantine_path).await?;
-                if let Some(parent) = evidence.quarantine_path.parent() {
-                    sync_directory(parent)?;
-                }
-            }
+        // Pruning never makes a repository unavailable: a batch that cannot complete now stays
+        // unfinished, and the next retention sweep completes it first and reports any failure.
+        if let Err(error) = reconcile_artifact_prunes(runtime).await {
+            eprintln!(
+                "Tollgate deferred artifact pruning recovery for {}: {error}",
+                runtime.data.lock().state.id
+            );
         }
         Ok(())
     }
@@ -9457,6 +9613,26 @@ impl TollgateService {
             (!unhealthy_slots.is_empty())
                 .then(|| "Reset each unhealthy slot cold before reuse.".into()),
         );
+        let (attention_count, attention) = runtime.store.artifacts_needing_attention(5)?;
+        push(
+            "Retained artifacts",
+            attention_count == 0,
+            if attention_count == 0 {
+                "no retained artifact needs attention".into()
+            } else {
+                format!(
+                    "{attention_count} artifact(s) could not be pruned: {}",
+                    attention
+                        .iter()
+                        .map(|entry| format!("{} ({})", entry.artifact_id, entry.detail))
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                )
+            },
+            (attention_count > 0).then(|| {
+                "Automatic pruning skips these artifacts. Make each retained file match its recorded size and hash, then run `tg artifact prune <id>`.".into()
+            }),
+        );
 
         let cache_root = runtime
             .slots_root
@@ -9676,43 +9852,6 @@ impl TollgateService {
     ) -> Result<MutationResult, ServiceError> {
         let runtime = self.runtime(repository_id).await?;
         let _mutation = runtime.mutation.lock().await;
-        self.prune_artifact_locked(&runtime, artifact_id, command_id, Actor::App)
-            .await
-    }
-
-    async fn prune_expired_artifacts(
-        self: &Arc<Self>,
-        repository_id: RepositoryId,
-    ) -> Result<(), ServiceError> {
-        let runtime = self.runtime(repository_id).await?;
-        let expired = runtime.store.expired_artifacts(OffsetDateTime::now_utc())?;
-        for record in expired {
-            let protects_active_certificate = runtime.data.lock().items.iter().any(|item| {
-                item.buildset_id == Some(record.buildset_id) && !item.state.is_terminal()
-            });
-            if protects_active_certificate {
-                continue;
-            }
-            let _mutation = runtime.mutation.lock().await;
-            self.prune_artifact_locked(
-                &runtime,
-                record.artifact_id,
-                CommandId::new(),
-                Actor::Recovery,
-            )
-            .await?;
-        }
-        Ok(())
-    }
-
-    async fn prune_artifact_locked(
-        &self,
-        runtime: &Arc<RepositoryRuntime>,
-        artifact_id: String,
-        command_id: CommandId,
-        actor: Actor,
-    ) -> Result<MutationResult, ServiceError> {
-        let repository_id = runtime.data.lock().state.id;
         let request_digest = command_digest(&serde_json::json!({
             "repository_id": repository_id,
             "artifact_id": artifact_id,
@@ -9724,80 +9863,73 @@ impl TollgateService {
         {
             return Ok(result);
         }
+        reconcile_artifact_prunes(&runtime).await?;
         let record = runtime.store.artifact(&artifact_id)?.ok_or_else(|| {
             ServiceError::Invariant(format!("artifact {artifact_id} was not found"))
         })?;
-        if runtime
-            .data
-            .lock()
-            .items
-            .iter()
-            .any(|item| item.buildset_id == Some(record.buildset_id) && !item.state.is_terminal())
-        {
+        if active_buildsets(&runtime).contains(&record.buildset_id) {
             return Err(ServiceError::Invariant(
                 "artifacts bound to an active queue certificate cannot be pruned".into(),
             ));
         }
-        verify_retained_artifact(runtime, &record).await?;
-        let artifacts_root = runtime.git.common_dir.join("tollgate/artifacts");
-        let quarantine_root = artifacts_root.join(".quarantine");
-        tokio::fs::create_dir_all(&quarantine_root).await?;
-        verify_owned_directory(&artifacts_root, &quarantine_root)?;
-        let original_path = PathBuf::from(&record.retained_path);
-        let quarantine_path = quarantine_root.join(format!("{}-{command_id}", record.artifact_id));
-        if tokio::fs::try_exists(&quarantine_path).await? {
-            return Err(ServiceError::Invariant(
-                "artifact pruning quarantine destination already exists".into(),
-            ));
+        let result = prune_artifact_batch(
+            &runtime,
+            vec![record],
+            command_id,
+            Some(request_digest),
+            Actor::App,
+        )
+        .await?;
+        if let Some(attention) = result.needs_attention.first() {
+            return Err(ServiceError::Invariant(format!(
+                "artifact {} needs attention: {}",
+                attention.artifact_id, attention.detail
+            )));
         }
-        let evidence = ArtifactPruneEvidence {
-            repository_id,
-            request_digest: request_digest.clone(),
-            record: record.clone(),
-            original_path: original_path.clone(),
-            quarantine_path: quarantine_path.clone(),
-        };
-        runtime
-            .store
-            .prepare_operation(repository_id, "artifact-prune", command_id, &evidence)?;
-        tokio::fs::rename(&original_path, &quarantine_path).await?;
-        sync_directory(
-            original_path
-                .parent()
-                .ok_or_else(|| ServiceError::Invariant("artifact has no parent".into()))?,
+        if result.pruned.len() != 1 {
+            return Err(ServiceError::Invariant(format!(
+                "artifact {artifact_id} was not pruned"
+            )));
+        }
+        Ok(MutationResult {
+            repository_id: result.repository_id,
+            action: result.action,
+            message: result.message,
+        })
+    }
+
+    /// Prunes one batch of a repository's expired artifacts, returning `None` when none is
+    /// eligible. It settles any batch a crash or earlier failure left unfinished first, and holds
+    /// the repository mutation lock only for this batch.
+    async fn prune_expired_artifact_batch(
+        &self,
+        repository_id: RepositoryId,
+    ) -> Result<Option<ArtifactPruneBatchResult>, ServiceError> {
+        let runtime = self.runtime(repository_id).await?;
+        let _mutation = runtime.mutation.lock().await;
+        reconcile_artifact_prunes(&runtime).await?;
+        let protected = active_buildsets(&runtime);
+        let expired = runtime.store.expired_artifacts(
+            OffsetDateTime::now_utc(),
+            &protected,
+            ARTIFACT_PRUNE_BATCH_SIZE,
         )?;
-        sync_directory(&quarantine_root)?;
-        verify_quarantined_artifact(&artifacts_root, &evidence).await?;
-        runtime.store.set_intent_state(
-            command_id,
-            IntentState::ExternalApplied,
-            &serde_json::json!({"quarantine": quarantine_path}),
-        )?;
-        let result = MutationResult {
-            repository_id,
-            action: "artifact-prune".into(),
-            message: format!("Pruned retained artifact {}.", record.source_path),
-        };
-        let mut state = runtime.data.lock().state.clone();
-        let event = runtime.store.complete_artifact_state_change(
-            &state,
-            &artifact_id,
-            &["retained", "pinned"],
-            "pruned",
-            Some("artifact-prune"),
-            command_id,
-            "artifact-prune",
-            &request_digest,
-            &result,
-            "artifact.pruned",
-            actor,
-        )?;
-        state.event_sequence = event.sequence;
-        runtime.data.lock().state = state;
-        let _ = runtime.events.send(event);
-        tokio::fs::remove_file(&quarantine_path).await?;
-        sync_directory(&quarantine_root)?;
-        Ok(result)
+        if expired.is_empty() {
+            return Ok(None);
+        }
+        let mut bytes = 0_u64;
+        let batch = expired
+            .into_iter()
+            .enumerate()
+            .take_while(|(index, record)| {
+                bytes = bytes.saturating_add(record.size);
+                *index == 0 || bytes <= ARTIFACT_PRUNE_BATCH_BYTES
+            })
+            .map(|(_, record)| record)
+            .collect();
+        prune_artifact_batch(&runtime, batch, CommandId::new(), None, Actor::Recovery)
+            .await
+            .map(Some)
     }
 
     pub async fn reset_slot(
@@ -15136,21 +15268,383 @@ async fn verify_retained_artifact(
 
 async fn verify_quarantined_artifact(
     artifacts_root: &Path,
-    evidence: &ArtifactPruneEvidence,
+    quarantine_path: &Path,
+    record: &ArtifactRecord,
 ) -> Result<(), ServiceError> {
-    let parent = evidence
-        .quarantine_path
+    let parent = quarantine_path
         .parent()
         .ok_or_else(|| ServiceError::Invariant("artifact quarantine has no parent".into()))?;
     verify_owned_directory(artifacts_root, parent)?;
-    let metadata = tokio::fs::symlink_metadata(&evidence.quarantine_path).await?;
+    let metadata = tokio::fs::symlink_metadata(quarantine_path).await?;
     if !metadata.file_type().is_file()
-        || metadata.len() != evidence.record.size
-        || hash_file(&evidence.quarantine_path).await? != evidence.record.hash
+        || metadata.len() != record.size
+        || hash_file(quarantine_path).await? != record.hash
     {
         return Err(ServiceError::Invariant(
             "quarantined artifact does not match the pruning intent".into(),
         ));
+    }
+    Ok(())
+}
+
+/// Buildsets of nonterminal queue items. Their artifacts back an active certificate and are
+/// never pruned.
+fn active_buildsets(runtime: &RepositoryRuntime) -> Vec<BuildsetId> {
+    runtime
+        .data
+        .lock()
+        .items
+        .iter()
+        .filter(|item| !item.state.is_terminal())
+        .filter_map(|item| item.buildset_id)
+        .collect()
+}
+
+/// Prunes `records` as one batch: one durable intent, the moves into quarantine, and one
+/// completion transaction. Each artifact ends exactly one way: pruned, or recorded as needing
+/// attention with its retained file left in place. The caller holds the mutation lock.
+async fn prune_artifact_batch(
+    runtime: &Arc<RepositoryRuntime>,
+    records: Vec<ArtifactRecord>,
+    command_id: CommandId,
+    request_digest: Option<String>,
+    actor: Actor,
+) -> Result<ArtifactPruneBatchResult, ServiceError> {
+    let evidence =
+        prepare_artifact_prune_batch(runtime, records, command_id, request_digest).await?;
+    let failures = quarantine_artifact_prune_entries(&evidence).await?;
+    let (result, pruned) =
+        settle_artifact_prune_batch(runtime, command_id, &evidence, &failures, actor).await?;
+    discard_pruned_quarantine(&evidence.quarantine_root, &pruned);
+    Ok(result)
+}
+
+/// Checks each artifact without reading its contents and records the batch intent before
+/// anything moves.
+async fn prepare_artifact_prune_batch(
+    runtime: &RepositoryRuntime,
+    records: Vec<ArtifactRecord>,
+    command_id: CommandId,
+    request_digest: Option<String>,
+) -> Result<ArtifactPruneBatchEvidence, ServiceError> {
+    let repository_id = runtime.data.lock().state.id;
+    let artifacts_root = runtime.git.common_dir.join("tollgate/artifacts");
+    let quarantine_root = artifacts_root.join(".quarantine");
+    tokio::fs::create_dir_all(&quarantine_root).await?;
+    verify_owned_directory(&artifacts_root, &quarantine_root)?;
+    let mut entries = Vec::new();
+    let mut rejected = Vec::new();
+    for record in records {
+        let quarantine_path = quarantine_root.join(format!("{}-{command_id}", record.artifact_id));
+        match check_artifact_before_prune(&artifacts_root, &record, &quarantine_path).await {
+            Ok(()) => entries.push(ArtifactPruneEntry {
+                original_path: PathBuf::from(&record.retained_path),
+                quarantine_path,
+                record,
+            }),
+            Err(error) => rejected.push(ArtifactAttention {
+                artifact_id: record.artifact_id,
+                detail: error.to_string(),
+            }),
+        }
+    }
+    let evidence = ArtifactPruneBatchEvidence {
+        repository_id,
+        request_digest,
+        quarantine_root,
+        entries,
+        rejected,
+    };
+    runtime.store.prepare_unique_operation(
+        repository_id,
+        ARTIFACT_PRUNE_BATCH_KIND,
+        command_id,
+        &evidence,
+    )?;
+    Ok(evidence)
+}
+
+/// Checks an artifact's owned location, file type, and size before it moves into quarantine.
+/// Its content hash is verified once per prune, in quarantine, immediately before deletion
+/// (`settle_artifact_prune_entry`): that check covers exactly the bytes being deleted, and a
+/// rename cannot change them, so hashing the retained path first as well would read every
+/// artifact twice without strengthening the contract.
+async fn check_artifact_before_prune(
+    artifacts_root: &Path,
+    record: &ArtifactRecord,
+    quarantine_path: &Path,
+) -> Result<(), ServiceError> {
+    let path = PathBuf::from(&record.retained_path);
+    if !path.starts_with(artifacts_root) || path == artifacts_root {
+        return Err(ServiceError::Invariant(
+            "retained artifact path escaped its authoritative root".into(),
+        ));
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| ServiceError::Invariant("retained artifact has no parent".into()))?;
+    verify_owned_directory(artifacts_root, parent)?;
+    let metadata = tokio::fs::symlink_metadata(&path).await?;
+    if !metadata.file_type().is_file() || metadata.len() != record.size {
+        return Err(ServiceError::Invariant(format!(
+            "retained artifact {} no longer matches its immutable record",
+            record.artifact_id
+        )));
+    }
+    if tokio::fs::symlink_metadata(quarantine_path).await.is_ok() {
+        return Err(ServiceError::Invariant(
+            "artifact pruning quarantine destination already exists".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Moves every batch entry into quarantine and makes the moves durable. A move that fails
+/// leaves its artifact in place and is returned by artifact ID.
+async fn quarantine_artifact_prune_entries(
+    evidence: &ArtifactPruneBatchEvidence,
+) -> Result<HashMap<String, String>, ServiceError> {
+    let mut failures = HashMap::new();
+    let mut parents = std::collections::BTreeSet::new();
+    for entry in &evidence.entries {
+        match tokio::fs::rename(&entry.original_path, &entry.quarantine_path).await {
+            Ok(()) => {
+                if let Some(parent) = entry.original_path.parent() {
+                    parents.insert(parent.to_owned());
+                }
+            }
+            Err(error) => {
+                failures.insert(
+                    entry.record.artifact_id.clone(),
+                    format!("moving the artifact into quarantine failed: {error}"),
+                );
+            }
+        }
+    }
+    for parent in parents {
+        sync_directory(&parent)?;
+    }
+    sync_directory(&evidence.quarantine_root)?;
+    Ok(failures)
+}
+
+/// Settles every entry of a prepared batch from what is on disk and completes the batch in one
+/// transaction. The live path and crash recovery both end here, so a batch interrupted at any
+/// point completes exactly as an uninterrupted one would: verified quarantined artifacts are
+/// pruned, artifacts that never moved stay retained, and anything else needs attention.
+/// `failures` are moves the live path saw fail. Returns the result and the pruned entries
+/// whose quarantined files the caller removes.
+async fn settle_artifact_prune_batch(
+    runtime: &RepositoryRuntime,
+    command_id: CommandId,
+    evidence: &ArtifactPruneBatchEvidence,
+    failures: &HashMap<String, String>,
+    actor: Actor,
+) -> Result<(ArtifactPruneBatchResult, Vec<ArtifactPruneEntry>), ServiceError> {
+    let artifacts_root = runtime.git.common_dir.join("tollgate/artifacts");
+    let mut pruned = Vec::new();
+    let mut attention = evidence.rejected.clone();
+    for entry in &evidence.entries {
+        let settlement = match failures.get(&entry.record.artifact_id) {
+            Some(detail) => ArtifactEntrySettlement::NeedsAttention(detail.clone()),
+            None => settle_artifact_prune_entry(&artifacts_root, entry).await,
+        };
+        match settlement {
+            ArtifactEntrySettlement::Pruned => pruned.push(entry.clone()),
+            ArtifactEntrySettlement::Retained => {}
+            ArtifactEntrySettlement::NeedsAttention(detail) => attention.push(ArtifactAttention {
+                artifact_id: entry.record.artifact_id.clone(),
+                detail,
+            }),
+        }
+    }
+    let message = match (evidence.request_digest.is_some(), pruned.as_slice()) {
+        (true, [entry]) => format!("Pruned retained artifact {}.", entry.record.source_path),
+        _ => format!(
+            "Pruned {} artifact(s); {} need attention.",
+            pruned.len(),
+            attention.len()
+        ),
+    };
+    let result = ArtifactPruneBatchResult {
+        repository_id: evidence.repository_id,
+        action: "artifact-prune".into(),
+        message,
+        pruned: pruned
+            .iter()
+            .map(|entry| entry.record.artifact_id.clone())
+            .collect(),
+        needs_attention: attention,
+    };
+    // Only a successful explicit prune is replayable; a failed one reports its error.
+    let request_digest = evidence
+        .request_digest
+        .as_deref()
+        .filter(|_| result.needs_attention.is_empty() && !result.pruned.is_empty());
+    let mut state = runtime.data.lock().state.clone();
+    let event = runtime.store.complete_artifact_prune_batch(
+        &state,
+        command_id,
+        &result.pruned,
+        &result.needs_attention,
+        request_digest,
+        &result,
+        actor,
+    )?;
+    state.event_sequence = event.sequence;
+    runtime.data.lock().state = state;
+    let _ = runtime.events.send(event);
+    Ok((result, pruned))
+}
+
+/// Settles one batch entry from the retained path and its quarantine path. A quarantined file
+/// is pruned only after its size and hash match the record; one that does not match is moved
+/// back to its retained path for inspection.
+async fn settle_artifact_prune_entry(
+    artifacts_root: &Path,
+    entry: &ArtifactPruneEntry,
+) -> ArtifactEntrySettlement {
+    let original = tokio::fs::symlink_metadata(&entry.original_path)
+        .await
+        .is_ok();
+    let quarantined = tokio::fs::symlink_metadata(&entry.quarantine_path)
+        .await
+        .is_ok();
+    match (original, quarantined) {
+        (false, true) => {
+            let Err(error) =
+                verify_quarantined_artifact(artifacts_root, &entry.quarantine_path, &entry.record)
+                    .await
+            else {
+                return ArtifactEntrySettlement::Pruned;
+            };
+            let restored = tokio::fs::rename(&entry.quarantine_path, &entry.original_path)
+                .await
+                .map_err(ServiceError::from)
+                .and_then(|()| match entry.original_path.parent() {
+                    Some(parent) => sync_directory(parent),
+                    None => Ok(()),
+                });
+            ArtifactEntrySettlement::NeedsAttention(match restored {
+                Ok(()) => format!("{error}; the artifact was moved back to its retained path"),
+                Err(restore) => format!(
+                    "{error}; moving it back from {} failed: {restore}",
+                    entry.quarantine_path.display()
+                ),
+            })
+        }
+        (true, false) => ArtifactEntrySettlement::Retained,
+        (true, true) => ArtifactEntrySettlement::NeedsAttention(format!(
+            "both the retained path and the quarantine path {} exist",
+            entry.quarantine_path.display()
+        )),
+        (false, false) => ArtifactEntrySettlement::NeedsAttention(
+            "the artifact file is missing from its retained path".into(),
+        ),
+    }
+}
+
+/// Removes the quarantined files of pruned artifacts. The artifacts are already durably pruned,
+/// so a failure here is logged and the next reconciliation removes what remains.
+fn discard_pruned_quarantine(quarantine_root: &Path, pruned: &[ArtifactPruneEntry]) {
+    for entry in pruned {
+        if let Err(error) = std::fs::remove_file(&entry.quarantine_path) {
+            eprintln!(
+                "Tollgate could not remove pruned artifact quarantine {}: {error}",
+                entry.quarantine_path.display()
+            );
+        }
+    }
+    if !pruned.is_empty()
+        && let Err(error) = sync_directory(quarantine_root)
+    {
+        eprintln!(
+            "Tollgate could not sync artifact quarantine {}: {error}",
+            quarantine_root.display()
+        );
+    }
+}
+
+/// Completes every unfinished pruning batch, then removes quarantined files left behind by
+/// batches that completed before their cleanup finished. Runs during activation and before
+/// every pruning batch, under the repository mutation lock.
+async fn reconcile_artifact_prunes(runtime: &Arc<RepositoryRuntime>) -> Result<(), ServiceError> {
+    for (command_id, _, evidence, _) in runtime
+        .store
+        .unfinished_operations(&[ARTIFACT_PRUNE_BATCH_KIND])?
+    {
+        let evidence: ArtifactPruneBatchEvidence = serde_json::from_value(evidence)?;
+        if evidence.repository_id != runtime.data.lock().state.id {
+            return Err(ServiceError::Invariant(
+                "artifact pruning batch belongs to another repository".into(),
+            ));
+        }
+        let (_, pruned) = settle_artifact_prune_batch(
+            runtime,
+            command_id,
+            &evidence,
+            &HashMap::new(),
+            Actor::Recovery,
+        )
+        .await?;
+        discard_pruned_quarantine(&evidence.quarantine_root, &pruned);
+    }
+    remove_settled_artifact_quarantine(runtime).await
+}
+
+/// Quarantined artifacts are named `{artifact_id}-{command_id}`. A file whose artifact is
+/// recorded as pruned, and which still matches that record's size and hash, is the leftover of
+/// a completed prune and is removed. Anything else is preserved for inspection.
+async fn remove_settled_artifact_quarantine(
+    runtime: &RepositoryRuntime,
+) -> Result<(), ServiceError> {
+    let artifacts_root = runtime.git.common_dir.join("tollgate/artifacts");
+    let quarantine_root = artifacts_root.join(".quarantine");
+    let mut entries = match tokio::fs::read_dir(&quarantine_root).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut removed = false;
+    while let Some(entry) = entries.next_entry().await? {
+        let name = entry.file_name();
+        let Some(artifact_id) = name
+            .to_str()
+            .and_then(|name| name.split_at_checked(36))
+            .filter(|(artifact_id, command_id)| {
+                uuid::Uuid::parse_str(artifact_id).is_ok()
+                    && command_id
+                        .strip_prefix('-')
+                        .is_some_and(|command_id| uuid::Uuid::parse_str(command_id).is_ok())
+            })
+            .map(|(artifact_id, _)| artifact_id.to_owned())
+        else {
+            continue;
+        };
+        let Some(record) = runtime.store.artifact_record(&artifact_id)? else {
+            continue;
+        };
+        if record.retention_state != "pruned" {
+            continue;
+        }
+        let path = entry.path();
+        if let Err(error) = verify_quarantined_artifact(&artifacts_root, &path, &record).await {
+            eprintln!(
+                "Tollgate preserved quarantined artifact {} for inspection: {error}",
+                path.display()
+            );
+            continue;
+        }
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => removed = true,
+            Err(error) => eprintln!(
+                "Tollgate could not remove pruned artifact quarantine {}: {error}",
+                path.display()
+            ),
+        }
+    }
+    if removed {
+        sync_directory(&quarantine_root)?;
     }
     Ok(())
 }
@@ -24323,7 +24817,7 @@ run = "true"
         let runtime = reopened.runtime(id).await.unwrap();
         let expired = runtime
             .store
-            .expired_artifacts(OffsetDateTime::now_utc())
+            .expired_artifacts(OffsetDateTime::now_utc(), &[], usize::MAX)
             .unwrap();
         assert_eq!(
             expired.len(),
@@ -24332,6 +24826,380 @@ run = "true"
         );
         assert_eq!(expired[0].retention_state, "retained");
         assert!(retained.exists());
+    }
+
+    /// A registered repository with one terminal (check-passed) buildset whose artifacts are
+    /// eligible for pruning.
+    async fn repository_with_finished_buildset(
+        root: &Path,
+    ) -> (Arc<TollgateService>, PathBuf, RepositoryId, BuildsetId) {
+        let support = root.join("support");
+        let repository = committed_repository(root, "repository");
+        let service = TollgateService::open(support.clone()).await.unwrap();
+        let id = service
+            .initialize_repository_with_options(&repository, Some("true".into()), false)
+            .await
+            .unwrap()
+            .state
+            .id;
+        let check = service
+            .check_from(
+                id,
+                "HEAD".into(),
+                Some(repository.to_string_lossy().into_owned()),
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        let buildset_id = loop {
+            let details = service.item_details(id, check.item_id).await.unwrap();
+            if details.item.state == QueueItemState::CheckPassed {
+                break details.buildset.unwrap().id;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        };
+        (service, support, id, buildset_id)
+    }
+
+    fn record_test_artifacts(
+        runtime: &RepositoryRuntime,
+        buildset_id: BuildsetId,
+        group: &str,
+        count: usize,
+        expires_at: OffsetDateTime,
+    ) -> Vec<ArtifactRecord> {
+        let directory = runtime
+            .git
+            .common_dir
+            .join("tollgate/artifacts")
+            .join(group);
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut paths = HashSet::new();
+        for index in 0..count {
+            let path = directory.join(format!("{index}.txt"));
+            let contents = format!("{group} artifact {index:06}\n");
+            std::fs::write(&path, &contents).unwrap();
+            runtime
+                .store
+                .record_artifact(
+                    buildset_id,
+                    Path::new(&format!("{group}/{index}.txt")),
+                    &path,
+                    &blake3::hash(contents.as_bytes()).to_hex(),
+                    contents.len() as u64,
+                    expires_at,
+                )
+                .unwrap();
+            paths.insert(path.to_string_lossy().into_owned());
+        }
+        let mut records = runtime
+            .store
+            .retained_artifacts()
+            .unwrap()
+            .into_iter()
+            .filter(|record| paths.contains(&record.retained_path))
+            .collect::<Vec<_>>();
+        records.sort_by(|left, right| left.retained_path.cmp(&right.retained_path));
+        records
+    }
+
+    /// Replaces a file's bytes without changing its size, so only its hash disagrees.
+    fn corrupt_preserving_size(path: &Path) {
+        let mut bytes = std::fs::read(path).unwrap();
+        bytes[0] ^= 0x20;
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn quarantine_root(runtime: &RepositoryRuntime) -> PathBuf {
+        runtime
+            .git
+            .common_dir
+            .join("tollgate/artifacts/.quarantine")
+    }
+
+    fn quarantined_files(runtime: &RepositoryRuntime) -> usize {
+        std::fs::read_dir(quarantine_root(runtime))
+            .map(|entries| entries.count())
+            .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn artifact_sweep_prunes_in_bounded_batches_and_continues_past_failing_artifacts() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (service, _, id, buildset_id) =
+            repository_with_finished_buildset(temporary.path()).await;
+        let runtime = service.runtime(id).await.unwrap();
+        let expired = OffsetDateTime::now_utc() - Duration::days(1);
+        let healthy = record_test_artifacts(&runtime, buildset_id, "healthy", 450, expired);
+        // The failing artifacts expired first, so the first batch meets them.
+        let failing = record_test_artifacts(
+            &runtime,
+            buildset_id,
+            "failing",
+            2,
+            expired - Duration::days(1),
+        );
+        let kept = record_test_artifacts(
+            &runtime,
+            buildset_id,
+            "kept",
+            1,
+            OffsetDateTime::now_utc() + Duration::days(1),
+        );
+        // One artifact's bytes change (its hash fails in quarantine); another's file is gone.
+        let corrupted = &failing[0];
+        corrupt_preserving_size(Path::new(&corrupted.retained_path));
+        let missing = &failing[1];
+        std::fs::remove_file(&missing.retained_path).unwrap();
+        let events_before = runtime.store.events_after(0, u32::MAX).unwrap().len();
+
+        let sweep = TollgateService::sweep_expired_artifacts(&Arc::downgrade(&service), id).await;
+
+        assert_eq!(
+            sweep,
+            ArtifactSweep {
+                batches: 3,
+                pruned: 450,
+                needs_attention: 2,
+                error: None,
+            },
+            "452 eligible artifacts prune in batches of at most {ARTIFACT_PRUNE_BATCH_SIZE}"
+        );
+        let events = runtime.store.events_after(0, u32::MAX).unwrap();
+        assert_eq!(
+            events[events_before..]
+                .iter()
+                .filter(|event| event.kind == "artifact.pruned")
+                .count(),
+            3,
+            "each batch completes with one event"
+        );
+        assert!(
+            healthy
+                .iter()
+                .all(|record| !Path::new(&record.retained_path).exists())
+        );
+        assert!(healthy.iter().all(|record| {
+            runtime
+                .store
+                .artifact(&record.artifact_id)
+                .unwrap()
+                .is_none()
+        }));
+        assert!(
+            Path::new(&corrupted.retained_path).exists(),
+            "an artifact that fails verification returns to its retained path"
+        );
+        assert!(
+            runtime
+                .store
+                .artifact(&corrupted.artifact_id)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            runtime
+                .store
+                .artifact(&kept[0].artifact_id)
+                .unwrap()
+                .is_some()
+        );
+        assert!(Path::new(&kept[0].retained_path).exists());
+        assert_eq!(quarantined_files(&runtime), 0);
+        let (count, attention) = runtime.store.artifacts_needing_attention(10).unwrap();
+        assert_eq!(count, 2);
+        let mut attention_ids = attention
+            .iter()
+            .map(|entry| entry.artifact_id.clone())
+            .collect::<Vec<_>>();
+        attention_ids.sort();
+        let mut failing_ids = failing
+            .iter()
+            .map(|record| record.artifact_id.clone())
+            .collect::<Vec<_>>();
+        failing_ids.sort();
+        assert_eq!(attention_ids, failing_ids);
+
+        // The repository stays available and reports the failures through Doctor.
+        let snapshot = service.repository_snapshot(id).await.unwrap();
+        assert_ne!(
+            snapshot.state.execution_state,
+            RepositoryExecutionState::Blocked
+        );
+        let doctor = service.doctor(id).await.unwrap();
+        let retained = doctor
+            .checks
+            .iter()
+            .find(|check| check.name == "Retained artifacts")
+            .unwrap();
+        assert!(matches!(retained.status, DiagnosticStatus::Attention));
+        assert!(retained.recovery_action.is_some());
+
+        assert_eq!(
+            TollgateService::sweep_expired_artifacts(&Arc::downgrade(&service), id).await,
+            ArtifactSweep::default(),
+            "artifacts that need attention are not retried automatically"
+        );
+
+        // Once its file matches the record again, an explicit prune succeeds and clears it.
+        corrupt_preserving_size(Path::new(&corrupted.retained_path));
+        service
+            .prune_artifact(id, corrupted.artifact_id.clone(), CommandId::new())
+            .await
+            .unwrap();
+        assert!(!Path::new(&corrupted.retained_path).exists());
+        assert_eq!(runtime.store.artifacts_needing_attention(10).unwrap().0, 1);
+        let error = service
+            .prune_artifact(id, missing.artifact_id.clone(), CommandId::new())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains(&missing.artifact_id));
+    }
+
+    #[tokio::test]
+    async fn artifact_prune_batches_recover_exactly_from_a_crash_at_every_boundary() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (service, support, id, buildset_id) =
+            repository_with_finished_buildset(temporary.path()).await;
+        let runtime = service.runtime(id).await.unwrap();
+        let expired = OffsetDateTime::now_utc() - Duration::days(1);
+        let group = |name: &str| record_test_artifacts(&runtime, buildset_id, name, 3, expired);
+
+        // Crash after the batch intent is durable, before anything moves.
+        let prepared = group("prepared");
+        prepare_artifact_prune_batch(&runtime, prepared.clone(), CommandId::new(), None)
+            .await
+            .unwrap();
+
+        // Crash after the first of three moves into quarantine.
+        let partial = group("partial");
+        let evidence =
+            prepare_artifact_prune_batch(&runtime, partial.clone(), CommandId::new(), None)
+                .await
+                .unwrap();
+        std::fs::rename(
+            &evidence.entries[0].original_path,
+            &evidence.entries[0].quarantine_path,
+        )
+        .unwrap();
+
+        // Crash after every move, before the completion transaction. One quarantined file no
+        // longer matches its record.
+        let quarantined = group("quarantined");
+        let evidence =
+            prepare_artifact_prune_batch(&runtime, quarantined.clone(), CommandId::new(), None)
+                .await
+                .unwrap();
+        assert!(
+            quarantine_artifact_prune_entries(&evidence)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let corrupted = &evidence.entries[2];
+        corrupt_preserving_size(&corrupted.quarantine_path);
+
+        // Crash after the completion transaction, before quarantined files are removed.
+        let completed = group("completed");
+        let command_id = CommandId::new();
+        let evidence = prepare_artifact_prune_batch(&runtime, completed.clone(), command_id, None)
+            .await
+            .unwrap();
+        let failures = quarantine_artifact_prune_entries(&evidence).await.unwrap();
+        settle_artifact_prune_batch(&runtime, command_id, &evidence, &failures, Actor::Recovery)
+            .await
+            .unwrap();
+        assert_eq!(quarantined_files(&runtime), 3 + 1 + 3);
+
+        // No crash: the batch finishes.
+        let finished = group("finished");
+        prune_artifact_batch(
+            &runtime,
+            finished.clone(),
+            CommandId::new(),
+            None,
+            Actor::Recovery,
+        )
+        .await
+        .unwrap();
+
+        let quarantine = quarantine_root(&runtime);
+        drop(runtime);
+        drop(service);
+        let reopened = TollgateService::open(support).await.unwrap();
+        let runtime = reopened.runtime(id).await.unwrap();
+
+        let pruned = |record: &ArtifactRecord| {
+            runtime
+                .store
+                .artifact_record(&record.artifact_id)
+                .unwrap()
+                .unwrap()
+                .retention_state
+                == "pruned"
+                && !Path::new(&record.retained_path).exists()
+        };
+        let retained = |record: &ArtifactRecord| {
+            runtime
+                .store
+                .artifact(&record.artifact_id)
+                .unwrap()
+                .is_some_and(|current| current.retention_state == "retained")
+                && Path::new(&record.retained_path).exists()
+        };
+        assert!(
+            prepared.iter().all(retained),
+            "nothing moved, so nothing is pruned"
+        );
+        assert!(
+            pruned(&partial[0]),
+            "the moved artifact verifies and is pruned"
+        );
+        assert!(
+            partial[1..].iter().all(retained),
+            "unmoved artifacts stay retained"
+        );
+        assert!(quarantined[..2].iter().all(pruned));
+        assert!(
+            retained(&quarantined[2]),
+            "a quarantined artifact that fails verification returns to its retained path"
+        );
+        assert!(completed.iter().all(pruned));
+        assert!(finished.iter().all(pruned));
+        let (count, attention) = runtime.store.artifacts_needing_attention(10).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(attention[0].artifact_id, quarantined[2].artifact_id);
+        assert_eq!(
+            std::fs::read_dir(&quarantine).unwrap().count(),
+            0,
+            "recovery leaves no quarantined file behind"
+        );
+        assert!(
+            runtime
+                .store
+                .unfinished_operations(&[ARTIFACT_PRUNE_BATCH_KIND])
+                .unwrap()
+                .is_empty()
+        );
+        let state = runtime.store.repository_state().unwrap();
+        assert_eq!(
+            runtime
+                .store
+                .events_after(0, u32::MAX)
+                .unwrap()
+                .last()
+                .unwrap()
+                .sequence,
+            state.event_sequence
+        );
+
+        // The unmoved artifacts of the interrupted batches prune normally afterward.
+        let sweep = TollgateService::sweep_expired_artifacts(&Arc::downgrade(&reopened), id).await;
+        assert_eq!(sweep.pruned, 3 + 2);
+        assert!(prepared.iter().all(pruned));
+        assert!(partial.iter().all(pruned));
     }
 
     async fn repository_with_published_seed(
