@@ -47,7 +47,7 @@ old files from other executions cannot satisfy a required artifact with this pat
 
 ## First repository
 
-Launch the app and choose **Add repository**, or run:
+Register a repository from its checkout; the desktop app has no registration control:
 
 ```sh
 tg init --run './ci'
@@ -127,8 +127,9 @@ temporary divergence. New commits or working-tree changes prevent automatic
 projection and are left untouched. Use `tg push-master --wait` when a foreground
 result is useful. `tg push-master --status` reports the latest master push,
 including its failed validation step and the exact log command to inspect.
-The Queue screen retains the latest failed master push as an action-required
-entry after it leaves the active queue. Remote pushing must be enabled for the
+The desktop app's Gate route keeps the latest failed master push as an
+action-required entry after it leaves the active queue, and the sidebar marks
+its repository with `!`. Remote pushing must be enabled for the
 repository. With a release stage, the chain reaches the remote when a passing
 release run advances `release` past it. Bare `tg push` retains its narrower
 recovery meaning: retrying a push of commits that Tollgate has already certified.

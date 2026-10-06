@@ -151,7 +151,7 @@ These invariants govern `release` in a repository with release-stage steps (sect
 
 The Tauri application is a normal Dock application and the only command center. Closing its last window does not terminate the app. Explicit Quit while work is active requires confirmation, terminates all active process groups, records interruption, checkpoints state, and exits. A crash is handled equivalently on recovery, using ephemeral worker supervisors to terminate orphan-prone child process trees.
 
-The app does not launch at login by default. An explicit preference may register the ordinary app as a login item. Invoking a live or state-changing `tg` command while the app is absent launches the app through Launch Services without forcing a window to the foreground, waits for the IPC endpoint, and submits the request. `--no-launch` makes unavailability an immediate error.
+The app does not launch at login, and it has no login-item preference; Section 22 (Phase 4) plans one. Invoking a live or state-changing `tg` command while the app is absent launches the app through Launch Services without forcing a window to the foreground, waits for the IPC endpoint, and submits the request. `--no-launch` makes unavailability an immediate error.
 
 While any validation runs, the app holds a macOS idle-system-sleep assertion but permits display sleep, explicit sleep, lid-close sleep, and forced thermal/battery sleep. Suspended intervals are recorded and excluded from runnable timeout accounting.
 
@@ -199,9 +199,9 @@ Tollgate has three kinds of process:
 
 1. **Tauri application.** One long-lived process contains the Rust application service, repository supervisors, global scheduler, Git adapter, SQLite stores, log broker, process supervisor, and Tauri bridge. It remains alive with zero windows.
 2. **`tg` CLI.** A short-lived Rust client resolves the repository, launches the app if allowed, performs a versioned IPC handshake, sends a command, and optionally subscribes to events. It never becomes an executor.
-3. **Ephemeral step supervisor.** One small helper per running command establishes a process group, applies priority and resource settings, monitors the app parent, launches the configured shell command, and reports exit status. It exists only for the command's lifetime and is not a daemon.
+3. **Ephemeral step supervisor.** One small helper per running command establishes a process group, watches its process tree's RSS and containment, monitors the app parent, launches the configured shell command, and reports exit status. It exists only for the command's lifetime and is not a daemon.
 
-The React/TypeScript frontend is a projection of the Rust service. It sends typed commands through Tauri invokes and receives snapshots and ordered channels. The frontend is never authoritative: optimistic UI may improve responsiveness, but it must reconcile to service-issued sequence numbers and command results.
+The React/TypeScript frontend is a projection of the Rust service. It calls Tauri commands for every read and operation and renders the service's snapshots and command results; it makes no optimistic updates and is never authoritative. It refetches the application snapshot every two seconds, when the window regains focus, and when the shell emits `tollgate://snapshot-changed`, which every state-changing Tauri command does after it succeeds.
 
 ### 7.2 Rust workspace boundaries
 
@@ -214,12 +214,12 @@ The implementation should use a Cargo workspace with narrow dependency direction
 | `tollgate-store` | SQLite schema, migrations, transactional repositories, event journal, intents/outbox, backups, retention metadata. |
 | `tollgate-runner` | Slots, environment bootstrap, process supervision, logs, timeouts, tracked-clean checks, artifacts, APFS seed management. |
 | `tollgate-scheduler` | Per-repository queue supervisors and global resource/fairness scheduler. |
-| `tollgate-service` | Typed command handlers shared by Tauri and IPC, authorization to repository scope, snapshots, subscriptions. |
+| `tollgate-service` | Typed command handlers shared by Tauri and IPC, authorization to repository scope, snapshots, subscriptions, the idle-sleep assertion held while a buildset runs. |
 | `tollgate-ipc` | Unix-domain-socket framing, protocol negotiation, peer checks, request/response and event stream types. |
 | `tg` | CLI parsing, app launch, rendering, JSON schema, wait/stream behavior. |
 | `tollgate-worker` | Minimal ephemeral command supervisor. |
-| `src-tauri` | macOS lifecycle, Tauri commands/channels, notifications, window restoration, power assertions, app packaging. |
-| `ui` | React/TypeScript views, navigation, virtualization, ANSI log rendering, generated Rust API types. |
+| `src-tauri` | macOS lifecycle, Tauri commands, the Quit confirmation request, failure notifications, window-geometry restoration, app packaging. |
+| `ui` | React/TypeScript views, navigation, the item inspector and its log tail, hand-maintained TypeScript mirrors of the service's serde types. |
 
 Infrastructure crates implement domain traits; the domain must not call a shell, database, wall clock, random generator, or filesystem directly. All state-machine tests use deterministic fake ports.
 
@@ -237,7 +237,7 @@ The v1 wire protocol uses a fixed magic, protocol version, frame kind, flags, co
 
 Request/response frames coexist with resumable event streams. A subscription supplies repository event sequence and per-log-stream offsets. The server returns contiguous durable frames after those positions or an explicit `gap/pruned` response with the earliest available offset; it never silently jumps. High-volume log frames contain repository ID, run/attempt ID, stream, per-stream byte offset, broker observation sequence, and payload. Every handshake identifies CLI version, protocol range, app version, JSON schema version (currently 6), maximum frame sizes, and supported frame kinds. The highest mutually supported protocol version is selected; no overlap fails before commands with a structured upgrade instruction. The JSON schema version must match exactly, because payloads of different schema versions rename fields. The app answers a client of another schema version with a handshake acknowledgement carrying a structured `schema-version-mismatch` rejection and then answers every request on that connection with the same error, running none of them, so even a client too old to read the rejection reports it as a command error. `tg` compares the acknowledged schema version itself as well, so it refuses an app from before this negotiation. The rejection says which side to upgrade: an older `tg` is upgraded to the version bundled with the app, and an older running app is quit and restarted.
 
-The Tauri frontend calls the same `tollgate-service` handlers in-process. Tauri commands are used for bounded request/response operations; Tauri channels carry ordered logs and state changes. Generated TypeScript types and a checked-in protocol schema prevent Rust/UI drift.
+The Tauri frontend calls the same `tollgate-service` handlers in-process through Tauri commands, which are bounded request/response operations. It reads logs by calling the `logs` command and learns of state changes through the snapshot refreshes described in Section 7.1. The TypeScript types in `ui/src/lib/types.ts` are written by hand to mirror the service's serde output; the checked-in `schemas/protocol-v1.schema.json` neither generates nor checks them.
 
 Timestamps in control JSON (IPC results, Tauri command and channel payloads, persisted JSON such as event payloads and stored responses, and `tg --json`) use the `time` crate's serde encoding of `OffsetDateTime`: the array `[year, ordinal day, hour, minute, second, nanosecond, offset hours, offset minutes, offset seconds]`, a local date and time at that UTC offset whose offset components share one sign. For example, `[2026, 227, 5, 43, 0, 0, -5, -30, 0]` is 2026-08-15T05:43:00-05:30. This encoding is part of the stable `--json` contract at the current JSON schema version; changing it to RFC 3339 strings requires a schema-version bump and decoding of both encodings in persisted rows. The UI types each timestamp as the `Timestamp` tuple and decodes it only through `timestampMs` in `ui/src/lib/utils.ts`.
 
@@ -250,14 +250,14 @@ Authoritative runtime repository state is colocated with the Git common director
 | Path | Contents |
 | --- | --- |
 | `<git-common-dir>/tollgate/state.sqlite3` | Queue, buildsets, steps, events, intents, history, slots/seeds metadata, retention metadata. |
-| `<git-common-dir>/tollgate/logs/` | Append-only active logs and compressed completed logs. |
+| `<git-common-dir>/tollgate/logs/` | Append-only per-step logs (`.tlog`) and their frame indexes (`.idx`). |
 | `<git-common-dir>/tollgate/artifacts/` | Retained run artifacts governed by their own budget. |
 | `<repository-root>/.tollgate/config.toml` | Required trusted local repository configuration and the sole live policy source. |
 | `<git-common-dir>/tollgate/backups/` | Rolling online database backups and migration snapshots. |
 | `refs/tollgate/sources/` | Approved source-object retention refs. |
 | `refs/tollgate/tested/` | Exact tested objects copied back from the mirror while active/audited. |
 
-Disposable execution data lives by default at `~/Library/Caches/Tollgate/<repository-id>/`:
+Disposable execution data lives under the app-support directory at `<app-support>/cache/<repository-id>/` (on macOS, `~/Library/Application Support/dev.Tollgate.Tollgate/cache/<repository-id>/`):
 
 | Path | Contents |
 | --- | --- |
@@ -267,7 +267,7 @@ Disposable execution data lives by default at `~/Library/Caches/Tollgate/<reposi
 | `seeds/<profile>/<generation>/` | Read-only APFS clone snapshots and manifests. |
 | `quarantine/` | Reset/corrupt slot data awaiting deletion. |
 
-Global app support contains only the explicit repository registry, UI/preferences state, IPC endpoint/lock, protocol metadata, and updater state. It does not duplicate queue authority. UI navigation state includes last repository, route, selection, filters, log follow/scroll state, sidebar state, and window geometry.
+Global app support holds the explicit repository registry (`repositories.json`), stored global command results, the IPC socket, the app authority lock, and notification preferences (`notification-preferences.json`). It does not duplicate queue authority. UI navigation state lives in the webview's local storage, which keeps the last repository, route, and selected item; the Tauri window-state plugin keeps window geometry.
 
 The cache root is configurable per repository. Before cloning, Tollgate verifies source and destination have the same device identity and that the volume advertises APFS clone capability. A non-APFS or cross-volume root remains usable with persistent slots, but new-slot seeding is cold unless the user explicitly authorizes a physical copy after seeing its estimated size. Clone-required operations never silently degrade to physical copies.
 
@@ -326,7 +326,7 @@ Every operation spanning SQLite and Git or the filesystem uses the same explicit
 ### 8.4 Retention
 
 - Queue, result, timing, promotion, push, configuration-digest, and audit metadata are retained indefinitely.
-- Full logs default to 90 days and 10 GiB per repository. Active-queue logs are never pruned. Completed logs are compressed in the background. Pruned log ranges remain explicit metadata.
+- Full logs default to 90 days and 10 GiB per repository. Active-queue logs are never pruned. Pruned log ranges remain explicit metadata.
 - Retained artifacts default to 30 days and 50 GiB per repository. Pinned runs/artifacts are exempt and reported separately.
 - The artifact retention sweep runs five minutes after startup and hourly afterward, on its own background task. It prunes expired, unpinned artifacts that no active queue item's buildset owns, oldest expiry first, in batches of at most 200 artifacts and, past a batch's first artifact, 256 MiB of artifact data. Each batch is one `artifact-prune-batch` intent and one completion transaction with one `artifact.pruned` event. The sweep holds a repository's mutation lock only while a batch runs and yields between batches, so configuration observation, pulls, and queue work for every repository continue during a long sweep. Each artifact's size and hash are verified once, in quarantine, immediately before deletion.
 - A pruning failure never stops the sweep or makes a repository unavailable. The failing artifact stays at its retained path and is recorded as needing attention; later sweeps skip it and Doctor reports it until an explicit `tg artifact prune` of that artifact succeeds. A batch-level failure, such as a database error, ends that repository's sweep, and the next sweep completes the unfinished batch first.
@@ -788,15 +788,15 @@ Templates may detect an already-installed third-party tool such as `sccache`, `m
 Changing the local configuration is an explicit gate-wide operation:
 
 1. When Tollgate detects file contents different from the active digest, the repository enters `configuration-pending`. New dispatch and promotion stop, while active commands may finish and record results under their frozen configuration.
-2. The app and `tg config apply` validate the candidate and preview every running or ready item that will restart. If the candidate's canonical digest matches the active digest, the pending state clears without invalidation.
-3. After explicit confirmation, Tollgate activates the new canonical digest. When the gate policy changed, it advances the queue revision, invalidates every active gate and independent-check generation that has not already crossed local CAS, terminates their still-running old buildsets, and rebuilds the affected queue. A release-only edit, one that changes at most release-stage steps, `release_concurrency`, and `max_release_lag` without adding the first or removing the last release-stage step, leaves the gate policy unchanged: gate and independent-check generations, their running or completed buildsets, and their certificates stay current, and the queue revision stays. Release runs follow the release-stage digest instead (section 12.7), so a gate edit never terminates a running release run either. Promoting a gate generation built under a configuration with the active gate policy keeps the active configuration, so a release-only edit survives the promotion of work validated before it. Recovery of an interrupted apply makes the same distinction from the recorded previous and activated digests. A `promoted-local-push-pending` head and its frozen push intent are historical local-promotion facts and are not invalidated or mutated by a later configuration digest; Section 10.4 keeps their barrier closed until exact push completion or explicit abandonment.
+2. `tg config apply` validates the candidate and activates it. It shows no impact preview, so running it is the explicit confirmation, and the desktop UI has no apply control (Section 17.5). If the candidate's canonical digest matches the active digest, the pending state clears without invalidation.
+3. Tollgate then activates the new canonical digest. When the gate policy changed, it advances the queue revision, invalidates every active gate and independent-check generation that has not already crossed local CAS, terminates their still-running old buildsets, and rebuilds the affected queue. A release-only edit, one that changes at most release-stage steps, `release_concurrency`, and `max_release_lag` without adding the first or removing the last release-stage step, leaves the gate policy unchanged: gate and independent-check generations, their running or completed buildsets, and their certificates stay current, and the queue revision stays. Release runs follow the release-stage digest instead (section 12.7), so a gate edit never terminates a running release run either. Promoting a gate generation built under a configuration with the active gate policy keeps the active configuration, so a release-only edit survives the promotion of work validated before it. Recovery of an interrupted apply makes the same distinction from the recorded previous and activated digests. A `promoted-local-push-pending` head and its frozen push intent are historical local-promotion facts and are not invalidated or mutated by a later configuration digest; Section 10.4 keeps their barrier closed until exact push completion or explicit abandonment.
 4. An invalid configuration blocks that repository until repaired or reverted. It never falls back silently to defaults or a previous digest.
 
 Running buildsets never change configuration in place. Tracked scripts invoked by a configured command remain ordinary tested source content and need no special configuration activation behavior.
 
 File watching exists only to make pending changes visible promptly. Before constructing a validation generation, dispatching a buildset, retrying infrastructure work, or promoting, the supervisor synchronously opens and canonicalizes the configuration and compares its digest with the repository's active digest. A missing, unreadable, concurrently changing, or invalid file enters `configuration-pending` or `blocked` and prevents the transition. To avoid accepting a torn read, Tollgate reads from an open descriptor, records file identity and metadata before and after parsing, and retries once when they change; a second change is reported as unstable configuration.
 
-`tg config explain` and the UI show each effective field, its explicit or defaulted value, the active and pending digests, and which buildsets a candidate change would invalidate. Its human output names the gate and release-stage graph digests, the `sync_user_master` target, `release_concurrency`, `max_release_lag`, and each step's stage. The checked-in `schemas/config-v1.schema.json` declares `stage`, `sync_user_master`, `release_concurrency`, and `max_release_lag` with their defaults.
+`tg config explain`, like `tg config validate`, parses `.tollgate/config.toml` as it is on disk and reports that candidate's effective configuration. Its `--json` output is the serialized effective configuration, which omits post-v1 fields at their defaults (Section 11.2). Its human output names the canonical digest, the gate and release-stage graph digests, the runner, the `sync_user_master` target, `release_concurrency`, `max_release_lag`, and each step's stage, voting flag, and timeout. It does not mark values as explicit or defaulted, compare the candidate with the active digest, or list the buildsets a change would invalidate. The active digest is `active_configuration_digest` in `tg --json status`, whose human output prints its first twelve characters. The desktop UI has no configuration view: its header badge shows the repository's execution state, including **Configuration pending** (Section 17.1). Section 22 (Phase 4) plans the explicit-or-defaulted marking, the digest comparison, and the impact preview. The checked-in `schemas/config-v1.schema.json` declares `stage`, `sync_user_master`, `release_concurrency`, and `max_release_lag` with their defaults.
 
 ## 12. Execution environment and step semantics
 
@@ -936,11 +936,11 @@ A release run is a queue item of kind `release`: one buildset of the release sta
 
 ### 13.1 Log pipeline
 
-The runner writes every stdout/stderr frame to an append-only per-attempt log before publishing it. Each frame has stream, per-stream byte offset, broker observation sequence, monotonic timestamp, wall timestamp, and payload length. Offsets prove gap-free order within stdout or stderr. The broker sequence is only the order in which Tollgate observed reads from the two independent pipes; it does not claim causal ordering between bytes concurrently written to stdout and stderr. A bounded broadcast channel may drop live UI delivery under pressure, but never process output or durable log bytes; clients resume by durable frame/stream offsets.
+The runner writes every stdout/stderr frame to an append-only per-attempt log before publishing it. Each frame has stream, per-stream byte offset, broker observation sequence, monotonic timestamp, wall timestamp, and payload length. Offsets prove gap-free order within stdout or stderr. The broker sequence is only the order in which Tollgate observed reads from the two independent pipes; it does not claim causal ordering between bytes concurrently written to stdout and stderr. Readers are not pushed log frames: the desktop UI and `tg logs --follow` read the durable log by broker sequence, so a slow or absent reader never holds back process output or durable log bytes, and a reader resumes from the last sequence it saw.
 
-Active logs remain uncompressed. Completed logs are indexed and compressed in seekable chunks so the UI can request ranges, tail efficiently, search, and preserve offsets. Log completion includes final offsets and hashes in the pass certificate. Invalid UTF-8 is preserved in storage and rendered lossily with an indicator. ANSI escape rendering is supported without granting terminal input.
+Each step's log is one uncompressed `.tlog` file with a frame index, so a reader can request frames from any broker sequence or only the last frames. Log completion includes final offsets and hashes in the pass certificate. Invalid UTF-8 is preserved in storage; log reads decode each frame lossily and flag it `invalid_utf8`.
 
-The UI uses virtualization and bounded decoded buffers. Follow mode, pause, stdout/stderr filtering, search, copy, and “open raw log” are available. A slow/closed window never blocks a command.
+In the desktop UI, the item inspector's **View log** opens a panel showing the tail of one step's log. A step picker selects the step; the panel requests that step's last 2,000 frames and shows their stdout and stderr text interleaved in broker order as plain text, refetching every second while the item is running. **Open raw** opens the step's `.tlog` file in the system's default application. The panel has no follow or pause control, stream filter, search, or copy action; it does not interpret ANSI escapes or mark lossily decoded frames; and it cannot page back past the tail. `tg logs <id> [--step <name>] [--follow]` prints the log from its first frame (at most 10,000 frames without `--follow`), `--follow` keeps reading new frames while the item runs and resumes after a disconnect, and `--json` emits each frame with its stream, offsets, and `invalid_utf8` flag. A slow or closed window never blocks a command. Section 22 (Phase 4) plans the full log viewer.
 
 ### 13.2 Retained artifacts
 
@@ -1088,7 +1088,7 @@ Two narrower holds exist in a repository with release-stage steps (section 10.9)
 
 ### 15.4 Background behavior
 
-Worker groups run in Background priority by default, with a global preference for Normal mode and a temporary “Boost active runs” action. Priority does not replace concurrency/resource limits. Power assertions exist only while at least one command is active and are reference counted.
+Worker process groups run at the default macOS scheduling priority. Tollgate sets no Background or Normal priority, and neither the CLI nor the desktop UI has a priority preference or a “Boost active runs” action; Section 22 (Phase 4) plans them. Concurrency and resource limits (Section 15.1) govern admission. Each running buildset holds its own idle-system-sleep assertion (Section 6.1) and releases it when the buildset finishes.
 
 ## 16. CLI contract
 
@@ -1141,34 +1141,37 @@ Wait/log streams resume from event/log sequence offsets after transient IPC disc
 
 Live commands auto-launch the app unless `--no-launch`. A command that requires the app never mutates SQLite directly. Offline historical reads may eventually use a read-only library, but v1 should prefer app service consistency.
 
-The signed/notarized Apple-Silicon app bundle contains the matching `tg` binary. First launch offers to create/update a symlink in `~/.local/bin/tg` and diagnoses whether that directory is on imported `PATH`. App updates replace both components. A Homebrew cask may automate the same layout later.
+The signed/notarized Apple-Silicon app bundle contains the matching `tg` binary. `scripts/install-local.sh` installs the app and points the `~/.local/bin/tg` symlink at the bundled binary. The Tauri shell registers `cli_install_status`, which reports whether that symlink resolves to the bundled `tg` and whether its directory is on the app's `PATH`, and `install_cli`, which creates the symlink or repairs one that points into a `Tollgate.app`; no UI control calls either, and Section 22 (Phase 4) plans a first-launch install prompt. App updates replace both components. A Homebrew cask may automate the same layout later.
 
 ## 17. Desktop user experience
 
 ### 17.1 Navigation
 
-The app has a persistent left sidebar containing only explicitly registered repositories. Badges summarize running, queued, failed, and blocked states. Repositories are never auto-discovered.
+The app has a persistent left sidebar listing the registered repositories that have finished activation. Repositories that are still activating or unavailable do not appear there; `tg repo activation` reports them. Repositories are never auto-discovered, and with none registered the window says to register one with `tg init`. Each repository row carries a status dot (red when the repository is blocked or its latest master push failed, green when its gate is active, amber when it is paused or configuration-pending) and either the number of items in its active queue or `!` for a failed master push. Below the list, the **Gate**, **Checks**, and **Release** routes select the main view.
 
-On reopen, the app restores the previously viewed repository, route, selected queue/history item and step, filters, log position/follow state, sidebar state, and window geometry. Back/forward navigation and recent selection history behave like a normal desktop browser shell. An aggregate Home view may exist but is never forced on launch.
+The header shows the route title, the repository's execution state (**Gate active**, **Gate paused**, **Configuration pending**, or **Needs attention**), the short `staging` and `release` OIDs, the release lag, and a **Refresh** button.
+
+On reopen, the app restores the last repository, route, and selected item from the webview's local storage, and the Tauri window-state plugin restores window geometry. Each selection is also recorded in the webview's session history, but the window offers no back or forward control. There is no aggregate Home view.
 
 ### 17.2 Repository queue view
 
-The primary repository view presents the queue as an ordered speculative chain. Each row/card shows:
+The **Gate** route (page heading **Runs**) lists the active queue in queue order, followed by completed gate items from the service's paged history, newest first; reaching the end of the list loads the next 50 (**Load older runs**). Above the list it shows the repository's first block reason with its recovery action and, when the latest master push failed, an action-required card that names the failed step when one is known and opens the entry. Each card shows:
 
-- queue position, hard-dependency edges, and active-window eligibility;
-- source branch/worktree label and immutable source OID;
-- exact tested prefix OID and its expected parent;
-- which earlier patches are included;
-- queue revision, validation generation, and stale/invalidation lineage;
-- step summary, current slot, elapsed/estimated timing;
-- pass/failure/conflict/cancel state;
-- local promotion, remote push, and cleanup state.
+- queue position, for items in the active queue;
+- a status icon and label derived from the queue item state, so a ready item (**Validation passed**) reads differently from a promoted one;
+- the commit subject;
+- the source branch label (`detached` without one, `release run` for a release run) and short source OID;
+- elapsed time.
 
-Selecting an item opens its frozen configuration, prefix composition, attempts, step DAG/list, timing, logs, artifacts, certificate, and audit timeline. Ready descendants are visually different from promoted items. A passing item with non-voting failures says “passed with warnings,” not green success.
+Selecting a card opens the item inspector, a dialog that Escape closes. It shows the item kind and status, subject, branch, and source OID; elapsed time and attempt number; the tested commit; whether promotion is authorized (a release run shows its range instead); the terminal reason; each step of the frozen step list (or of the current configuration before a buildset exists) with its result class, `(reused)` for a reused result, and elapsed time, or `waiting`; and the log panel (Section 13.1). The **Checks** route lists independent checks the same way: active checks first, then completed ones from history.
+
+A ready item reads **Validation passed** whether or not a non-voting step failed; the failed non-voting step shows its failure class in the inspector's step list.
+
+The cards and inspector do not show hard-dependency edges, active-window eligibility, the tested prefix and its expected parent, included earlier patches, queue revision, validation generation or invalidation lineage, the current slot, estimated timing, or remote push and cleanup state, and the inspector does not show the frozen configuration, prefix composition, earlier attempts, certificate, artifacts, or audit timeline. `tg queue` reports the queue revision, per-item validation generations, dependencies, states, and prefix OIDs, and `tg status <id>` reports an item's detailed evidence. Section 22 (Phase 4) plans these displays and a distinct passed-with-warnings label.
 
 ### 17.3 Slots and resources
 
-A resource panel shows global run capacity, CPU/memory reservations versus observed use, named semaphores, disk reserve, running processes, and scheduler order. Slot detail shows checkout OID, last/next use, cache profile, seed origin, logical/estimated physical size, and health. Slot reset and cache purge are CLI-only (Section 17.5).
+The desktop UI has no resource or slot panel. The application snapshot carries each repository's resources (run capacity, CPU and memory reservations, named semaphores, and per-volume free space and thresholds), slots, and seeds, but no view displays them; the Quit confirmation reads only the running buildset count (Section 19.2). They are available from the CLI: `tg status` reports active and waiting runs and its `--json` output carries the whole resource view; `tg slot list` lists each slot's ID, state, and checkout OID, adding path, health, and last use with `--json`; `tg cache status` reports the slot count and, with `--json`, the seeds; and `tg storage status` reports cache usage (Section 17.6). Slot reset and cache purge are CLI-only (Section 17.5). Section 22 (Phase 4) plans the resource panel and slot detail.
 
 ### 17.4 Release panel
 
@@ -1203,19 +1206,21 @@ The Release route's Remote panel lists the repository's active blocks (for examp
 
 ### 17.6 History and storage
 
-History is queryable by repository, source/tested/promoted OID, branch label, queue item, result, step, time, and terminal reason. Invalidated attempts remain visible and link to the event that invalidated them. Promotion/push recovery and external-base adoption are part of the same timeline.
+History in the desktop UI is the completed part of the **Gate** and **Checks** routes (Section 17.2): the service's paged history for the selected repository, newest first, 50 items at a time, with no filter or search. The item inspector shows only the current attempt. `tg history` prints the repository's recent domain events (the newest 100 in human output, the snapshot's event list with `--json`), and `tg status <id> --json` carries an item's attempts and their validation generations, each generation's `invalidated_by` naming the generation that replaced it. Promotion/push recovery and external-base adoption record events in the same journal.
 
-Storage settings show separate budgets/usage for logs, retained artifacts, slots, and seeds; pinned items and minimum reserves are explicit. Pruned content is represented by tombstone metadata.
+The desktop UI has no storage settings or storage view. Storage is managed from the CLI: `tg storage status` reports execution-cache usage against its target and hard limit, the reclaimable bytes, and the minimum free-space floor, with each entry's class, path, charged size, and protection reason in `--json`; `tg storage preview-prune` also lists the entries a prune would remove; `tg storage prune` removes them; and `tg artifact list` lists retained artifacts with their retained or pinned state. Pruned content is represented by tombstone metadata.
+
+Section 22 (Phase 4) plans history queries by source, tested, or promoted OID, branch label, queue item, result, step, time, and terminal reason; invalidated attempts that link to the event that invalidated them; and a storage view with separate budgets and usage for logs, retained artifacts, slots, and seeds, with pinned items and minimum reserves explicit.
 
 ### 17.7 Notifications
 
-macOS notifications are failure/attention-only: conclusive validation failure, exhausted infrastructure attempts, setup/bootstrap failure, push failure, a user-master synchronization refusal, repository block requiring reconciliation, a failing release streak and its recovery, a release hold (`release.push-blocked` or `release.held`) and a release push that lands after one, or a promotion paused by `max_release_lag` (`promotion.paused`). Events notify when their payload sets `notify`; a snapshot fallback notifies each release hold or promotion pause once when it appears without an event in the observed history, and again only after it clears and returns. Success, promotion, starts, retries, and ordinary invalidation do not notify. Clicking a notification opens the exact item/step. Notifications honor per-repository mute and global quiet mode from the app's `notification-preferences.json`; the desktop UI has no control to change them (Section 17.5).
+macOS notifications are failure/attention-only: conclusive validation failure, exhausted infrastructure attempts, setup/bootstrap failure, push failure, a user-master synchronization refusal, repository block requiring reconciliation, a failing release streak and its recovery, a release hold (`release.push-blocked` or `release.held`) and a release push that lands after one, or a promotion paused by `max_release_lag` (`promotion.paused`). Events notify when their payload sets `notify`; a snapshot fallback notifies each release hold or promotion pause once when it appears without an event in the observed history, and again only after it clears and returns. Success, promotion, starts, retries, and ordinary invalidation do not notify. A notification's title names the repository, and its body carries the event's subject and detail or the block's message; clicking it does not select an item or step, and Section 22 (Phase 4) plans that navigation. Notifications honor per-repository mute and global quiet mode from the app's `notification-preferences.json`; the desktop UI has no control to change them (Section 17.5).
 
 ### 17.8 Frontend implementation
 
-React/TypeScript is appropriate for the complex queue, virtualized history, and terminal-style logs. All authoritative logic stays in Rust. The UI should use generated API types, an explicit query/cache layer for snapshots, ordered event reducers keyed by repository sequence, and an ANSI renderer that does not expose an interactive terminal.
+The frontend is React and TypeScript; all authoritative logic stays in Rust. TanStack Query caches the application snapshot, the paged history, item details, and log tails, and the snapshot refreshes described in Section 7.1 keep them current; there are no event reducers. The TypeScript types in `ui/src/lib/types.ts` are maintained by hand to match the service's serde output (Section 7.4). Logs render as plain text in a bounded tail, without an ANSI renderer or a virtualized list (Section 13.1). The browser development view (`npm --prefix ui run dev`) uses the typed fixture in `ui/src/lib/demo-data.ts`.
 
-Accessibility requirements include keyboard access to every operation, non-color state labels/icons, VoiceOver names for queue/dependency state, reduced-motion support, and system light/dark appearance.
+For accessibility, every control is a native button or select reachable from the keyboard; status icons carry text labels and each status also appears as text; the item inspector, the Reconcile confirmation, and the Quit confirmation are labeled dialogs, and Escape closes the inspector and dismisses the Quit confirmation; the active route is marked `aria-current`; and `prefers-reduced-motion` suppresses animation. The app has a light appearance only. Section 22 (Phase 4) plans generated API types, ordered event reducers, ANSI rendering, VoiceOver names for queue and dependency state, and system dark appearance.
 
 ## 18. Initialization and diagnostics
 
@@ -1451,9 +1456,9 @@ Benchmark state snapshots/history queries at one year of events, 10 MiB/s log in
 
 ### 21.6 UI and end-to-end tests
 
-Frontend tests use recorded typed service fixtures for every state and transition. End-to-end tests launch the real Tauri app, CLI, Git repositories, and shell commands on macOS Tahoe. Critical flows include init/bootstrap, approve/wait, A/B/C visualization without descendant reruns, tail append without earlier invalidation, failure/retry/reorder, local configuration pending/preview/apply/revert, prospective environment reload, pull/reconcile, push block/retry, explicit frozen-push abandonment followed by policy apply, app window close/reopen restoration, app crash recovery, cache reset, and automatic safe worktree cleanup.
+Frontend tests run under Vitest with jsdom and Testing Library (`npm --prefix ui test`). They render components against synthetic typed snapshots or the typed development fixture, with the Tauri `invoke` and event APIs mocked, and cover the Gate and Checks routes, the Release view and its Remote operations including the Reconcile preview, the Quit confirmation, and timestamp decoding.
 
-Accessibility tests cover keyboard-only queue/log operations, VoiceOver labels, non-color state communication, and reduced motion.
+There is no end-to-end or accessibility suite. Phase 6 of the roadmap (Section 22) plans end-to-end tests that launch the real Tauri app, CLI, Git repositories, and shell commands on macOS Tahoe, covering init/bootstrap, approve/wait, A/B/C visualization without descendant reruns, tail append without earlier invalidation, failure/retry/reorder, local configuration pending/preview/apply/revert, prospective environment reload, pull/reconcile, push block/retry, explicit frozen-push abandonment followed by policy apply, app window close/reopen restoration, app crash recovery, cache reset, and automatic safe worktree cleanup, and accessibility tests covering keyboard-only queue/log operations, VoiceOver labels, non-color state communication, and reduced motion.
 
 ### 21.7 Release acceptance criteria
 
@@ -1482,11 +1487,24 @@ Add SQLite schema/events/intents/backups, repository actors, global service, UDS
 
 ### Phase 3: runner, logs, slots, and caches
 
-Add shell bootstrap, worker process groups, real generic steps/DAGs, timeouts/retries, tracked-clean verification, logs, independent checks, retained artifacts, resource scheduler, execution slots, APFS seeds, budgets, reset/purge, and bootstrap CI. Exit criterion: real Rust/Node/Python/Unity-shaped command fixtures demonstrate warm-slot/new-slot reuse and safe crash/cancel behavior.
+Add shell bootstrap, worker process groups, real generic steps/DAGs, timeouts/retries, tracked-clean verification, logs, independent checks, retained artifacts, resource scheduler, execution slots, APFS seeds, budgets, reset/purge, and bootstrap CI. Exit criterion: real Rust/Node/Python/Unity-shaped command fixtures demonstrate warm-slot/new-slot reuse and safe crash/cancel behavior. Compressing completed logs in seekable chunks is planned work in this phase.
 
 ### Phase 4: Tauri command center
 
 Build React navigation/sidebar, repository queue/prefix visualization, slot/resource panels, step/log/artifact/history views, all shared-service operations, navigation restoration, storage/config/doctor surfaces, failure notifications, and accessibility. Exit criterion: every normal CLI mutation has a tested UI path, and log/UI scale targets pass. The UI paths still to build are the CLI-only operations that Section 17.5 lists. Each one that invalidates descendants, kills a process, deletes a worktree or branch, discards caches, or reorders the queue will present a concrete impact preview, and each will carry the observed queue revision so the service refuses it, and the UI re-previews it, when state changed before confirmation, as Reconcile does today.
+
+The display work still planned for this phase is:
+
+- queue cards and an item inspector that show dependency edges, active-window eligibility, the tested prefix and expected parent, included patches, queue revision, validation generation and invalidation lineage, the current slot, estimated timing, remote push and cleanup state, the frozen configuration, every attempt, the certificate, artifacts, the audit timeline, and a distinct passed-with-warnings label (Section 17.2);
+- sidebar badges for running, queued, failed, and blocked work, activating and unavailable repositories in the sidebar, restoration of the selected step, filters, log position and follow state, and sidebar state, back and forward controls, and an aggregate Home view that is never forced on launch (Section 17.1);
+- a resource panel with run capacity, CPU and memory reservations against observed use, named semaphores, disk reserve, running processes, and scheduler order, and slot detail with checkout OID, last and next use, cache profile, seed origin, logical and estimated physical size, and health (Section 17.3);
+- a configuration view and `tg config explain` output that mark each effective field explicit or defaulted, compare the active and pending digests, and preview the running or ready items a pending change would restart before `tg config apply` or a UI apply activates it (Section 11.5);
+- a log viewer with follow mode, pause, stdout/stderr filtering, search, copy, ANSI rendering without terminal input, an invalid-UTF-8 indicator, virtualization, and access to the whole log (Section 13.1);
+- history queries and a storage view (Section 17.6);
+- notifications that open their exact item and step when clicked, and controls for per-repository mute and quiet mode (Section 17.7);
+- generated API types checked against the protocol schema, ordered state and log delivery over Tauri channels, VoiceOver names for queue and dependency state, and system dark appearance (Sections 7.4 and 17.8);
+- a first-launch prompt that installs the `tg` symlink through `install_cli` (Section 16.3);
+- Background worker priority with a Normal-mode preference and a temporary “Boost active runs” action (Section 15.4), and a login-item preference (Section 6.1).
 
 ### Phase 5: remote synchronization and gate-aware Git wrappers
 
@@ -1494,7 +1512,7 @@ Implement `tg pull`, leased `tg push`, push barriers, automatic remote fast-forw
 
 ### Phase 6: release hardening
 
-Complete Tahoe Apple-Silicon performance/soak testing, signed/notarized packaging, bundled CLI install/update, schema migration tests, diagnostics export, storage-pressure tests, documentation, and recovery drills. Exit criterion: all release acceptance criteria and scale goals pass on physical hardware.
+Complete Tahoe Apple-Silicon performance/soak testing, the end-to-end and accessibility suites of Section 21.6, signed/notarized packaging, bundled CLI install/update, schema migration tests, diagnostics export, storage-pressure tests, documentation, and recovery drills. Exit criterion: all release acceptance criteria and scale goals pass on physical hardware.
 
 ## 23. Key risks and mitigations
 
@@ -1508,7 +1526,7 @@ Complete Tahoe Apple-Silicon performance/soak testing, signed/notarized packagin
 | Git/SQLite cross-system partial commit | Durable intents, old-OID ref CAS, idempotent recovery, exhaustive fault injection. |
 | CI command mutates Git state | Disposable execution mirror, detached slot worktrees, final HEAD/index/tracked checks. |
 | External local or remote movement wastes long CI | Ref monitoring plus mandatory transition checks, periodic fetch when remote authoritative, immediate affected-generation invalidation, leased push. |
-| High-volume logs freeze app or block builds | File-first append, bounded broadcasts, offset resume, Tauri channels, seekable compression, virtualized UI. |
+| High-volume logs freeze app or block builds | File-first append, a per-step frame index, sequence-resumable polling reads, and a desktop log panel bounded to the last 2,000 frames of one step. |
 | A local configuration edit unexpectedly changes the gate | Pending-change block, explicit impact preview and activation, applicable voting-step validation, one canonical frozen digest, synchronous transition-time revalidation, and full unpromoted-result invalidation when an apply changes the gate policy. |
 | SQLite WAL/version defects | Bundle a fixed current SQLite, use one writer/checkpointer, short readers, online backups, integrity checks. |
 | Automatic cleanup deletes user work | Never primary worktree; exact OID and cleanliness verification; branch CAS; path ownership; needs-attention fallback. |
