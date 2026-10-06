@@ -209,7 +209,7 @@ impl TollgateService {
             return;
         }
         let service = Arc::clone(self);
-        tokio::spawn(async move {
+        self.background.spawn(async move {
             if let Err(error) = service.advance_release(repository_id).await {
                 eprintln!("Tollgate release advance for {repository_id} failed: {error}");
             }

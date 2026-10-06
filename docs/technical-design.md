@@ -1278,6 +1278,10 @@ Completion based on recovery evidence emits the same idempotent domain result as
 
 On explicit Quit, stop admitting work, persist shutdown intent, signal all worker groups, wait a bounded grace period, force-kill, checkpoint databases, release power assertions/locks, and mark clean shutdown. Running buildsets rerun in full next time.
 
+- **Admission.** Quit interrupts every preparing or running gate or release item under the repository mutation lock. An item task already dispatched but not yet preparing never starts once Quit begins, so its item stays queued.
+- **Settling.** Quit waits, within the same grace period, for every background task acting for a repository to finish: item execution, release triggers, and release advances. None spawns another once Quit begins. A task still running at the deadline leaves the shutdown unclean, and its repository stays locked until the process exits.
+- **Locks.** Only after every task settles and the databases are checkpointed does Quit release each repository ownership lock, so the repository can reopen at once in the same or a new process. Startup then recovers it like any other: an interrupted release run is started, so it keeps its target and reruns before its queued successor (section 12.7).
+
 On app crash, workers detect parent exit and kill command groups. On restart, any `running` database state without a completed durable result becomes interrupted even if an exit marker suggests success. A worker cannot author a pass certificate.
 
 ### 19.3 Mirror, slot, and seed loss

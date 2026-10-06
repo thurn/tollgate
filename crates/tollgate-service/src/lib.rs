@@ -795,7 +795,10 @@ impl RuntimeData {
 }
 
 struct RepositoryRuntime {
-    _ownership_lock: nix::fcntl::Flock<std::fs::File>,
+    /// The repository ownership lock. An orderly shutdown releases it once every background
+    /// task has settled, so the repository can reopen at once; otherwise it is released when the
+    /// runtime drops or the process exits.
+    ownership_lock: Mutex<Option<nix::fcntl::Flock<std::fs::File>>>,
     git: GitRepository,
     store: RepositoryStore,
     cache_root: PathBuf,
@@ -840,6 +843,10 @@ struct RepositoryRuntime {
     /// and waits on the second before planning again under the mutation lock.
     #[cfg(test)]
     release_observation_gate: Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
+    /// Test hook: the next dispatched item task signals the first `Notify` before it registers
+    /// its cancellation and waits on the second before dispatching.
+    #[cfg(test)]
+    dispatch_gate: Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
     scheduler_epoch: AtomicU64,
     dispatching: Mutex<HashSet<QueueItemId>>,
     execution_changed: Notify,
@@ -1077,6 +1084,10 @@ pub struct TollgateService {
     storage_charged_bytes: AtomicU64,
     volume_reservations: tokio::sync::Mutex<()>,
     shutting_down: AtomicBool,
+    /// Background tasks that act for a repository runtime: item execution, release triggers,
+    /// and release advances. Orderly shutdown waits for every one to settle before it releases
+    /// the repository ownership locks.
+    background: tokio_util::task::TaskTracker,
 }
 
 fn failure_attribution(
@@ -1837,6 +1848,7 @@ impl TollgateService {
             storage_charged_bytes: AtomicU64::new(u64::MAX),
             volume_reservations: tokio::sync::Mutex::new(()),
             shutting_down: AtomicBool::new(false),
+            background: tokio_util::task::TaskTracker::new(),
         });
         let records = service.load_registry().await?;
         service.spawn_activations(records).await;
@@ -1970,6 +1982,9 @@ impl TollgateService {
                 let Some(service) = service.upgrade() else {
                     break;
                 };
+                if service.shutting_down.load(Ordering::Acquire) {
+                    continue;
+                }
                 let ids = service
                     .runtimes
                     .read()
@@ -5585,7 +5600,7 @@ impl TollgateService {
             config.has_release_stage() || state.has_unreleased_commits(),
         );
         Ok(Arc::new(RepositoryRuntime {
-            _ownership_lock: ownership_lock,
+            ownership_lock: Mutex::new(Some(ownership_lock)),
             git,
             store,
             cache_root: cache,
@@ -5621,6 +5636,8 @@ impl TollgateService {
             release_fault: Mutex::new(None),
             #[cfg(test)]
             release_observation_gate: Mutex::new(None),
+            #[cfg(test)]
+            dispatch_gate: Mutex::new(None),
             scheduler_epoch: AtomicU64::new(0),
             dispatching: Mutex::new(HashSet::new()),
             execution_changed: Notify::new(),
@@ -11661,12 +11678,25 @@ impl TollgateService {
         item_id: QueueItemId,
     ) -> Result<(), ServiceError> {
         let runtime = self.runtime(repository_id).await?;
+        #[cfg(test)]
+        {
+            let gate = runtime.dispatch_gate.lock().take();
+            if let Some((reached, resume)) = gate {
+                reached.notify_one();
+                resume.notified().await;
+            }
+        }
         let buildset_id = BuildsetId::new();
         let cancellation = CancellationToken::new();
         runtime
             .cancellations
             .lock()
             .insert(item_id, cancellation.clone());
+        // Shutdown sets its flag before it cancels the registered tokens, so a task registered
+        // too late for that sweep observes the flag here and never dispatches.
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Ok(());
+        }
         loop {
             let observed_storage = self.storage_charged_bytes.load(Ordering::Acquire);
             let storage_ready = observed_storage <= storage::HARD_LIMIT_BYTES;
@@ -11779,6 +11809,11 @@ impl TollgateService {
             return Ok(());
         }
         let dispatch_guard = runtime.mutation.lock().await;
+        // Shutdown interrupts preparing and running items under this lock, so an item that has
+        // not reached `Preparing` by then must never start once it is acquired.
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let config_text =
             tokio::fs::read_to_string(runtime.git.worktree_root.join(".tollgate/config.toml"))
                 .await?;
@@ -13498,7 +13533,7 @@ impl TollgateService {
                     service.spawn_eligible(repository_id, &runtime);
                 }
             });
-        tokio::spawn(future);
+        self.background.spawn(future);
     }
 
     fn recover_interrupted(
@@ -14532,7 +14567,7 @@ impl TollgateService {
         }
         let service = Arc::clone(self);
         let runtime = Arc::clone(runtime);
-        tokio::spawn(async move {
+        self.background.spawn(async move {
             if let Err(error) = service.trigger_release_run(repository_id).await {
                 runtime
                     .release_trigger_requested
@@ -15528,17 +15563,19 @@ impl TollgateService {
                 token.cancel();
             }
         }
+        // Every background task acting for a runtime settles before the ownership locks are
+        // released: a canceled worker records its interruption, an item task dispatched too late
+        // for the sweep above returns without starting, and a release trigger or advance already
+        // in flight finishes its pass. None spawns another, because each checks the flag.
+        self.background.close();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(12);
-        while tokio::time::Instant::now() < deadline
-            && runtimes
+        let settled = tokio::time::timeout_at(deadline, self.background.wait())
+            .await
+            .is_ok();
+        if !settled
+            || runtimes
                 .iter()
                 .any(|runtime| !runtime.cancellations.lock().is_empty())
-        {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-        if runtimes
-            .iter()
-            .any(|runtime| !runtime.cancellations.lock().is_empty())
         {
             return Err(ServiceError::Invariant(
                 "workers did not finish bounded termination; shutdown remains unclean".into(),
@@ -15546,6 +15583,11 @@ impl TollgateService {
         }
         for runtime in &runtimes {
             runtime.store.checkpoint()?;
+        }
+        // Nothing acts for these runtimes any more, so the repositories may reopen at once even
+        // while a caller still holds a runtime or the service.
+        for runtime in &runtimes {
+            drop(runtime.ownership_lock.lock().take());
         }
         let marker = self.support_root.join("clean-shutdown");
         tokio::fs::write(&marker, OffsetDateTime::now_utc().to_string()).await?;
@@ -28743,6 +28785,21 @@ policy = "clone"
             })
         })
         .await;
+        wait_for_release_snapshot(
+            &recovered,
+            id,
+            "release to reach the second tip",
+            |snapshot| snapshot.state.release_oid == tip_b,
+        )
+        .await;
+        assert_eq!(
+            release_outcomes(&runtime.store.events_after(0, 10_000).unwrap()),
+            [
+                ("release.run-passed".to_owned(), serde_json::json!(run_a)),
+                ("release.run-passed".to_owned(), serde_json::json!(run_b)),
+            ],
+            "each run records exactly one outcome, the interrupted run first"
+        );
         assert_release_buildsets_never_overlap(&runtime);
     }
 
@@ -30748,11 +30805,11 @@ policy = "clone"
         .await;
         let tip = approve_and_promote(&service, id, "feature-a").await;
         wait_for_failed_release(&service, id).await;
-        // Paused, the retried run stays queued across the restart.
-        service.set_paused(id, true).await.unwrap();
         let command = CommandId::new();
         let retried = service.release_retry(id, command).await.unwrap();
         assert_eq!(retried.action, ReleaseRetryAction::Queued);
+        // Shutdown finds the retried run queued, dispatching, or running; whichever it is, the
+        // repository reopens at once and the run survives the restart.
         service.shutdown().await.unwrap();
         drop(service);
 
@@ -30771,9 +30828,6 @@ policy = "clone"
             vec![retried.item_id],
             "startup recovery neither drops nor duplicates the retried run"
         );
-        if snapshot.state.execution_state == RepositoryExecutionState::Paused {
-            reopened.set_paused(id, false).await.unwrap();
-        }
         std::fs::write(&gate, "").unwrap();
         let released = wait_for_release_snapshot(
             &reopened,
@@ -30788,7 +30842,207 @@ policy = "clone"
             .map(|view| view.item.id)
             .collect::<Vec<_>>();
         assert_eq!(passed, vec![retried.item_id]);
+        let runtime = reopened.runtime(id).await.unwrap();
+        let outcomes = release_outcomes(&runtime.store.events_after(0, 10_000).unwrap());
+        assert_eq!(
+            outcomes[1..],
+            [(
+                "release.run-passed".to_owned(),
+                serde_json::json!(retried.item_id)
+            )],
+            "the retried run records exactly one outcome"
+        );
+        drop(runtime);
         reopened.shutdown().await.unwrap();
+    }
+
+    /// Every release outcome event in order, as `(kind, item id)`.
+    fn release_outcomes(events: &[DomainEvent]) -> Vec<(String, serde_json::Value)> {
+        events
+            .iter()
+            .filter(|event| {
+                event.kind == "release.run-passed" || event.kind == "release.run-failed"
+            })
+            .map(|event| (event.kind.clone(), event.payload["item_id"].clone()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn shutdown_while_a_release_run_dispatches_releases_the_repository_for_an_immediate_reopen()
+     {
+        let temporary = tempfile::tempdir().unwrap();
+        let support = temporary.path().join("support");
+        let marker = temporary.path().join("first-run-failed");
+        let gate = temporary.path().join("release-may-finish");
+        let (service, id, _repository) = staged_release_repository(
+            temporary.path(),
+            &[],
+            &[("feature-a", "a.txt", "a\n")],
+            &flaky_release_step(&marker, &gate),
+        )
+        .await;
+        let tip = approve_and_promote(&service, id, "feature-a").await;
+        wait_for_failed_release(&service, id).await;
+        let runtime = service.runtime(id).await.unwrap();
+        let reached = Arc::new(Notify::new());
+        let resume = Arc::new(Notify::new());
+        *runtime.dispatch_gate.lock() = Some((Arc::clone(&reached), Arc::clone(&resume)));
+        drop(runtime);
+        let retried = service.release_retry(id, CommandId::new()).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(30), reached.notified())
+            .await
+            .expect("the retried run's item task is dispatched");
+
+        // Shutdown begins while the dispatched task has not yet registered its cancellation.
+        let shutdown = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move { service.shutdown().await }
+        });
+        while !service.shutting_down.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        resume.notify_one();
+        shutdown.await.unwrap().unwrap();
+        drop(service);
+
+        let reopened = TollgateService::open(support).await.unwrap();
+        let snapshot = reopened
+            .repository_snapshot(id)
+            .await
+            .expect("the repository reopens immediately after shutdown");
+        let run = release_runs_for(&snapshot, &tip)
+            .into_iter()
+            .find(|view| view.item.id == retried.item_id)
+            .unwrap();
+        assert_eq!(
+            run.item.buildset_id, None,
+            "a run dispatched during shutdown never starts"
+        );
+        std::fs::write(&gate, "").unwrap();
+        wait_for_release_snapshot(
+            &reopened,
+            id,
+            "the retried run to release the tip",
+            |snapshot| snapshot.state.release_oid == tip,
+        )
+        .await;
+        let runtime = reopened.runtime(id).await.unwrap();
+        assert_eq!(item_buildset_count(&runtime, retried.item_id), 1);
+        let outcomes = release_outcomes(&runtime.store.events_after(0, 10_000).unwrap());
+        assert_eq!(
+            outcomes[1..],
+            [(
+                "release.run-passed".to_owned(),
+                serde_json::json!(retried.item_id)
+            )]
+        );
+        drop(runtime);
+        reopened.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_crash_during_a_running_release_run_reruns_it_once_before_its_successor() {
+        let temporary = tempfile::tempdir().unwrap();
+        let support = temporary.path().join("support");
+        let gate = temporary.path().join("release-may-finish");
+        let (service, id, _repository) = staged_release_repository(
+            temporary.path(),
+            &[],
+            &[("feature-a", "a.txt", "a\n"), ("feature-b", "b.txt", "b\n")],
+            &format!(
+                "\n[[step]]\nname = \"full\"\nstage = \"release\"\nrun = \"while [ ! -f '{}' ]; do sleep 0.05; done\"\nneeds = [\"fast\"]\n",
+                gate.display()
+            ),
+        )
+        .await;
+        let tip_a = approve_and_promote(&service, id, "feature-a").await;
+        let running =
+            wait_for_release_snapshot(&service, id, "the first release run to start", |snapshot| {
+                release_runs_for(snapshot, &tip_a)
+                    .iter()
+                    .any(|view| view.item.state == QueueItemState::Running)
+            })
+            .await;
+        let run_a = release_runs_for(&running, &tip_a)[0].item.id;
+        let tip_b = approve_and_promote(&service, id, "feature-b").await;
+        let queued = wait_for_release_snapshot(
+            &service,
+            id,
+            "a queued run for the second tip",
+            |snapshot| !release_runs_for(snapshot, &tip_b).is_empty(),
+        )
+        .await;
+        let run_b = release_runs_for(&queued, &tip_b)[0].item.id;
+        let runtime = service.runtime(id).await.unwrap();
+        let (state, crashed_item, crashed_buildset) = {
+            let data = runtime.data.lock();
+            let item = data
+                .items
+                .iter()
+                .find(|item| item.id == run_a)
+                .cloned()
+                .unwrap();
+            let buildset = data
+                .buildsets
+                .iter()
+                .find(|buildset| Some(buildset.id) == item.buildset_id)
+                .cloned()
+                .unwrap();
+            (data.state.clone(), item, buildset)
+        };
+        assert_eq!(crashed_item.state, QueueItemState::Running);
+        assert_eq!(crashed_buildset.state, BuildsetState::Running);
+        service.shutdown().await.unwrap();
+        // Leave the durable state a crash leaves: the run and its buildset still running.
+        runtime
+            .store
+            .save_item_projection(&state, &crashed_item)
+            .unwrap();
+        runtime.store.update_buildset(&crashed_buildset).unwrap();
+        drop(runtime);
+        drop(service);
+
+        let recovered = TollgateService::open(support).await.unwrap();
+        let runtime = recovered.runtime(id).await.unwrap();
+        let snapshot = recovered.repository_snapshot(id).await.unwrap();
+        assert!(
+            release_runs_for(&snapshot, &tip_a)
+                .iter()
+                .any(|view| view.item.id == run_a && !view.item.state.is_terminal()),
+            "the crashed run is started, so it is never retargeted"
+        );
+        wait_for_release_snapshot(
+            &recovered,
+            id,
+            "the crashed release run to rerun",
+            |snapshot| {
+                release_runs_for(snapshot, &tip_a)
+                    .iter()
+                    .any(|view| view.item.state == QueueItemState::Running)
+            },
+        )
+        .await;
+        assert_eq!(item_buildset_count(&runtime, run_a), 2);
+        assert_eq!(item_buildset_count(&runtime, run_b), 0);
+        std::fs::write(&gate, "").unwrap();
+        wait_for_release_snapshot(
+            &recovered,
+            id,
+            "release to reach the second tip",
+            |snapshot| snapshot.state.release_oid == tip_b,
+        )
+        .await;
+        assert_eq!(
+            release_outcomes(&runtime.store.events_after(0, 10_000).unwrap()),
+            [
+                ("release.run-passed".to_owned(), serde_json::json!(run_a)),
+                ("release.run-passed".to_owned(), serde_json::json!(run_b)),
+            ],
+            "each run records exactly one outcome, the crashed run first"
+        );
+        assert_release_buildsets_never_overlap(&runtime);
+        drop(runtime);
+        recovered.shutdown().await.unwrap();
     }
 
     #[tokio::test]
