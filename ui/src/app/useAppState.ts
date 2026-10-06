@@ -4,10 +4,10 @@ import { listen } from "@tauri-apps/api/event";
 import { getHistoryItems, getItemDetails, getSnapshot } from "../lib/api";
 import { isTauri } from "../lib/utils";
 
-export type Route = "runs" | "checks";
+export type Route = "runs" | "checks" | "release";
 
 function routeFromStorage(value: unknown): Route {
-  return value === "checks" ? "checks" : "runs";
+  return value === "checks" || value === "release" ? value : "runs";
 }
 
 export function useAppState() {
@@ -56,7 +56,7 @@ export function useAppState() {
   });
   const historyItems = historyQuery.data?.pages.flatMap((page) => page.items) ?? repository?.history_items ?? [];
   const snapshotItem = repository
-    ? [...repository.queue, ...repository.checks, ...historyItems].find((candidate) => candidate.item.id === selectedItemId) ?? null
+    ? [...repository.queue, ...repository.checks, ...(repository.release_runs ?? []), ...historyItems].find((candidate) => candidate.item.id === selectedItemId) ?? null
     : null;
   const detailQuery = useQuery({ queryKey: ["item-details", repository?.state.id, selectedItemId], queryFn: () => getItemDetails(repository!.state.id, selectedItemId!), enabled: isTauri() && !!repository && !!selectedItemId && !snapshotItem, retry: false });
   const selectedItem = snapshotItem ?? detailQuery.data ?? null;

@@ -15,7 +15,8 @@ use tollgate_ipc::{
 };
 use tollgate_service::{
     ActivatingRepository, AppSnapshot, ArtifactPage, DiagnoseResult, ItemWaitStatus, QueueItemView,
-    RepositoryDeliveryContext, RepositorySnapshot, UnavailableRepository,
+    ReleaseRetryResult, ReleaseRunSummary, ReleaseStatus, ReleaseWaitOutcome, ReleaseWaitStatus,
+    RepositoryDeliveryContext, RepositorySnapshot, UnavailableRepository, release_status,
 };
 use uuid::Uuid;
 
@@ -58,9 +59,21 @@ enum TopCommand {
     Status {
         id: Option<QueueItemId>,
     },
+    /// Wait for a queue item to finish, or with --released for an OID to reach `release`
     Wait {
-        id: QueueItemId,
+        #[arg(
+            help = "Queue item ID; with --released, a candidate ID or a staging revision (default: the newest promotion from this worktree, else the staging tip)"
+        )]
+        id: Option<String>,
+        #[arg(
+            long,
+            help = "Wait until `release` contains the target, or the newest release run covering it fails"
+        )]
+        released: bool,
     },
+    /// Report and retry release-stage runs
+    #[command(subcommand)]
+    Release(ReleaseCommand),
     Logs {
         id: QueueItemId,
         #[arg(long, help = "Read an exact retained buildset attempt")]
@@ -205,6 +218,16 @@ enum RepoCommand {
             help = "Fail when activation is still running after this many seconds"
         )]
         timeout: Option<u64>,
+    },
+}
+#[derive(Subcommand)]
+enum ReleaseCommand {
+    /// Both Tollgate refs, the release lag, and the latest release runs
+    Status,
+    /// Rerun the newest staging tip as a release run (for flaky release steps)
+    Retry {
+        #[arg(long, help = "Wait for the release run to finish")]
+        wait: bool,
     },
 }
 #[derive(Subcommand)]
@@ -764,7 +787,30 @@ async fn run(cli: Cli) -> anyhow::Result<u8> {
                 }
             }
         }
-        TopCommand::Wait { id } => {
+        TopCommand::Wait { id, released: true } => {
+            let repository = select_repository(&mut client, cli.repository).await?;
+            let mut selector = match id.as_deref().map(str::parse::<QueueItemId>) {
+                Some(Ok(item_id)) => ReleaseWaitSelector::Candidate(item_id),
+                Some(Err(_)) => ReleaseWaitSelector::Revision(id.unwrap_or_default()),
+                None => ReleaseWaitSelector::Latest(
+                    std::env::current_dir()
+                        .ok()
+                        .map(|path| path.to_string_lossy().into_owned()),
+                ),
+            };
+            return wait_for_release(&mut client, repository.state.id, &mut selector, cli.json)
+                .await;
+        }
+        TopCommand::Wait {
+            id,
+            released: false,
+        } => {
+            let id: QueueItemId = id
+                .ok_or_else(|| {
+                    anyhow!("`tg wait` needs a queue item ID unless --released is given")
+                })?
+                .parse()
+                .context("invalid queue item ID argument")?;
             let repository = select_repository(&mut client, cli.repository).await?;
             let validation_only = repository
                 .queue
@@ -907,6 +953,33 @@ async fn run(cli: Cli) -> anyhow::Result<u8> {
                 );
                 Ok(())
             })?;
+        }
+        TopCommand::Release(ReleaseCommand::Status) => {
+            let repository = select_repository(&mut client, cli.repository).await?;
+            let status = release_status(&repository);
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&status)?);
+            } else {
+                print_release_status(&repository.state.name, &status);
+            }
+        }
+        TopCommand::Release(ReleaseCommand::Retry { wait }) => {
+            let repository = select_repository(&mut client, cli.repository).await?;
+            let value = client
+                .request(IpcCommand::ReleaseRetry {
+                    repository_id: repository.state.id,
+                    command_id: CommandId::new(),
+                })
+                .await?;
+            let result: ReleaseRetryResult = serde_json::from_value(value.clone())?;
+            print_wait_value(value, cli.json, wait, |_| {
+                println!("{}", release_retry_message(&result));
+                Ok(())
+            })?;
+            if wait {
+                return wait_for_item(&mut client, repository.state.id, result.item_id, cli.json)
+                    .await;
+            }
         }
         TopCommand::Reorder { ids } => {
             let repository = select_repository(&mut client, cli.repository).await?;
@@ -2299,18 +2372,286 @@ fn print_status(repository: &RepositorySnapshot, id: Option<QueueItemId>) {
         }
         return;
     }
+    let release = release_status(repository);
     println!(
-        "{}\n  execution  {:?}\n  staging    {}\n  release    {}\n  queue      {} items · revision {}\n  runs       {} active · {} waiting\n  config     {}",
+        "{}\n  execution  {:?}\n  staging    {}\n  release    {}\n  lag        {}\n  queue      {} items · revision {}\n  runs       {} active · {} waiting\n  config     {}",
         repository.state.name,
         repository.state.execution_state,
         repository.state.staging_oid.short(),
         repository.state.release_oid.short(),
+        release_lag_text(&release, time::OffsetDateTime::now_utc()),
         repository.queue.len(),
         repository.state.queue_revision,
         repository.resources.active_runs,
         repository.resources.queued_runs,
         &repository.configuration.digest[..12]
     );
+    if release.release_stage {
+        println!(
+            "  release    {}{}",
+            release_state_label(release.release_state),
+            release
+                .active_run
+                .as_ref()
+                .map(|run| format!(" · run {} {}", run.item_id.short(), run.state.as_str()))
+                .unwrap_or_default()
+        );
+    }
+    for reason in release
+        .release_block_reasons
+        .iter()
+        .chain(release.promotion_pause.iter())
+    {
+        println!("  held       {}", reason.message);
+    }
+}
+
+/// `release`'s lag behind `staging`: commits and age.
+fn release_lag_text(status: &ReleaseStatus, now: time::OffsetDateTime) -> String {
+    if status.lag.commits == 0 {
+        return "release equals staging".into();
+    }
+    let age = status
+        .lag
+        .since
+        .map(|since| format!(" for {}", format_age(now - since)))
+        .unwrap_or_default();
+    format!(
+        "release trails staging by {} commit{}{age}",
+        status.lag.commits,
+        if status.lag.commits == 1 { "" } else { "s" }
+    )
+}
+
+fn format_age(age: time::Duration) -> String {
+    let minutes = age.whole_minutes().max(0);
+    if minutes < 1 {
+        "under a minute".into()
+    } else if minutes < 60 {
+        format!("{minutes}m")
+    } else if minutes < 48 * 60 {
+        format!("{}h {}m", minutes / 60, minutes % 60)
+    } else {
+        format!("{}d", minutes / (24 * 60))
+    }
+}
+
+fn release_state_label(state: tollgate_domain::ReleaseState) -> &'static str {
+    match state {
+        tollgate_domain::ReleaseState::Green => "green",
+        tollgate_domain::ReleaseState::Pending => "pending",
+        tollgate_domain::ReleaseState::Failing => "failing",
+    }
+}
+
+fn release_run_line(run: &ReleaseRunSummary) -> String {
+    let range = run
+        .range
+        .as_ref()
+        .map(|range| format!("{}..{}", range.from.short(), range.to.short()))
+        .unwrap_or_else(|| run.target_oid.short());
+    let mut line = format!(
+        "{}  {:<17}  {}  range {}",
+        run.item_id,
+        run.state.as_str(),
+        run.target_oid.short(),
+        range
+    );
+    if !run.failing_steps.is_empty() {
+        line.push_str(&format!("  failing {}", run.failing_steps.join(", ")));
+    }
+    if let Some(retry_of) = run.retry_of_item_id {
+        line.push_str(&format!("  retry of {}", retry_of.short()));
+    }
+    line
+}
+
+fn print_release_status(name: &str, status: &ReleaseStatus) {
+    println!(
+        "{name}\n  staging    {}  {}\n  release    {}  {}\n  lag        {}\n  state      {}",
+        status.staging.oid.short(),
+        status.staging.ref_name,
+        status.release.oid.short(),
+        status.release.ref_name,
+        release_lag_text(status, time::OffsetDateTime::now_utc()),
+        if status.release_stage {
+            release_state_label(status.release_state)
+        } else {
+            "no release stage (release follows staging)"
+        }
+    );
+    for reason in status
+        .release_block_reasons
+        .iter()
+        .chain(status.promotion_pause.iter())
+    {
+        println!(
+            "  held       {}\n             {}",
+            reason.message, reason.recovery_action
+        );
+    }
+    if status.runs.is_empty() {
+        println!("No release runs.");
+        return;
+    }
+    println!("Release runs (newest first):");
+    for run in &status.runs {
+        println!("  {}", release_run_line(run));
+    }
+}
+
+fn release_retry_message(result: &ReleaseRetryResult) -> String {
+    match result.action {
+        tollgate_service::ReleaseRetryAction::Queued => format!(
+            "Release run {} queued for staging tip {}{}",
+            result.item_id,
+            result.target_oid.short(),
+            result
+                .retry_of_item_id
+                .map(|id| format!(" (retry of {id})"))
+                .unwrap_or_default()
+        ),
+        tollgate_service::ReleaseRetryAction::AlreadyActive => format!(
+            "Release run {} for staging tip {} is already queued or running",
+            result.item_id,
+            result.target_oid.short()
+        ),
+    }
+}
+
+/// What `tg wait --released` asks the app to resolve on each poll.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ReleaseWaitSelector {
+    Candidate(QueueItemId),
+    Revision(String),
+    Latest(Option<String>),
+}
+
+impl ReleaseWaitSelector {
+    fn command(&self, repository_id: RepositoryId) -> IpcCommand {
+        let (item_id, revision, worktree_path) = match self {
+            Self::Candidate(item_id) => (Some(*item_id), None, None),
+            Self::Revision(revision) => (None, Some(revision.clone()), None),
+            Self::Latest(path) => (None, None, path.clone()),
+        };
+        IpcCommand::ReleaseWaitStatus {
+            repository_id,
+            item_id,
+            revision,
+            worktree_path,
+        }
+    }
+
+    /// After the first observation a default target is frozen to the OID it resolved to, so a
+    /// later promotion never moves what the wait is for.
+    fn freeze(&mut self, status: &ReleaseWaitStatus) {
+        if let (Self::Latest(_), Some(oid)) = (&*self, &status.target_oid) {
+            *self = Self::Revision(oid.to_hex());
+        }
+    }
+}
+
+/// The exit code a terminal `tg wait --released` observation maps to.
+fn exit_for_release_wait(status: &ReleaseWaitStatus) -> u8 {
+    use tollgate_domain::QueueItemState as State;
+    match status.status {
+        ReleaseWaitOutcome::Released => 0,
+        ReleaseWaitOutcome::ReleaseFailed => {
+            if status
+                .covering_run
+                .as_ref()
+                .is_some_and(|run| run.state == State::InfrastructureExhausted)
+            {
+                5
+            } else {
+                1
+            }
+        }
+        ReleaseWaitOutcome::NotPromoted => match status.candidate_state {
+            Some(State::Canceled | State::Superseded | State::DependencyFailed) => 3,
+            Some(State::InfrastructureExhausted) => 5,
+            _ => 1,
+        },
+        ReleaseWaitOutcome::NotOnStaging => 2,
+        ReleaseWaitOutcome::Blocked => 4,
+        ReleaseWaitOutcome::AwaitingPromotion | ReleaseWaitOutcome::Pending => 0,
+    }
+}
+
+fn release_wait_line(status: &ReleaseWaitStatus) -> String {
+    let target = status
+        .target_oid
+        .as_ref()
+        .map(|oid| oid.short())
+        .unwrap_or_else(|| "unpromoted candidate".into());
+    let run = status
+        .covering_run
+        .as_ref()
+        .map(|run| format!(" · run {} {}", run.item_id.short(), run.state.as_str()))
+        .unwrap_or_default();
+    format!(
+        "{target}  {:?}  release {}{run}",
+        status.status,
+        status.release_oid.short()
+    )
+}
+
+async fn wait_for_release(
+    client: &mut IpcClient,
+    repository_id: RepositoryId,
+    selector: &mut ReleaseWaitSelector,
+    json: bool,
+) -> anyhow::Result<u8> {
+    let mut previous: Option<ReleaseWaitStatus> = None;
+    loop {
+        let value = match client.request(selector.command(repository_id)).await {
+            Ok(value) => value,
+            Err(first_error) => {
+                if !json {
+                    eprintln!("\nConnection interrupted ({first_error}); waiting for Tollgate…");
+                }
+                reconnect_wait_client(client).await?;
+                client
+                    .request(selector.command(repository_id))
+                    .await
+                    .with_context(|| {
+                        format!("release wait status failed after reconnect: {first_error}")
+                    })?
+            }
+        };
+        let status: ReleaseWaitStatus = serde_json::from_value(value)?;
+        selector.freeze(&status);
+        if previous.as_ref() != Some(&status) {
+            if json {
+                println!("{}", serde_json::to_string(&status)?);
+            } else {
+                eprint!("\r{:<72}", release_wait_line(&status));
+            }
+            previous = Some(status.clone());
+        }
+        if status.status.is_terminal() {
+            if !json {
+                println!();
+                if let Some(run) = status
+                    .covering_run
+                    .as_ref()
+                    .filter(|_| status.status == ReleaseWaitOutcome::ReleaseFailed)
+                {
+                    println!("Release run failed: {}", release_run_line(run));
+                }
+                for reason in status
+                    .block_reasons
+                    .iter()
+                    .chain(&status.release_block_reasons)
+                    .filter(|_| status.status == ReleaseWaitOutcome::Blocked)
+                {
+                    println!("  held  {}", reason.message);
+                }
+            }
+            return Ok(exit_for_release_wait(&status));
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 }
 
 fn candidate_status_json(
@@ -2813,6 +3154,17 @@ fn candidate_submission_message(value: &serde_json::Value) -> String {
 }
 
 fn classify_exit(error: &anyhow::Error) -> u8 {
+    if let Some(error) = error.downcast_ref::<IpcRequestError>()
+        && error.0.code == "release-retry-unavailable"
+    {
+        // Nothing was queued: 2 without a release stage, else 3 (the tip is already certified).
+        let no_release_stage = error
+            .0
+            .details
+            .as_ref()
+            .is_some_and(|details| details["reason"] == "no-release-stage");
+        return if no_release_stage { 2 } else { 3 };
+    }
     if let Some(error) = error.downcast_ref::<IpcRequestError>()
         && matches!(
             error.0.code.as_str(),
@@ -3525,5 +3877,365 @@ mod tests {
         }));
         assert!(defaulted.contains("disabled"), "{defaulted}");
         assert!(defaulted.contains("max_lag=unlimited"), "{defaulted}");
+    }
+
+    fn oid_json(digit: char) -> serde_json::Value {
+        serde_json::json!({"format": "sha1", "bytes": digit.to_string().repeat(40)})
+    }
+
+    /// A release run view on `tested` whose `full` step ended with `full_result`.
+    fn release_run_view(
+        repository: &RepositorySnapshot,
+        id: &str,
+        state: &str,
+        tested: char,
+        base: char,
+        full_result: &str,
+    ) -> QueueItemView {
+        let generation_id = "019ffe40-a60d-7722-a369-2635222d1301";
+        let buildset_id = "019ffe40-a60d-7722-a369-2635222d1302";
+        serde_json::from_value(serde_json::json!({
+            "item": {
+                "id": id,
+                "repository_id": repository.state.id,
+                "kind": "release",
+                "enqueue_sequence": 9,
+                "source_oid": oid_json(tested),
+                "source_ref": format!("refs/tollgate/sources/{id}"),
+                "metadata": {
+                    "subject": "tip", "message_hash": "hash", "author_name": "Test",
+                    "author_email": "test@example.com", "branch": null, "worktree_path": null,
+                    "signature_state": "unknown", "approved_at": [2026, 227, 0, 0, 0, 0, 0, 0, 0],
+                    "purpose": "release"
+                },
+                "state": state,
+                "terminal_reason": if state == "check-failed" { serde_json::json!("release-run-failed") } else { serde_json::Value::Null },
+                "remote_state": "disabled",
+                "cleanup_state": "not-eligible",
+                "dependencies": [],
+                "retry_of_item_id": null,
+                "promotion_authorized": false,
+                "promotion_authorized_at": null,
+                "promotion_authorized_by": null,
+                "current_generation_id": generation_id,
+                "buildset_id": buildset_id,
+                "certificate_id": null
+            },
+            "generation": {
+                "id": generation_id, "item_id": id, "anchored_base_oid": oid_json(base),
+                "ordered_item_ids": [id], "ordered_source_oids": [oid_json(tested)],
+                "prefix_oids": [oid_json(tested)], "expected_parent_oid": oid_json(base),
+                "tested_oid": oid_json(tested), "configuration_digest": "configuration",
+                "step_graph_digest": "release-steps", "engine_epoch": 1,
+                "identity_digest": "identity", "invalidated_by": null
+            },
+            "buildset": {
+                "id": buildset_id, "item_id": id, "validation_generation_id": generation_id,
+                "tested_oid": oid_json(tested), "expected_parent_oid": oid_json(base),
+                "environment_fingerprint": "environment", "slot_id": null, "state": "failed",
+                "retry_of": null, "attempt": 1, "created_at": [2026, 227, 0, 0, 0, 0, 0, 0, 0],
+                "started_at": null, "finished_at": null,
+                "frozen_steps": [
+                    {
+                        "id": "019ffe40-a60d-7722-a369-2635222d1303", "name": "full",
+                        "command": {"kind": "shell", "runner": ["/bin/sh", "-c"], "script": "false"},
+                        "stage": "release", "working_directory": ".", "needs": [], "soft_needs": [],
+                        "voting": true, "final_step": false, "timeout_ns": 1, "cpu_tokens": 1,
+                        "memory_bytes": 1, "rss_limit_bytes": null, "semaphores": []
+                    }
+                ],
+                "step_results": [
+                    {
+                        "name": "full", "result_class": full_result, "exit_code": 1, "signal": null,
+                        "elapsed_ms": 1200, "log_hash": "log", "stdout_end": 0, "stderr_end": 0
+                    }
+                ]
+            },
+            "attempts": [], "attempt_generations": [], "certificate": null, "certificates": [],
+            "included_items": [], "elapsed_ms": 1200, "failure_attribution": null
+        }))
+        .unwrap()
+    }
+
+    fn lagging_repository() -> RepositorySnapshot {
+        let mut repository = repository_with_candidate("019ffe40-a60d-7722-a369-2635222d1203");
+        repository.state.staging_oid = serde_json::from_value(oid_json('3')).unwrap();
+        repository.state.release_lag = tollgate_domain::ReleaseLag {
+            commits: 2,
+            since: Some(time::OffsetDateTime::now_utc() - time::Duration::minutes(47)),
+        };
+        repository.state.release_state = tollgate_domain::ReleaseState::Failing;
+        repository.state.release_block_reasons = vec![tollgate_domain::BlockReason {
+            code: "push-blocked".into(),
+            message: "The release push did not land".into(),
+            recovery_action: "Run `tg push`".into(),
+        }];
+        repository.configuration.steps = serde_json::from_value(serde_json::json!([{
+            "name": "full", "command": {"kind": "shell", "script": "false"}, "stage": "release",
+            "working_directory": ".", "needs": [], "soft_needs": [], "voting": true,
+            "final_step": false, "timeout_ns": 1, "cpu_tokens": 1, "memory_bytes": 1,
+            "semaphores": [], "include": [], "exclude": [], "environment": {},
+            "remove_environment": [], "artifacts": []
+        }]))
+        .unwrap();
+        let failed = release_run_view(
+            &repository,
+            "019ffe40-a60d-7722-a369-2635222d1210",
+            "check-failed",
+            '3',
+            '1',
+            "exit-failure",
+        );
+        let running = release_run_view(
+            &repository,
+            "019ffe40-a60d-7722-a369-2635222d1211",
+            "running",
+            '3',
+            '1',
+            "running",
+        );
+        repository.release_runs = vec![running, failed];
+        repository
+    }
+
+    #[test]
+    fn json_status_carries_both_refs_the_release_lag_and_release_runs() {
+        let repository = lagging_repository();
+        let value: serde_json::Value =
+            serde_json::from_str(&status_json(&repository, None).unwrap()).unwrap();
+        let state = &value["state"];
+        assert_eq!(state["staging_ref"], "refs/heads/staging");
+        assert_eq!(state["staging_oid"], oid_json('3'));
+        assert_eq!(state["release_ref"], "refs/heads/release");
+        assert_eq!(state["release_oid"], oid_json('1'));
+        assert_eq!(state["release_lag"]["commits"], 2);
+        assert!(state["release_lag"]["since"].is_array());
+        assert_eq!(state["release_state"], "failing");
+        assert_eq!(state["release_block_reasons"][0]["code"], "push-blocked");
+        assert_eq!(value["release_runs"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn release_status_json_reports_refs_lag_runs_and_holds() {
+        let repository = lagging_repository();
+        let value = serde_json::to_value(release_status(&repository)).unwrap();
+        assert_eq!(value["repository_id"], repository.state.id.to_string());
+        assert_eq!(value["staging"]["ref"], "refs/heads/staging");
+        assert_eq!(value["staging"]["oid"], oid_json('3'));
+        assert_eq!(value["release"]["ref"], "refs/heads/release");
+        assert_eq!(value["release"]["oid"], oid_json('1'));
+        assert_eq!(value["lag"]["commits"], 2);
+        assert_eq!(value["release_state"], "failing");
+        assert_eq!(value["release_stage"], true);
+        assert_eq!(value["release_block_reasons"][0]["code"], "push-blocked");
+        assert!(value["promotion_pause"].is_null());
+        assert_eq!(
+            value["active_run"]["item_id"],
+            "019ffe40-a60d-7722-a369-2635222d1211"
+        );
+        assert_eq!(value["active_run"]["failing_steps"], serde_json::json!([]));
+        let last = &value["last_run"];
+        assert_eq!(last["item_id"], "019ffe40-a60d-7722-a369-2635222d1210");
+        assert_eq!(last["state"], "check-failed");
+        assert_eq!(last["terminal_reason"], "release-run-failed");
+        assert_eq!(last["target_oid"], oid_json('3'));
+        assert_eq!(last["range"]["from"], oid_json('1'));
+        assert_eq!(last["range"]["to"], oid_json('3'));
+        assert_eq!(last["failing_steps"], serde_json::json!(["full"]));
+        assert_eq!(last["steps"][0]["name"], "full");
+        assert_eq!(last["steps"][0]["result_class"], "exit-failure");
+        assert_eq!(last["steps"][0]["elapsed_ms"], 1200);
+        assert!(last["retry_of_item_id"].is_null());
+        assert_eq!(value["runs"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn human_status_names_the_release_lag_in_commits_and_age() {
+        let status = release_status(&lagging_repository());
+        let text = release_lag_text(&status, time::OffsetDateTime::now_utc());
+        assert!(text.contains("2 commits"), "{text}");
+        assert!(text.contains("47m"), "{text}");
+        let caught_up = release_status(&repository_with_candidate(
+            "019ffe40-a60d-7722-a369-2635222d1203",
+        ));
+        assert!(!caught_up.release_stage);
+        assert!(caught_up.active_run.is_none());
+        assert!(!release_lag_text(&caught_up, time::OffsetDateTime::now_utc()).contains("commit"));
+        assert!(release_run_line(status.last_run.as_ref().unwrap()).contains("full"));
+    }
+
+    #[test]
+    fn release_retry_json_names_the_run_and_what_it_reruns() {
+        let item_id: QueueItemId = "019ffe40-a60d-7722-a369-2635222d1220".parse().unwrap();
+        let retry_of: QueueItemId = "019ffe40-a60d-7722-a369-2635222d1210".parse().unwrap();
+        let result = ReleaseRetryResult {
+            repository_id: "019ffe40-a60d-7722-a369-2635222d1204".parse().unwrap(),
+            action: tollgate_service::ReleaseRetryAction::Queued,
+            item_id,
+            target_oid: serde_json::from_value(oid_json('3')).unwrap(),
+            staging_oid: serde_json::from_value(oid_json('3')).unwrap(),
+            release_oid: serde_json::from_value(oid_json('1')).unwrap(),
+            retry_of_item_id: Some(retry_of),
+            superseded_item_ids: Vec::new(),
+        };
+        let value = serde_json::to_value(&result).unwrap();
+        assert_eq!(value["action"], "queued");
+        assert_eq!(value["item_id"], item_id.to_string());
+        assert_eq!(value["target_oid"], oid_json('3'));
+        assert_eq!(value["staging_oid"], oid_json('3'));
+        assert_eq!(value["release_oid"], oid_json('1'));
+        assert_eq!(value["retry_of_item_id"], retry_of.to_string());
+        assert_eq!(value["superseded_item_ids"], serde_json::json!([]));
+        let mut active = result.clone();
+        active.action = tollgate_service::ReleaseRetryAction::AlreadyActive;
+        assert_eq!(
+            serde_json::to_value(&active).unwrap()["action"],
+            "already-active"
+        );
+        assert!(release_retry_message(&result).contains(&item_id.to_string()));
+
+        let refused = |reason: &str| {
+            anyhow!(IpcRequestError(StructuredError {
+                code: "release-retry-unavailable".into(),
+                message: "nothing to retry".into(),
+                retryable: false,
+                details: Some(serde_json::json!({"reason": reason})),
+            }))
+        };
+        assert_eq!(classify_exit(&refused("no-release-stage")), 2);
+        assert_eq!(classify_exit(&refused("already-certified")), 3);
+    }
+
+    #[test]
+    fn release_commands_and_wait_released_parse() {
+        let parsed = Cli::try_parse_from(["tg", "release", "status"]).unwrap();
+        assert!(matches!(
+            parsed.command,
+            TopCommand::Release(ReleaseCommand::Status)
+        ));
+        let parsed = Cli::try_parse_from(["tg", "release", "retry", "--wait"]).unwrap();
+        assert!(matches!(
+            parsed.command,
+            TopCommand::Release(ReleaseCommand::Retry { wait: true })
+        ));
+        let parsed = Cli::try_parse_from(["tg", "wait", "--released"]).unwrap();
+        assert!(matches!(
+            parsed.command,
+            TopCommand::Wait {
+                id: None,
+                released: true
+            }
+        ));
+        let parsed = Cli::try_parse_from(["tg", "wait", "--released", "HEAD~1"]).unwrap();
+        let TopCommand::Wait { id, released } = parsed.command else {
+            panic!("wait did not parse");
+        };
+        assert_eq!(id.as_deref(), Some("HEAD~1"));
+        assert!(released);
+        let parsed =
+            Cli::try_parse_from(["tg", "wait", "019ffe40-a60d-7722-a369-2635222d1203"]).unwrap();
+        assert!(matches!(
+            parsed.command,
+            TopCommand::Wait {
+                id: Some(_),
+                released: false
+            }
+        ));
+    }
+
+    fn release_wait_status(
+        status: ReleaseWaitOutcome,
+        source: tollgate_service::ReleaseWaitSource,
+    ) -> ReleaseWaitStatus {
+        let repository = lagging_repository();
+        ReleaseWaitStatus {
+            repository_id: repository.state.id,
+            source,
+            item_id: None,
+            target_oid: Some(repository.state.staging_oid.clone()),
+            status,
+            staging_oid: repository.state.staging_oid.clone(),
+            release_oid: repository.state.release_oid.clone(),
+            release_state: repository.state.release_state,
+            release_lag: repository.state.release_lag.clone(),
+            covering_run: repository
+                .release_runs
+                .get(1)
+                .map(ReleaseRunSummary::from_view),
+            candidate_state: None,
+            repository_execution_state: repository.state.execution_state,
+            block_reasons: Vec::new(),
+            release_block_reasons: repository.state.release_block_reasons.clone(),
+        }
+    }
+
+    #[test]
+    fn wait_released_json_and_exit_codes_follow_the_outcome() {
+        use tollgate_service::ReleaseWaitSource;
+        let failed = release_wait_status(
+            ReleaseWaitOutcome::ReleaseFailed,
+            ReleaseWaitSource::StagingTip,
+        );
+        let value = serde_json::to_value(&failed).unwrap();
+        assert_eq!(value["status"], "release-failed");
+        assert_eq!(value["source"], "staging-tip");
+        assert_eq!(value["target_oid"], oid_json('3'));
+        assert_eq!(value["release_oid"], oid_json('1'));
+        assert_eq!(
+            value["covering_run"]["failing_steps"],
+            serde_json::json!(["full"])
+        );
+        assert_eq!(value["release_block_reasons"][0]["code"], "push-blocked");
+        assert_eq!(exit_for_release_wait(&failed), 1);
+        for (outcome, code) in [
+            (ReleaseWaitOutcome::Released, 0),
+            (ReleaseWaitOutcome::NotOnStaging, 2),
+            (ReleaseWaitOutcome::Blocked, 4),
+        ] {
+            let status = release_wait_status(outcome, ReleaseWaitSource::Revision);
+            assert!(status.status.is_terminal());
+            assert_eq!(exit_for_release_wait(&status), code, "{outcome:?}");
+        }
+        for outcome in [
+            ReleaseWaitOutcome::Pending,
+            ReleaseWaitOutcome::AwaitingPromotion,
+        ] {
+            assert!(!outcome.is_terminal());
+        }
+        let mut canceled = release_wait_status(
+            ReleaseWaitOutcome::NotPromoted,
+            ReleaseWaitSource::Candidate,
+        );
+        canceled.candidate_state = Some(tollgate_domain::QueueItemState::Canceled);
+        assert_eq!(exit_for_release_wait(&canceled), 3);
+    }
+
+    #[test]
+    fn a_default_release_wait_freezes_the_oid_it_first_resolved() {
+        use tollgate_service::ReleaseWaitSource;
+        let repository_id: RepositoryId = "019ffe40-a60d-7722-a369-2635222d1204".parse().unwrap();
+        let mut selector = ReleaseWaitSelector::Latest(Some("/tmp/worktree".into()));
+        let IpcCommand::ReleaseWaitStatus {
+            worktree_path,
+            item_id: None,
+            revision: None,
+            ..
+        } = selector.command(repository_id)
+        else {
+            panic!("a default wait sends the caller's worktree");
+        };
+        assert_eq!(worktree_path.as_deref(), Some("/tmp/worktree"));
+        let status =
+            release_wait_status(ReleaseWaitOutcome::Pending, ReleaseWaitSource::StagingTip);
+        selector.freeze(&status);
+        assert_eq!(
+            selector,
+            ReleaseWaitSelector::Revision("3".repeat(40)),
+            "a later promotion never moves the target"
+        );
+        let candidate: QueueItemId = "019ffe40-a60d-7722-a369-2635222d1203".parse().unwrap();
+        let mut selector = ReleaseWaitSelector::Candidate(candidate);
+        selector.freeze(&status);
+        assert_eq!(selector, ReleaseWaitSelector::Candidate(candidate));
     }
 }

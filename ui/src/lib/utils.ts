@@ -26,6 +26,20 @@ export function formatBytes(value: number) {
   return `${(value / 1024 ** exponent).toFixed(exponent > 1 ? 1 : 0)} ${units[exponent]}`;
 }
 
+/** Milliseconds since the epoch for a serialized Rust `OffsetDateTime`, or null when unreadable. */
+export function timestampMs(value: unknown): number | null {
+  if (typeof value === "string") {
+    const parsed = Date.parse(value);
+    return Number.isNaN(parsed) ? null : parsed;
+  }
+  if (Array.isArray(value) && value.length >= 6 && value.every((part) => typeof part === "number")) {
+    const [year = 0, ordinal = 1, hour = 0, minute = 0, second = 0, nanosecond = 0, offsetHours = 0, offsetMinutes = 0, offsetSeconds = 0] = value as number[];
+    const offset = offsetHours * 3_600 + offsetMinutes * 60 + offsetSeconds;
+    return Date.UTC(year, 0, ordinal, hour, minute, second) + Math.floor(nanosecond / 1_000_000) - offset * 1_000;
+  }
+  return null;
+}
+
 export function relativeTime(value: string) {
   const delta = Date.now() - new Date(value).getTime();
   const minutes = Math.round(delta / 60_000);

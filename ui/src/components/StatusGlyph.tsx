@@ -1,9 +1,11 @@
 /* eslint-disable react-refresh/only-export-components -- pure appearance helpers are intentionally colocated */
 import { AlertTriangle, Ban, Check, CircleDashed, Clock3, GitMerge, LoaderCircle, Pause, ShieldCheck, X } from "lucide-react";
-import type { QueueItemState, RepositoryExecutionState } from "../lib/types";
+import type { QueueItemKind, QueueItemState, RepositoryExecutionState } from "../lib/types";
 import { cn } from "../lib/utils";
 
-export function itemStatus(state: QueueItemState) {
+export function itemStatus(state: QueueItemState, kind?: QueueItemKind) {
+  if (kind === "release" && state === "check-passed") return { label: "Release passed", tone: "success" as const, icon: Check };
+  if (kind === "release" && state === "check-failed") return { label: "Release failed", tone: "danger" as const, icon: X };
   switch (state) {
     case "ready": return { label: "Validation passed", tone: "success" as const, icon: ShieldCheck };
     case "promoting": return { label: "Promoting", tone: "info" as const, icon: GitMerge };
@@ -20,8 +22,8 @@ export function itemStatus(state: QueueItemState) {
   }
 }
 
-export function StatusGlyph({ state, size = "md" }: { state: QueueItemState; size?: "sm" | "md" | "lg" }) {
-  const status = itemStatus(state);
+export function StatusGlyph({ state, kind, size = "md" }: { state: QueueItemState; kind?: QueueItemKind; size?: "sm" | "md" | "lg" }) {
+  const status = itemStatus(state, kind);
   const Icon = status.icon;
   return <span className={cn("status-glyph", `status-glyph--${status.tone}`, `status-glyph--${size}`, state === "running" && "status-glyph--pulse")} role="img" aria-label={status.label}><Icon aria-hidden /></span>;
 }

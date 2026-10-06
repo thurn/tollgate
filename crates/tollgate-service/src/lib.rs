@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod release;
+mod release_surfaces;
 pub mod storage;
 
 use std::{
@@ -19,6 +20,11 @@ use parking_lot::Mutex;
 #[cfg(test)]
 use release::ReleaseFault;
 use release::{PUSH_BLOCKED, REMOTE_PREFLIGHT_MISMATCH};
+pub use release_surfaces::{
+    ReleaseRefView, ReleaseRetryAction, ReleaseRetryRefusal, ReleaseRetryResult, ReleaseRunRange,
+    ReleaseRunStep, ReleaseRunSummary, ReleaseStatus, ReleaseWaitOutcome, ReleaseWaitSource,
+    ReleaseWaitStatus, ReleaseWaitTarget, release_status,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use time::{Duration, OffsetDateTime};
@@ -144,6 +150,13 @@ pub enum ServiceError {
     )]
     UnpromotedSourceAncestor {
         ancestor: GitOid,
+        release_oid: GitOid,
+    },
+    #[error("{message}")]
+    ReleaseRetryUnavailable {
+        reason: ReleaseRetryRefusal,
+        message: String,
+        staging_oid: GitOid,
         release_oid: GitOid,
     },
     #[error("candidate {item_id} is terminal in state {state}: {reason}")]
@@ -14665,7 +14678,7 @@ impl TollgateService {
             }
             let state = runtime.data.lock().state.clone();
             queued = Some(
-                self.prepare_release_run(runtime, &config, &state, next_sequence)
+                self.prepare_release_run(runtime, &config, &state, next_sequence, None, None)
                     .await?,
             );
         }
@@ -14686,6 +14699,7 @@ impl TollgateService {
             retired: &retired,
             queued: queued.as_ref().map(|(item, generation)| (item, generation)),
             outcome,
+            command: None,
         })?;
         if events.is_empty()
             && (state.release_lag.clone(), state.release_state) != persisted_projection
@@ -14695,6 +14709,24 @@ impl TollgateService {
         if let Some(event) = events.last() {
             state.event_sequence = event.sequence;
         }
+        self.apply_release_trigger(runtime, &state, retired, queued, events)
+            .await
+    }
+
+    /// Applies a persisted release trigger in memory: replaces the retired runs, adds the queued
+    /// run with its generation, takes `state`'s release projection, publishes the events, cancels
+    /// the retired runs, and deletes their source refs.
+    pub(crate) async fn apply_release_trigger(
+        &self,
+        runtime: &Arc<RepositoryRuntime>,
+        state: &RepositoryState,
+        retired: Vec<QueueItem>,
+        queued: Option<(QueueItem, ValidationGeneration)>,
+        events: Vec<DomainEvent>,
+    ) -> Result<(), ServiceError> {
+        let event_sequence = events
+            .last()
+            .map_or(state.event_sequence, |event| event.sequence);
         {
             let mut data = runtime.data.lock();
             for item in &retired {
@@ -14710,9 +14742,9 @@ impl TollgateService {
                 data.items.push(item);
                 data.push_generation(generation);
             }
-            data.state.release_lag = state.release_lag;
+            data.state.release_lag = state.release_lag.clone();
             data.state.release_state = state.release_state;
-            data.state.event_sequence = data.state.event_sequence.max(state.event_sequence);
+            data.state.event_sequence = data.state.event_sequence.max(event_sequence);
         }
         for event in events {
             let _ = runtime.events.send(event);
@@ -14745,27 +14777,37 @@ impl TollgateService {
 
     /// Builds the release run for the newest `staging` tip. It tests that exact commit, so no
     /// synthetic prefix is built and the expected parent is the commit's own parent; the
-    /// generation anchors at the current `release` OID, which bounds the range its path filters
-    /// cover, and freezes the active configuration's release-stage digest.
-    async fn prepare_release_run(
+    /// generation anchors at `anchor` (by default the current `release` OID), which bounds the
+    /// range its path filters cover, and freezes the active configuration's release-stage digest.
+    /// An anchor equal to the tip (a `tg release retry` while `release` already holds it) falls
+    /// back to the tip's parent, so the run still selects steps by the tip's own changes.
+    pub(crate) async fn prepare_release_run(
         &self,
         runtime: &RepositoryRuntime,
         config: &EffectiveConfig,
         state: &RepositoryState,
         enqueue_sequence: u64,
+        anchor: Option<GitOid>,
+        retry_of_item_id: Option<QueueItemId>,
     ) -> Result<(QueueItem, ValidationGeneration), ServiceError> {
         let release_digest = config.release_step_graph_digest.clone().ok_or_else(|| {
             ServiceError::Invariant("a release run requires a release stage".into())
         })?;
         let tip = state.staging_oid.clone();
         let probe = runtime.git.probe_retained_check(&tip).await?;
+        let anchor = anchor.unwrap_or_else(|| state.release_oid.clone());
+        let anchor = if anchor == tip {
+            probe.parent_oid.clone()
+        } else {
+            anchor
+        };
         let item_id = QueueItemId::new();
         let source_ref = runtime.git.create_source_ref(item_id, &tip).await?;
         runtime.git.initialize_mirror(&runtime.mirror).await?;
         let generation = ValidationGeneration::derive(
             ValidationGenerationId::new(),
             item_id,
-            state.release_oid.clone(),
+            anchor,
             vec![item_id],
             vec![tip.clone()],
             vec![tip.clone()],
@@ -14802,7 +14844,7 @@ impl TollgateService {
             cleanup_state: CleanupState::NotEligible,
             cleanup_policy: CleanupPolicy::Automatic,
             dependencies: Vec::new(),
-            retry_of_item_id: None,
+            retry_of_item_id,
             promotion_authorized: false,
             promotion_authorized_at: None,
             promotion_authorized_by: None,
@@ -30448,6 +30490,377 @@ policy = "clone"
         wait_for_remote(&remote, &tip).await;
         wait_for_settled_release_advances(&runtime).await;
         assert_eq!(remote.pushed(), vec![tip.to_hex()]);
+        service.shutdown().await.unwrap();
+    }
+
+    /// A release step that fails its first run and, on later runs, holds until `gate` exists.
+    fn flaky_release_step(marker: &Path, gate: &Path) -> String {
+        format!(
+            "\n[[step]]\nname = \"full\"\nstage = \"release\"\nrun = \"if [ -f '{marker}' ]; then while [ ! -f '{gate}' ]; do sleep 0.05; done; else touch '{marker}'; exit 1; fi\"\nneeds = [\"fast\"]\n",
+            marker = marker.display(),
+            gate = gate.display()
+        )
+    }
+
+    fn active_release_runs(snapshot: &RepositorySnapshot) -> Vec<&QueueItemView> {
+        snapshot
+            .release_runs
+            .iter()
+            .filter(|view| !view.item.state.is_terminal())
+            .collect()
+    }
+
+    async fn wait_for_failed_release(
+        service: &Arc<TollgateService>,
+        id: RepositoryId,
+    ) -> RepositorySnapshot {
+        wait_for_release_snapshot(service, id, "the release run to fail", |snapshot| {
+            event_kinds(&snapshot.history, "release.run-failed").len() == 1
+                && active_release_runs(snapshot).is_empty()
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn release_retry_reruns_a_failed_tip_once_and_reports_what_waits_on_it() {
+        let temporary = tempfile::tempdir().unwrap();
+        let marker = temporary.path().join("first-run-failed");
+        let gate = temporary.path().join("release-may-finish");
+        let (service, id, repository) = staged_release_repository(
+            temporary.path(),
+            &[],
+            &[("feature-a", "a.txt", "a\n"), ("feature-b", "b.txt", "b\n")],
+            &flaky_release_step(&marker, &gate),
+        )
+        .await;
+        let base = GitOid::from_hex(&git(&repository, &["rev-parse", RELEASE_REF])).unwrap();
+        let worktree = temporary.path().join("feature-a");
+        let approved = service
+            .approve_from(
+                id,
+                "feature-a".into(),
+                Some(worktree.to_string_lossy().into_owned()),
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        let tip = wait_item_promoted(&service, id, approved.item_id).await;
+        let failing = wait_for_failed_release(&service, id).await;
+        let failed_run = release_runs_for(&failing, &tip)[0].item.id;
+        assert_eq!(failing.state.release_state, ReleaseState::Failing);
+
+        // Nothing requeues a failed tip on its own; `tg wait --released` reports the failure.
+        let failed = service
+            .release_wait_status(
+                id,
+                ReleaseWaitTarget::Candidate {
+                    item_id: approved.item_id,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(failed.status, ReleaseWaitOutcome::ReleaseFailed);
+        assert_eq!(failed.target_oid.as_ref(), Some(&tip));
+        let covering = failed.covering_run.unwrap();
+        assert_eq!(covering.item_id, failed_run);
+        assert_eq!(covering.failing_steps, vec!["full".to_owned()]);
+        let recorded_path = service
+            .item_details(id, approved.item_id)
+            .await
+            .unwrap()
+            .item
+            .metadata
+            .worktree_path;
+        let latest = service
+            .release_wait_status(
+                id,
+                ReleaseWaitTarget::Latest {
+                    worktree_path: recorded_path,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(latest.source, ReleaseWaitSource::WorktreePromotion);
+        assert_eq!(latest.item_id, Some(approved.item_id));
+        let unpromoted = git(&repository, &["rev-parse", "feature-b"]);
+        assert_eq!(
+            service
+                .release_wait_status(
+                    id,
+                    ReleaseWaitTarget::Revision {
+                        revision: unpromoted
+                    }
+                )
+                .await
+                .unwrap()
+                .status,
+            ReleaseWaitOutcome::NotOnStaging
+        );
+        assert_eq!(
+            service
+                .release_wait_status(
+                    id,
+                    ReleaseWaitTarget::Revision {
+                        revision: base.to_hex()
+                    }
+                )
+                .await
+                .unwrap()
+                .status,
+            ReleaseWaitOutcome::Released
+        );
+
+        let command = CommandId::new();
+        let retried = service.release_retry(id, command).await.unwrap();
+        assert_eq!(retried.action, ReleaseRetryAction::Queued);
+        assert_eq!(retried.target_oid, tip);
+        assert_eq!(retried.release_oid, base);
+        assert_eq!(retried.retry_of_item_id, Some(failed_run));
+        assert_ne!(retried.item_id, failed_run);
+        assert_eq!(
+            service.release_retry(id, command).await.unwrap(),
+            retried,
+            "a replayed retry returns the run it queued"
+        );
+        let again = service.release_retry(id, CommandId::new()).await.unwrap();
+        assert_eq!(again.action, ReleaseRetryAction::AlreadyActive);
+        assert_eq!(again.item_id, retried.item_id);
+        let running =
+            wait_for_release_snapshot(&service, id, "the retried run to start", |snapshot| {
+                release_runs_for(snapshot, &tip).iter().any(|view| {
+                    view.item.id == retried.item_id && view.item.state == QueueItemState::Running
+                })
+            })
+            .await;
+        assert_eq!(active_release_runs(&running).len(), 1);
+        assert_eq!(
+            service
+                .release_retry(id, CommandId::new())
+                .await
+                .unwrap()
+                .item_id,
+            retried.item_id,
+            "a retry while the run is active queues nothing"
+        );
+        let pending = service
+            .release_wait_status(
+                id,
+                ReleaseWaitTarget::Latest {
+                    worktree_path: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(pending.source, ReleaseWaitSource::StagingTip);
+        assert_eq!(pending.status, ReleaseWaitOutcome::Pending);
+        assert_eq!(
+            pending.covering_run.map(|run| run.item_id),
+            Some(retried.item_id)
+        );
+        let status = release_status(&running);
+        assert_eq!(
+            status.active_run.map(|run| run.retry_of_item_id),
+            Some(Some(failed_run))
+        );
+        assert_eq!(status.last_run.map(|run| run.item_id), Some(failed_run));
+
+        std::fs::write(&gate, "").unwrap();
+        let released = wait_for_release_snapshot(
+            &service,
+            id,
+            "release to reach the retried tip",
+            |snapshot| snapshot.state.release_oid == tip,
+        )
+        .await;
+        assert_eq!(released.state.release_state, ReleaseState::Green);
+        assert_eq!(
+            service
+                .release_wait_status(
+                    id,
+                    ReleaseWaitTarget::Candidate {
+                        item_id: approved.item_id
+                    }
+                )
+                .await
+                .unwrap()
+                .status,
+            ReleaseWaitOutcome::Released
+        );
+        match service.release_retry(id, CommandId::new()).await {
+            Err(ServiceError::ReleaseRetryUnavailable { reason, .. }) => {
+                assert_eq!(reason, ReleaseRetryRefusal::AlreadyCertified)
+            }
+            other => panic!("a certified release has nothing to retry: {other:?}"),
+        }
+        let runtime = service.runtime(id).await.unwrap();
+        let events = runtime.store.events_after(0, 10_000).unwrap();
+        let queued = event_kinds(&events, "release.run-queued");
+        assert_eq!(queued.len(), 2);
+        assert_eq!(queued[1].payload["outcome"]["action"], "retried");
+        let recovered = event_kinds(&events, "release.run-passed");
+        assert_eq!(recovered[0].payload["recovered"], true);
+        drop(runtime);
+        service.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn release_retry_without_a_release_stage_runs_nothing() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (service, id, _repository) =
+            staged_release_repository(temporary.path(), &[], &[], "").await;
+        match service.release_retry(id, CommandId::new()).await {
+            Err(ServiceError::ReleaseRetryUnavailable { reason, .. }) => {
+                assert_eq!(reason, ReleaseRetryRefusal::NoReleaseStage)
+            }
+            other => panic!("no release stage, no retry: {other:?}"),
+        }
+        let snapshot = service.repository_snapshot(id).await.unwrap();
+        assert!(snapshot.release_runs.is_empty());
+        assert!(!release_status(&snapshot).release_stage);
+        assert_eq!(
+            service
+                .release_wait_status(
+                    id,
+                    ReleaseWaitTarget::Latest {
+                        worktree_path: None
+                    }
+                )
+                .await
+                .unwrap()
+                .status,
+            ReleaseWaitOutcome::Released
+        );
+        service.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_release_retry_queued_before_a_restart_runs_once_and_replays() {
+        let temporary = tempfile::tempdir().unwrap();
+        let support = temporary.path().join("support");
+        let marker = temporary.path().join("first-run-failed");
+        let gate = temporary.path().join("release-may-finish");
+        let (service, id, _repository) = staged_release_repository(
+            temporary.path(),
+            &[],
+            &[("feature-a", "a.txt", "a\n")],
+            &flaky_release_step(&marker, &gate),
+        )
+        .await;
+        let tip = approve_and_promote(&service, id, "feature-a").await;
+        wait_for_failed_release(&service, id).await;
+        // Paused, the retried run stays queued across the restart.
+        service.set_paused(id, true).await.unwrap();
+        let command = CommandId::new();
+        let retried = service.release_retry(id, command).await.unwrap();
+        assert_eq!(retried.action, ReleaseRetryAction::Queued);
+        service.shutdown().await.unwrap();
+        drop(service);
+
+        let reopened = TollgateService::open(support).await.unwrap();
+        assert_eq!(
+            reopened.release_retry(id, command).await.unwrap(),
+            retried,
+            "the client's resend after a restart returns the run queued before it"
+        );
+        let snapshot = reopened.repository_snapshot(id).await.unwrap();
+        assert_eq!(
+            active_release_runs(&snapshot)
+                .iter()
+                .map(|view| view.item.id)
+                .collect::<Vec<_>>(),
+            vec![retried.item_id],
+            "startup recovery neither drops nor duplicates the retried run"
+        );
+        if snapshot.state.execution_state == RepositoryExecutionState::Paused {
+            reopened.set_paused(id, false).await.unwrap();
+        }
+        std::fs::write(&gate, "").unwrap();
+        let released = wait_for_release_snapshot(
+            &reopened,
+            id,
+            "the retried run to release the tip",
+            |snapshot| snapshot.state.release_oid == tip,
+        )
+        .await;
+        let passed = release_runs_for(&released, &tip)
+            .into_iter()
+            .filter(|view| view.item.state == QueueItemState::CheckPassed)
+            .map(|view| view.item.id)
+            .collect::<Vec<_>>();
+        assert_eq!(passed, vec![retried.item_id]);
+        reopened.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn release_retry_certifies_a_tip_release_holds_after_the_release_stage_changes() {
+        let temporary = tempfile::tempdir().unwrap();
+        let gate = temporary.path().join("release-may-finish");
+        let (service, id, repository, remote, base) = staged_release_repository_with_remote(
+            temporary.path(),
+            &[("feature-a", "a.txt", "a\n")],
+            true,
+            &held_release_policy(&gate),
+        )
+        .await;
+        let tip = approve_and_promote(&service, id, "feature-a").await;
+        wait_for_release_snapshot(&service, id, "the first release run to start", |snapshot| {
+            release_runs_for(snapshot, &tip)
+                .iter()
+                .any(|view| view.item.state == QueueItemState::Running)
+        })
+        .await;
+        // `release` adopts the tip uncertified, then the release stage changes: the running run
+        // is retired under the old digest, and nothing requeues because `release == staging`.
+        git(&repository, &["update-ref", RELEASE_REF, &tip.to_hex()]);
+        service.pull(id, CommandId::new()).await.unwrap();
+        std::fs::write(
+            repository.join(".tollgate/config.toml"),
+            "version = 1\n\n[remote]\nenabled = true\n\n[[step]]\nname = \"fast\"\nrun = \"true\"\n\n[[step]]\nname = \"full\"\nstage = \"release\"\nrun = \"true && true\"\n",
+        )
+        .unwrap();
+        service
+            .apply_configuration(id, CommandId::new())
+            .await
+            .unwrap();
+        let settled = wait_for_release_snapshot(
+            &service,
+            id,
+            "the old-stage run to be retired",
+            |snapshot| active_release_runs(snapshot).is_empty(),
+        )
+        .await;
+        assert_eq!(settled.state.release_oid, tip);
+        assert_eq!(settled.state.staging_oid, tip);
+        assert!(service.push(id, CommandId::new()).await.is_err());
+        assert_eq!(remote.master(), base.to_hex());
+
+        let retried = service.release_retry(id, CommandId::new()).await.unwrap();
+        assert_eq!(retried.action, ReleaseRetryAction::Queued);
+        assert_eq!(retried.target_oid, tip);
+        assert_eq!(retried.release_oid, tip);
+        let passed =
+            wait_for_release_snapshot(&service, id, "the retried run to pass", |snapshot| {
+                release_runs_for(snapshot, &tip).iter().any(|view| {
+                    view.item.id == retried.item_id
+                        && view.item.state == QueueItemState::CheckPassed
+                })
+            })
+            .await;
+        let run = release_runs_for(&passed, &tip)
+            .into_iter()
+            .find(|view| view.item.id == retried.item_id)
+            .unwrap();
+        assert_ne!(
+            run.generation.as_ref().unwrap().anchored_base_oid,
+            tip,
+            "a retry of a tip release already holds still selects steps by the tip's changes"
+        );
+        let pushed = service.push(id, CommandId::new()).await.unwrap();
+        assert!(
+            matches!(pushed.action, RemoteSyncAction::Pushed),
+            "{pushed:?}"
+        );
+        assert_eq!(remote.master(), tip.to_hex());
         service.shutdown().await.unwrap();
     }
 }

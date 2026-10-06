@@ -14,7 +14,9 @@ use tauri::{Emitter, Manager};
 use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_opener::OpenerExt;
 use tokio_util::codec::Framed;
-use tollgate_domain::{BuildsetId, CleanupPolicy, CommandId, QueueItemId, RepositoryId, SlotId};
+use tollgate_domain::{
+    BuildsetId, CleanupPolicy, CommandId, QueueItemId, RepositoryId, RepositoryState, SlotId,
+};
 use tollgate_ipc::{
     Frame, FrameCodec, FrameKind, Handshake, HandshakeAck, IpcCommand, IpcResponse,
     MAX_CONTROL_PAYLOAD, MAX_LOG_PAYLOAD, PROTOCOL_VERSION, ProtocolError, SCHEMA_VERSION,
@@ -23,8 +25,8 @@ use tollgate_ipc::{
 };
 use tollgate_service::{
     AppSnapshot, ApproveResult, CandidateAuthorizationResult, DoctorReport, EnvironmentView,
-    QueueReorderResult, RemoteSyncResult, RepositorySnapshot, ServiceError, TollgateService,
-    WorktreeOperationResult,
+    QueueReorderResult, ReleaseRetryResult, ReleaseWaitTarget, RemoteSyncResult,
+    RepositorySnapshot, ServiceError, TollgateService, WorktreeOperationResult,
 };
 
 type Service = Arc<TollgateService>;
@@ -150,6 +152,20 @@ async fn retry_item(
 ) -> Result<ApproveResult, String> {
     let result = service
         .retry(repository_id, item_id, cold, CommandId::new())
+        .await
+        .map_err(|error| error.to_string())?;
+    let _ = app.emit("tollgate://snapshot-changed", ());
+    Ok(result)
+}
+
+#[tauri::command]
+async fn release_retry(
+    app: tauri::AppHandle,
+    service: tauri::State<'_, Service>,
+    repository_id: RepositoryId,
+) -> Result<ReleaseRetryResult, String> {
+    let result = service
+        .release_retry(repository_id, CommandId::new())
         .await
         .map_err(|error| error.to_string())?;
     let _ = app.emit("tollgate://snapshot-changed", ());
@@ -722,6 +738,7 @@ pub fn run() {
             authorize_candidate,
             check,
             retry_item,
+            release_retry,
             cancel_item,
             reorder_queue,
             pull,
@@ -809,9 +826,17 @@ async fn monitor_failure_notifications(
 ) {
     let mut cursors = HashMap::new();
     let mut blocked = HashSet::new();
+    let mut release_holds = HashMap::<RepositoryId, HashSet<String>>::new();
     if let Ok(snapshot) = service.snapshot().await {
         for repository in snapshot.repositories {
             cursors.insert(repository.state.id, repository.state.event_sequence);
+            release_holds.insert(
+                repository.state.id,
+                release_hold_reasons(&repository.state)
+                    .into_iter()
+                    .map(|(code, _)| code)
+                    .collect(),
+            );
             for reason in repository.state.block_reasons {
                 blocked.insert((repository.state.id, reason.code));
             }
@@ -831,11 +856,15 @@ async fn monitor_failure_notifications(
             let cursor = cursors.entry(repository.state.id).or_insert(0);
             let starting_cursor = *cursor;
             let mut observed_cursor = starting_cursor;
+            let mut announced = HashSet::new();
             for event in repository
                 .history
                 .iter()
                 .filter(|event| event.sequence > starting_cursor)
             {
+                if let Some(code) = announced_release_hold(&event.kind, &event.payload) {
+                    announced.insert(code);
+                }
                 if notifications_enabled
                     && let Some((subject, body)) = event_notification(&event.kind, &event.payload)
                 {
@@ -849,6 +878,21 @@ async fn monitor_failure_notifications(
                 observed_cursor = observed_cursor.max(event.sequence);
             }
             *cursor = observed_cursor;
+            let raised = newly_raised_release_holds(
+                release_holds.entry(repository.state.id).or_default(),
+                release_hold_reasons(&repository.state),
+                &announced,
+            );
+            for (subject, body) in raised {
+                if notifications_enabled {
+                    let _ = app
+                        .notification()
+                        .builder()
+                        .title(format!("{} · Tollgate", repository.state.name))
+                        .body(format!("{subject}: {body}"))
+                        .show();
+                }
+            }
             for reason in &repository.state.block_reasons {
                 if blocked.insert((repository.state.id, reason.code.clone()))
                     && notifications_enabled
@@ -865,11 +909,78 @@ async fn monitor_failure_notifications(
     }
 }
 
+/// A release hold or promotion pause code with the notification subject and body it raises.
+type HoldNotification = (String, (String, String));
+
+/// The release holds and promotion pause `state` carries, as `(code, notification)` pairs. The
+/// snapshot fallback notifies each once when it appears, in case its event left the snapshot's
+/// history window before the monitor saw it.
+fn release_hold_reasons(state: &RepositoryState) -> Vec<HoldNotification> {
+    state
+        .release_block_reasons
+        .iter()
+        .map(|reason| {
+            (
+                reason.code.clone(),
+                (
+                    if reason.code == "push-blocked" {
+                        "Release push blocked".into()
+                    } else {
+                        "Release held".into()
+                    },
+                    reason.message.clone(),
+                ),
+            )
+        })
+        .chain(state.promotion_pause.iter().map(|pause| {
+            (
+                pause.code.clone(),
+                ("Promotion paused".into(), pause.message.clone()),
+            )
+        }))
+        .collect()
+}
+
+/// The release hold or promotion pause code a history event announces, so the snapshot
+/// fallback does not notify it a second time.
+fn announced_release_hold(kind: &str, payload: &serde_json::Value) -> Option<String> {
+    match kind {
+        "release.push-blocked" => Some("push-blocked".into()),
+        "release.held" => payload["code"].as_str().map(str::to_owned),
+        "promotion.paused" => payload["reason"].as_str().map(str::to_owned),
+        _ => None,
+    }
+}
+
+/// The notifications for holds in `current` that were not held at the previous observation
+/// (`seen`) and that no event in this pass announced. `seen` becomes `current`'s codes, so a
+/// hold that clears notifies again if it returns.
+fn newly_raised_release_holds(
+    seen: &mut HashSet<String>,
+    current: Vec<HoldNotification>,
+    announced: &HashSet<String>,
+) -> Vec<(String, String)> {
+    let codes = current
+        .iter()
+        .map(|(code, _)| code.clone())
+        .collect::<HashSet<_>>();
+    let raised = current
+        .into_iter()
+        .filter(|(code, _)| !seen.contains(code) && !announced.contains(code))
+        .map(|(_, notification)| notification)
+        .collect();
+    *seen = codes;
+    raised
+}
+
 /// The desktop notification one repository history event raises, as a subject and body.
 ///
 /// Release runs notify through their outcome events only: `release.run-failed` once per failing
 /// streak (`notify`) and `release.run-passed` once on recovery (`recovered`). Their item updates
-/// never notify, so a red release streak raises one notification, not one per run.
+/// never notify, so a red release streak raises one notification, not one per run. Release
+/// holds (`release.push-blocked`, `release.held`), a recovered release push (`release.pushed`),
+/// and the `max_release_lag` pause (`promotion.paused`) notify when their payload sets
+/// `notify`.
 fn event_notification(kind: &str, payload: &serde_json::Value) -> Option<(String, String)> {
     let text = |value: &serde_json::Value| value.as_str().map(str::to_owned);
     let short = |value: &serde_json::Value| {
@@ -878,9 +989,10 @@ fn event_notification(kind: &str, payload: &serde_json::Value) -> Option<(String
             .map(|oid| oid.chars().take(12).collect::<String>())
             .unwrap_or_else(|| "staging".into())
     };
+    let notify = payload.get("notify").and_then(serde_json::Value::as_bool) == Some(true);
     match kind {
         "release.run-failed" => {
-            if payload.get("notify").and_then(serde_json::Value::as_bool) != Some(true) {
+            if !notify {
                 return None;
             }
             let steps = payload["failing_steps"]
@@ -918,6 +1030,53 @@ fn event_notification(kind: &str, payload: &serde_json::Value) -> Option<(String
                 format!("{} passed the release stage", short(&payload["tested_oid"])),
             ));
         }
+        "release.push-blocked" => {
+            if !notify {
+                return None;
+            }
+            return Some((
+                "Release push blocked".into(),
+                format!(
+                    "{} did not reach the remote{}",
+                    short(&payload["tested_oid"]),
+                    text(&payload["error"])
+                        .map(|error| format!(": {error}"))
+                        .unwrap_or_default()
+                ),
+            ));
+        }
+        "release.pushed" => {
+            if !notify {
+                return None;
+            }
+            return Some((
+                "Release push recovered".into(),
+                format!("{} reached the remote", short(&payload["tested_oid"])),
+            ));
+        }
+        "release.held" => {
+            if !notify {
+                return None;
+            }
+            return Some((
+                "Release held".into(),
+                text(&payload["message"]).unwrap_or_else(|| "Release advances are held".into()),
+            ));
+        }
+        "promotion.paused" => {
+            if !notify {
+                return None;
+            }
+            return Some((
+                "Promotion paused".into(),
+                format!(
+                    "release trails staging by {} commit(s), more than max_release_lag = {}, and the latest release run failed",
+                    payload["release_lag"].as_u64().unwrap_or(0),
+                    payload["max_release_lag"].as_u64().unwrap_or(0)
+                ),
+            ));
+        }
+        "promotion.resumed" => return None,
         _ => {}
     }
     if payload.get("kind").and_then(serde_json::Value::as_str) == Some("release") {
@@ -964,7 +1123,176 @@ fn event_notification(kind: &str, payload: &serde_json::Value) -> Option<(String
 
 #[cfg(test)]
 mod notification_tests {
-    use super::event_notification;
+    use super::{
+        announced_release_hold, event_notification, newly_raised_release_holds,
+        release_hold_reasons,
+    };
+    use std::collections::HashSet;
+    use tollgate_domain::{BlockReason, GitOid, RepositoryState};
+
+    fn reason(code: &str) -> BlockReason {
+        BlockReason {
+            code: code.into(),
+            message: format!("{code} message"),
+            recovery_action: "recover".into(),
+        }
+    }
+
+    fn state_with(release_holds: &[&str], pause: Option<&str>) -> RepositoryState {
+        let oid = GitOid::from_hex("1111111111111111111111111111111111111111").unwrap();
+        RepositoryState {
+            id: tollgate_domain::RepositoryId::new(),
+            name: "repository".into(),
+            path: "/tmp/repository".into(),
+            staging_ref: "refs/heads/staging".into(),
+            staging_oid: oid.clone(),
+            release_ref: "refs/heads/release".into(),
+            release_oid: oid,
+            release_lag: Default::default(),
+            release_state: Default::default(),
+            queue_revision: 0,
+            event_sequence: 0,
+            engine_epoch: 1,
+            execution_state: tollgate_domain::RepositoryExecutionState::Active,
+            block_reasons: Vec::new(),
+            active_configuration_digest: "digest".into(),
+            active_window: 1,
+            active_window_floor: 1,
+            active_window_ceiling: 1,
+            remote_enabled: false,
+            release_block_reasons: release_holds.iter().map(|code| reason(code)).collect(),
+            promotion_pause: pause.map(reason),
+        }
+    }
+
+    #[test]
+    fn release_holds_and_the_promotion_pause_notify_through_their_events() {
+        let blocked = |notify| {
+            event(
+                "release.push-blocked",
+                serde_json::json!({
+                    "notify": notify,
+                    "tested_oid": "c".repeat(40),
+                    "error": "rejected",
+                }),
+            )
+        };
+        let (subject, body) = blocked(true).expect("a new push block notifies");
+        assert!(!subject.is_empty());
+        assert!(body.contains("rejected"));
+        assert!(
+            blocked(false).is_none(),
+            "a continuing push block is silent"
+        );
+        let paused = |notify| {
+            event(
+                "promotion.paused",
+                serde_json::json!({
+                    "notify": notify,
+                    "reason": "release-lag",
+                    "release_lag": 4,
+                    "max_release_lag": 3,
+                }),
+            )
+        };
+        let (_, body) = paused(true).expect("a promotion pause notifies");
+        assert!(body.contains('4') && body.contains('3'));
+        assert!(paused(false).is_none());
+        assert!(
+            event(
+                "release.held",
+                serde_json::json!({"notify": true, "code": "release-range-unattributed", "message": "held"}),
+            )
+            .is_some()
+        );
+        assert!(
+            event(
+                "release.pushed",
+                serde_json::json!({"notify": true, "tested_oid": "d".repeat(40)}),
+            )
+            .is_some(),
+            "a push that lands after a block reports its recovery"
+        );
+        assert!(event("release.pushed", serde_json::json!({"notify": false})).is_none());
+        assert!(
+            event(
+                "promotion.resumed",
+                serde_json::json!({"reason": "release-lag"})
+            )
+            .is_none()
+        );
+        assert_eq!(
+            announced_release_hold("release.push-blocked", &serde_json::json!({})),
+            Some("push-blocked".into())
+        );
+        assert_eq!(
+            announced_release_hold(
+                "promotion.paused",
+                &serde_json::json!({"reason": "release-lag"})
+            ),
+            Some("release-lag".into())
+        );
+        assert_eq!(
+            announced_release_hold(
+                "release.held",
+                &serde_json::json!({"code": "remote-preflight-mismatch"})
+            ),
+            Some("remote-preflight-mismatch".into())
+        );
+    }
+
+    #[test]
+    fn the_snapshot_fallback_notifies_each_release_hold_and_pause_once() {
+        let mut seen = HashSet::new();
+        let none = HashSet::new();
+        let raised = newly_raised_release_holds(
+            &mut seen,
+            release_hold_reasons(&state_with(&["push-blocked"], Some("release-lag"))),
+            &none,
+        );
+        assert_eq!(
+            raised.len(),
+            2,
+            "a hold and a pause missed by the event path notify"
+        );
+        assert!(
+            newly_raised_release_holds(
+                &mut seen,
+                release_hold_reasons(&state_with(&["push-blocked"], Some("release-lag"))),
+                &none,
+            )
+            .is_empty(),
+            "a hold still in place does not notify again"
+        );
+        assert!(
+            newly_raised_release_holds(
+                &mut seen,
+                release_hold_reasons(&state_with(&[], None)),
+                &none
+            )
+            .is_empty()
+        );
+        let announced = HashSet::from(["push-blocked".to_owned()]);
+        assert!(
+            newly_raised_release_holds(
+                &mut seen,
+                release_hold_reasons(&state_with(&["push-blocked"], None)),
+                &announced,
+            )
+            .is_empty(),
+            "a hold its event already announced does not notify twice"
+        );
+        assert_eq!(
+            newly_raised_release_holds(
+                &mut seen,
+                release_hold_reasons(&state_with(&["push-blocked"], Some("release-lag"))),
+                &none,
+            )
+            .len(),
+            1,
+            "a pause that returns after clearing notifies again"
+        );
+    }
 
     fn event(kind: &str, payload: serde_json::Value) -> Option<(String, String)> {
         event_notification(kind, &payload)
@@ -1355,6 +1683,35 @@ async fn execute_ipc_command(service: &Service, command: IpcCommand) -> IpcRespo
                     .map_err(encode_service_error)?,
             )
             .map_err(|error| error.to_string()),
+            IpcCommand::ReleaseRetry {
+                repository_id,
+                command_id,
+            } => serde_json::to_value(
+                service
+                    .release_retry(repository_id, command_id)
+                    .await
+                    .map_err(encode_service_error)?,
+            )
+            .map_err(|error| error.to_string()),
+            IpcCommand::ReleaseWaitStatus {
+                repository_id,
+                item_id,
+                revision,
+                worktree_path,
+            } => {
+                let target = match (item_id, revision) {
+                    (Some(item_id), _) => ReleaseWaitTarget::Candidate { item_id },
+                    (None, Some(revision)) => ReleaseWaitTarget::Revision { revision },
+                    (None, None) => ReleaseWaitTarget::Latest { worktree_path },
+                };
+                serde_json::to_value(
+                    service
+                        .release_wait_status(repository_id, target)
+                        .await
+                        .map_err(encode_service_error)?,
+                )
+                .map_err(|error| error.to_string())
+            }
             IpcCommand::Reorder {
                 repository_id,
                 selected_ids,
@@ -1695,6 +2052,21 @@ fn encode_service_error(error: ServiceError) -> String {
                 "retry": "Rebase the single task commit onto release_oid only, then resubmit."
             })),
         }),
+        ServiceError::ReleaseRetryUnavailable {
+            reason,
+            staging_oid,
+            release_oid,
+            ..
+        } => Some(StructuredError {
+            code: "release-retry-unavailable".into(),
+            message: message.clone(),
+            retryable: false,
+            details: Some(serde_json::json!({
+                "reason": reason,
+                "staging_oid": staging_oid,
+                "release_oid": release_oid,
+            })),
+        }),
         ServiceError::CandidateTerminal {
             item_id,
             state,
@@ -1795,6 +2167,36 @@ mod ipc_error_tests {
                 .as_str()
                 .unwrap()
                 .contains("release_oid only")
+        );
+    }
+
+    #[test]
+    fn an_unavailable_release_retry_crosses_ipc_with_its_reason_and_refs() {
+        let staging_oid = GitOid::from_hex("1111111111111111111111111111111111111111").unwrap();
+        let release_oid = GitOid::from_hex("2222222222222222222222222222222222222222").unwrap();
+        let encoded = encode_service_error(ServiceError::ReleaseRetryUnavailable {
+            reason: tollgate_service::ReleaseRetryRefusal::AlreadyCertified,
+            message: "nothing to retry".into(),
+            staging_oid: staging_oid.clone(),
+            release_oid: release_oid.clone(),
+        });
+        let error: StructuredError = serde_json::from_str(
+            encoded
+                .strip_prefix(STRUCTURED_SERVICE_ERROR_PREFIX)
+                .expect("an unavailable retry crosses IPC as a structured error"),
+        )
+        .unwrap();
+        assert_eq!(error.code, "release-retry-unavailable");
+        assert!(!error.retryable);
+        let details = error.details.unwrap();
+        assert_eq!(details["reason"], "already-certified");
+        assert_eq!(
+            details["staging_oid"],
+            serde_json::to_value(staging_oid).unwrap()
+        );
+        assert_eq!(
+            details["release_oid"],
+            serde_json::to_value(release_oid).unwrap()
         );
     }
 

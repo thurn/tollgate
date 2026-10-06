@@ -48,6 +48,17 @@ pub struct ReleaseTrigger<'a> {
     pub queued: Option<(&'a QueueItem, &'a ValidationGeneration)>,
     /// Why the trigger settled the intents, recorded as their observed evidence.
     pub outcome: serde_json::Value,
+    /// The command whose result commits with the trigger (`tg release retry`), so a replay of
+    /// its command ID after a crash returns the run it queued instead of queueing another.
+    pub command: Option<ReleaseTriggerCommand<'a>>,
+}
+
+/// A command result recorded in the same transaction as a release trigger.
+pub struct ReleaseTriggerCommand<'a> {
+    pub command_id: CommandId,
+    pub command_kind: &'a str,
+    pub request_digest: &'a str,
+    pub response: serde_json::Value,
 }
 
 const ARTIFACT_COLUMNS: &str = "artifact_id, buildset_id, source_path, retained_path, hash, size, retention_state, created_at, expires_at";
@@ -2120,6 +2131,12 @@ impl RepositoryStore {
                 insert_event(&transaction, event)?;
             }
         }
+        if let Some(command) = &trigger.command {
+            transaction.execute(
+                "INSERT INTO command_results (command_id, command_kind, request_digest, response_json, event_sequence, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![command.command_id.to_string(), command.command_kind, command.request_digest, encode(&command.response)?, sequence as i64, now()],
+            )?;
+        }
         transaction.commit()?;
         Ok(events)
     }
@@ -3976,6 +3993,7 @@ mod tests {
         let (first, first_generation) = release_run(&state, 1);
         let events = store
             .record_release_trigger(&ReleaseTrigger {
+                command: None,
                 state: &state,
                 retired: &[],
                 queued: Some((&first, &first_generation)),
@@ -4021,6 +4039,7 @@ mod tests {
         let (second, second_generation) = release_run(&state, 2);
         let events = store
             .record_release_trigger(&ReleaseTrigger {
+                command: None,
                 state: &state,
                 retired: std::slice::from_ref(&superseded),
                 queued: Some((&second, &second_generation)),
@@ -4049,6 +4068,51 @@ mod tests {
             store.repository_state().unwrap().event_sequence,
             events[1].sequence
         );
+    }
+
+    #[test]
+    fn a_release_trigger_commits_its_command_result_with_the_queued_run() {
+        let store = RepositoryStore::open_in_memory().unwrap();
+        store.set_release_stage_configured(true);
+        let state = lagging_state("release-retry");
+        store.initialize_repository(&state).unwrap();
+        let (run, generation) = release_run(&state, 1);
+        let command_id = CommandId::new();
+        let response = serde_json::json!({"action": "queued", "item_id": run.id});
+        let events = store
+            .record_release_trigger(&ReleaseTrigger {
+                command: Some(ReleaseTriggerCommand {
+                    command_id,
+                    command_kind: "release-retry",
+                    request_digest: "digest",
+                    response: response.clone(),
+                }),
+                state: &state,
+                retired: &[],
+                queued: Some((&run, &generation)),
+                outcome: serde_json::json!({"action": "retried"}),
+            })
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(store.queue_items().unwrap().len(), 1);
+        assert_eq!(
+            store
+                .checked_command_response::<serde_json::Value>(
+                    command_id,
+                    "release-retry",
+                    "digest"
+                )
+                .unwrap(),
+            Some(response)
+        );
+        assert!(matches!(
+            store.checked_command_response::<serde_json::Value>(
+                command_id,
+                "release-retry",
+                "other"
+            ),
+            Err(StoreError::CommandReplayMismatch)
+        ));
     }
 
     #[test]

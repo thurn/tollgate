@@ -12,7 +12,9 @@ export type CleanupState = "not-eligible" | "pending" | "running" | "completed" 
 export interface GitOid { format: "sha1" | "sha256"; bytes: string }
 export interface BlockReason { code: string; message: string; recovery_action: string }
 export type ReleaseState = "green" | "pending" | "failing";
-export interface ReleaseLag { commits: number; since: string | null }
+/** A Rust `OffsetDateTime`: an ISO string, or the `[year, ordinal day, hour, minute, second, nanosecond, offset h, m, s]` tuple serde emits. */
+export type Timestamp = string | number[];
+export interface ReleaseLag { commits: number; since: Timestamp | null }
 export interface RepositoryState {
   id: string; name: string; path: string; staging_ref: string; staging_oid: GitOid;
   release_ref: string; release_oid: GitOid; release_lag: ReleaseLag; release_state: ReleaseState;
@@ -60,7 +62,7 @@ export interface PassCertificate {
   completed_event_sequence: number; created_at: string;
 }
 export interface EffectiveStep {
-  name: string; command: { kind: "shell"; script: string } | { kind: "argv"; argv: string[] };
+  name: string; stage?: "gate" | "release"; command: { kind: "shell"; script: string } | { kind: "argv"; argv: string[] };
   working_directory: string; needs: string[]; soft_needs: string[]; voting: boolean;
   final_step: boolean; reuse_on_retry: boolean; timeout_ns: number; cpu_tokens: number; memory_bytes: number;
   rss_limit_bytes?: number; semaphores: string[]; include: string[]; exclude: string[];
@@ -83,6 +85,11 @@ export interface UnavailableRepository { id: string; name: string; path: string;
 export type ActivationPhase = "queued" | "opening" | "recovering" | "resuming";
 export interface ActivatingRepository { id: string; name: string; path: string; phase: ActivationPhase; step: string; queued_at: string; phase_started_at: string }
 export interface AppSnapshot { version: string; generated_at: string; repositories: RepositorySnapshot[]; activating_repositories: ActivatingRepository[]; unavailable_repositories: UnavailableRepository[]; environment: EnvironmentView }
+
+export interface ReleaseRetryResult {
+  repository_id: string; action: "queued" | "already-active"; item_id: string; target_oid: GitOid;
+  staging_oid: GitOid; release_oid: GitOid; retry_of_item_id: string | null; superseded_item_ids: string[];
+}
 
 export function oidHex(oid?: GitOid) { return oid?.bytes ?? ""; }
 

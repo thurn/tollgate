@@ -7,3 +7,4 @@
 *.sqlite3-shm
 *.sqlite3-wal
 *.log
+/artifacts/

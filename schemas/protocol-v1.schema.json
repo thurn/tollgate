@@ -33,7 +33,7 @@
     "request": {
       "type": "object", "additionalProperties": false, "required": ["command"],
       "properties": {
-        "command": { "enum": ["snapshot", "item-status", "item-details", "item-wait-status", "initialize", "candidate", "approve", "authorize-candidate", "check", "cancel", "retry", "reorder", "pull", "push", "reconcile", "update", "worktree-create", "worktree-remove", "reset-slot", "snapshot-cache", "purge-cache", "artifact-pin", "artifact-prune", "remove-repository", "apply-configuration", "validate-configuration", "regenerate-configuration", "logs", "doctor", "pause", "resume", "reload-environment"] },
+        "command": { "enum": ["snapshot", "item-status", "item-details", "item-wait-status", "initialize", "candidate", "approve", "authorize-candidate", "check", "cancel", "retry", "release-retry", "release-wait-status", "reorder", "pull", "push", "reconcile", "update", "worktree-create", "worktree-remove", "reset-slot", "snapshot-cache", "purge-cache", "artifact-pin", "artifact-prune", "remove-repository", "apply-configuration", "validate-configuration", "regenerate-configuration", "logs", "doctor", "pause", "resume", "reload-environment"] },
         "repository_id": { "$ref": "#/$defs/uuid" },
         "item_id": { "$ref": "#/$defs/uuid" },
         "buildset_id": { "$ref": "#/$defs/uuid" },
@@ -68,6 +68,8 @@
         { "if": { "properties": { "command": { "const": "authorize-candidate" } } }, "then": { "required": ["repository_id", "item_id", "expected_revision", "command_id"] } },
         { "if": { "properties": { "command": { "const": "cancel" } } }, "then": { "required": ["repository_id", "item_id", "expected_revision", "command_id"] } },
         { "if": { "properties": { "command": { "const": "retry" } } }, "then": { "required": ["repository_id", "item_id", "cold", "command_id"] } },
+        { "if": { "properties": { "command": { "const": "release-retry" } } }, "then": { "required": ["repository_id", "command_id"] } },
+        { "if": { "properties": { "command": { "const": "release-wait-status" } } }, "then": { "required": ["repository_id"] } },
         { "if": { "properties": { "command": { "const": "reorder" } } }, "then": { "required": ["repository_id", "selected_ids", "expected_revision", "command_id"] } },
         { "if": { "properties": { "command": { "enum": ["pull", "push", "remove-repository", "apply-configuration", "regenerate-configuration", "snapshot-cache", "pause", "resume"] } } }, "then": { "required": ["repository_id", "command_id"] } },
         { "if": { "properties": { "command": { "const": "reconcile" } } }, "then": { "required": ["repository_id", "command_id"] } },

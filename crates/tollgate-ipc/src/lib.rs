@@ -18,7 +18,9 @@ pub const PROTOCOL_VERSION: u16 = 1;
 /// Version 3 added the `release` queue item kind and repository snapshots' `release_runs`.
 /// Version 4 added repository state's `release_block_reasons` and `promotion_pause`, queue items'
 /// `release_fix`, and the `release_fix` flag of candidate authorization.
-pub const SCHEMA_VERSION: u16 = 4;
+/// Version 5 added the `release-retry` and `release-wait-status` commands, `tg release status`,
+/// and `tg wait --released`.
+pub const SCHEMA_VERSION: u16 = 5;
 /// Structured error code for a handshake between a `tg` and an app whose `SCHEMA_VERSION`s differ.
 pub const SCHEMA_MISMATCH_CODE: &str = "schema-version-mismatch";
 pub const MAX_CONTROL_PAYLOAD: usize = 8 * 1024 * 1024;
@@ -330,6 +332,23 @@ pub enum IpcCommand {
         item_id: QueueItemId,
         cold: bool,
         command_id: CommandId,
+    },
+    /// `tg release retry`: rerun the newest `staging` tip as a release run.
+    ReleaseRetry {
+        repository_id: RepositoryId,
+        command_id: CommandId,
+    },
+    /// One `tg wait --released` observation. With `item_id`, the target is that candidate's
+    /// promoted OID; with `revision`, that commit; otherwise the newest promotion from
+    /// `worktree_path`, else the `staging` tip.
+    ReleaseWaitStatus {
+        repository_id: RepositoryId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item_id: Option<QueueItemId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        revision: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        worktree_path: Option<String>,
     },
     Reorder {
         repository_id: RepositoryId,
@@ -654,6 +673,43 @@ mod tests {
             IpcCommand::ItemDetails {
                 repository_id: None,
                 item_id,
+            }
+        );
+    }
+
+    #[test]
+    fn release_commands_use_their_kebab_case_wire_names() {
+        let repository_id = RepositoryId::new();
+        let command_id = CommandId::new();
+        let retry = serde_json::to_value(IpcCommand::ReleaseRetry {
+            repository_id,
+            command_id,
+        })
+        .unwrap();
+        assert_eq!(retry["command"], "release-retry");
+        assert_eq!(retry["command_id"], command_id.to_string());
+        let wait = serde_json::to_value(IpcCommand::ReleaseWaitStatus {
+            repository_id,
+            item_id: None,
+            revision: Some("abc".into()),
+            worktree_path: None,
+        })
+        .unwrap();
+        assert_eq!(wait["command"], "release-wait-status");
+        assert_eq!(wait["revision"], "abc");
+        assert!(wait.get("item_id").is_none());
+        let decoded: IpcCommand = serde_json::from_value(serde_json::json!({
+            "command": "release-wait-status",
+            "repository_id": repository_id,
+        }))
+        .unwrap();
+        assert_eq!(
+            decoded,
+            IpcCommand::ReleaseWaitStatus {
+                repository_id,
+                item_id: None,
+                revision: None,
+                worktree_path: None,
             }
         );
     }

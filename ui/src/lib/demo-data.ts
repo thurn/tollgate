@@ -69,6 +69,38 @@ completedCheck.item.kind = "independent-check";
 completedCheck.item.metadata.purpose = "check";
 completedCheck.item.promotion_authorized = false;
 
+function releaseRun(index: number, state: QueueItemState, tested: string, base: string, steps: [string, string, number][], elapsed: number): QueueItemView {
+  const id = `019fef58-7247-7${index}73-9c03-e6aff447a5c${index}`;
+  const generationId = `019fef58-9100-7${index}00-8000-e6aff447a5ba`;
+  const buildsetId = `019fef58-8100-7${index}00-8000-e6aff447a5ba`;
+  const failed = state === "check-failed";
+  return {
+    item: {
+      id, repository_id: "019fef58-aaaa-7000-8000-e6aff447a5ba", kind: "release", enqueue_sequence: 20 + index,
+      source_oid: oid(tested), source_ref: `refs/tollgate/sources/${id}`,
+      metadata: { subject: "Release run", message_hash: "e15bc42", author_name: "Tollgate", author_email: "dev@example.com", signature_state: "unknown", approved_at: ago(60 - index * 10), purpose: "release" },
+      state, terminal_reason: failed ? "release-run-failed" : undefined, remote_state: "disabled", cleanup_state: "not-eligible",
+      dependencies: [], promotion_authorized: false, current_generation_id: generationId, buildset_id: buildsetId,
+    },
+    generation: {
+      id: generationId, item_id: id, anchored_base_oid: oid(base), ordered_item_ids: [id], ordered_source_oids: [oid(tested)],
+      prefix_oids: [oid(tested)], expected_parent_oid: oid(base), tested_oid: oid(tested),
+      configuration_digest: "0aa71db513e868d166f3640ef91bf93c", step_graph_digest: "7d02f1c99e04ab1d", engine_epoch: 1, identity_digest: `r7d3ac0c${index}`,
+    },
+    buildset: {
+      id: buildsetId, item_id: id, validation_generation_id: generationId, tested_oid: oid(tested), expected_parent_oid: oid(base),
+      environment_fingerprint: "44acbc2fa5", state: failed ? "failed" : state === "check-passed" ? "passed" : "running", attempt: 1,
+      created_at: ago(58 - index * 10), started_at: ago(57 - index * 10), finished_at: failed || state === "check-passed" ? ago(50 - index * 10) : undefined,
+      frozen_steps: steps.map(([name]) => ({ id: `019fef58-7100-7${index}00-8000-${name.padEnd(12, "0").slice(0, 12)}`, name, command: { kind: "shell" as const, runner: ["/bin/sh", "-c"], script: name === "full" ? "cargo test --workspace" : "cargo check" }, working_directory: ".", needs: [], soft_needs: [], voting: true, final_step: false, timeout_ns: 3_600_000_000_000, cpu_tokens: 4, memory_bytes: 6442450944, semaphores: [] })),
+      step_results: steps.map(([name, result_class, elapsed_ms]) => ({ name, result_class, elapsed_ms, log_hash: "4be1f0aa", stdout_end: 9120, stderr_end: result_class === "success" ? 0 : 812 })),
+    },
+    included_items: [], elapsed_ms: elapsed,
+  };
+}
+
+const failedRelease = releaseRun(2, "check-failed", "e4a91c0", "b2cdf95", [["fast", "success", 41_000], ["full", "exit-failure", 372_000]], 413_000);
+const passedRelease = releaseRun(1, "check-passed", "b2cdf95", "9f1e2aa", [["fast", "success", 39_000], ["full", "success", 401_000]], 440_000);
+
 export const demoSnapshot: AppSnapshot = {
   version: "0.1.0",
   generated_at: now.toISOString(),
@@ -79,8 +111,8 @@ export const demoSnapshot: AppSnapshot = {
     {
       state: {
         id: "019fef58-aaaa-7000-8000-e6aff447a5ba", name: "tollgate", path: "/Users/dev/tollgate",
-        staging_ref: "refs/heads/staging", staging_oid: oid("b2cdf95"), release_ref: "refs/heads/release",
-        release_oid: oid("b2cdf95"), release_lag: { commits: 0, since: null }, release_state: "green", queue_revision: 17, event_sequence: 94,
+        staging_ref: "refs/heads/staging", staging_oid: oid("e4a91c0"), release_ref: "refs/heads/release",
+        release_oid: oid("b2cdf95"), release_lag: { commits: 3, since: ago(47) }, release_state: "failing", queue_revision: 17, event_sequence: 94,
         engine_epoch: 1, execution_state: "active", block_reasons: [], active_configuration_digest: "0aa71db513e868d166f3640ef91bf93c",
         active_window: 20, active_window_floor: 3, active_window_ceiling: 20, remote_enabled: false,
         release_block_reasons: [], promotion_pause: null,
@@ -93,6 +125,7 @@ export const demoSnapshot: AppSnapshot = {
         item(4, "queued", "Polish queue dependency visualization", "feature/queue-ui", 0),
       ],
       checks: [activeCheck, completedCheck],
+      release_runs: [failedRelease, passedRelease],
       master_push: failedMasterPush,
       history_items: [completedCheck, failedMasterPush, canceledRun, promotedRun],
       history: [
@@ -109,6 +142,7 @@ export const demoSnapshot: AppSnapshot = {
           { name: "format", command: { kind: "shell", script: "cargo fmt --check" }, working_directory: ".", needs: [], soft_needs: [], voting: true, final_step: false, reuse_on_retry: false, timeout_ns: 3_600_000_000_000, cpu_tokens: 1, memory_bytes: 268435456, semaphores: [], include: ["**/*.rs"], exclude: [], environment: {}, remove_environment: [], artifacts: [] },
           { name: "test", command: { kind: "shell", script: "cargo test --workspace" }, working_directory: ".", needs: ["format"], soft_needs: [], voting: true, final_step: false, reuse_on_retry: false, timeout_ns: 3_600_000_000_000, cpu_tokens: 4, memory_bytes: 6442450944, semaphores: [], include: [], exclude: [], environment: {}, remove_environment: [], artifacts: [] },
           { name: "clippy", command: { kind: "shell", script: "cargo clippy --all-targets" }, working_directory: ".", needs: ["format"], soft_needs: [], voting: true, final_step: false, reuse_on_retry: false, timeout_ns: 3_600_000_000_000, cpu_tokens: 2, memory_bytes: 4294967296, semaphores: [], include: [], exclude: [], environment: {}, remove_environment: [], artifacts: [] },
+          { name: "full", stage: "release", command: { kind: "shell", script: "cargo test --workspace --all-targets" }, working_directory: ".", needs: [], soft_needs: [], voting: true, final_step: false, reuse_on_retry: false, timeout_ns: 3_600_000_000_000, cpu_tokens: 4, memory_bytes: 6442450944, semaphores: [], include: [], exclude: [], environment: {}, remove_environment: [], artifacts: [] },
         ],
       },
       resources: { max_buildsets: 8, repository_concurrency: 4, cpu_tokens: 12, memory_bytes: 25769803776, active_runs: 2, queued_runs: 1, cpu_reserved: 7, memory_reserved: 10737418240, named_semaphores: { unity: 1 }, authoritative_volume_available: 128849018880, recovery_reserve: 10737418240, volumes: [{ id: "fs-2a", roles: ["artifacts", "authoritative", "database", "logs"], available_bytes: 128849018880, warning_threshold: 16106127360, critical_threshold: 10737418240, emergency_allowance: 536870912, state: "healthy" }] },

@@ -28,17 +28,20 @@ export function ItemInspector({ view, repository, onClose }: {
   }, [itemId]);
   if (!view) return null;
 
-  const status = itemStatus(view.item.state);
+  const status = itemStatus(view.item.state, view.item.kind);
+  const kindLabel = view.item.kind === "independent-check" ? "CHECK" : view.item.kind === "release" ? "RELEASE RUN" : "QUEUE ITEM";
   const steps = view.buildset?.frozen_steps ?? repository.configuration.steps;
   return <aside ref={inspector} id="item-inspector" className="inspector" role="dialog" aria-modal="true" aria-label={`Details: ${view.item.metadata.subject}`} tabIndex={-1}>
-    <header className="inspector__top"><div><StatusGlyph state={view.item.state} /><span><small>{view.item.kind === "independent-check" ? "CHECK" : "QUEUE ITEM"}</small><strong>{status.label}</strong></span></div><Button variant="ghost" size="icon" onClick={onClose} aria-label="Close details"><X /></Button></header>
+    <header className="inspector__top"><div><StatusGlyph state={view.item.state} kind={view.item.kind} /><span><small>{kindLabel}</small><strong>{status.label}</strong></span></div><Button variant="ghost" size="icon" onClick={onClose} aria-label="Close details"><X /></Button></header>
     <div className="inspector__content">
       <section className="inspector__heading"><h2>{view.item.metadata.subject}</h2><p>{view.item.metadata.branch ?? "Detached source"} · <code>{shortId(oidHex(view.item.source_oid), 10)}</code></p></section>
       <dl className="detail-list">
         <div><dt>Elapsed</dt><dd>{formatDuration(view.elapsed_ms)}</dd></div>
         <div><dt>Attempt</dt><dd>{view.buildset?.attempt ?? "—"}</dd></div>
         <div><dt>Tested commit</dt><dd><code>{shortId(oidHex(view.generation?.tested_oid), 10) || "—"}</code></dd></div>
-        <div><dt>Promotion</dt><dd>{view.item.promotion_authorized ? "Authorized" : "Not authorized"}</dd></div>
+        {view.item.kind === "release"
+          ? <div><dt>Range</dt><dd><code>{shortId(oidHex(view.generation?.anchored_base_oid), 8)}..{shortId(oidHex(view.generation?.tested_oid), 8)}</code></dd></div>
+          : <div><dt>Promotion</dt><dd>{view.item.promotion_authorized ? "Authorized" : "Not authorized"}</dd></div>}
       </dl>
       {view.item.terminal_reason && <div className="notice"><strong>{view.item.terminal_reason}</strong></div>}
       <section className="steps"><h3>Steps</h3>{steps.map((step) => { const result = view.buildset?.step_results.find((candidate) => candidate.name === step.name); const failed = result && !["success", "running", "pending", "skipped"].includes(result.result_class); return <div key={step.name}><span className={`step-state ${result?.result_class === "success" ? "is-success" : failed ? "is-failure" : result ? "is-active" : ""}`} /><strong>{step.name}</strong><small>{result ? `${result.result_class}${result.reused_from_attempt_id ? " (reused)" : ""} · ${formatDuration(result.elapsed_ms)}` : "waiting"}</small></div>; })}</section>
