@@ -10067,7 +10067,7 @@ impl TollgateService {
             return self.repository_snapshot(repository_id).await;
         }
         // A release advance that froze a push owes it to the configured remote until the push
-        // lands, `tg push` publishes it, or `tg reconcile` abandons it (section 9).
+        // lands, `tg push` publishes it, or `tg reconcile` abandons it (technical-design.md 10.9).
         let release_push_owed = runtime
             .store
             .recoverable_operations(&[tollgate_store::RELEASE_ADVANCE_INTENT_KIND])?
@@ -14543,7 +14543,7 @@ impl TollgateService {
     }
 
     /// Settles outstanding release-run intents and keeps release runs coalesced to the newest
-    /// `staging` tip (staged-release-design.md 8.2), under the repository mutation lock but never
+    /// `staging` tip (technical-design.md 12.7), under the repository mutation lock but never
     /// inside a promotion's: it runs in its own task, spawned after the lock is released.
     async fn trigger_release_run(
         self: &Arc<Self>,
@@ -16691,7 +16691,7 @@ fn promotion_activated_configuration(
 }
 
 /// Whether release run `item_id` may start. A repository runs at most one release run at a time
-/// (staged-release-design.md 8.2), whatever its `release_concurrency` permit count, and starts
+/// (technical-design.md 12.7), whatever its `release_concurrency` permit count, and starts
 /// them in queue order: only the oldest active release run may start, and it stays the oldest
 /// until it ends. With the trigger's coalescing, this keeps at most one started and one queued
 /// release run per repository and delivers their outcomes in target order.

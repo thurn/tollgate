@@ -1,13 +1,13 @@
-//! Release surfaces (staged-release-design.md section 11): the release status that `tg status`,
-//! `tg release status`, and the desktop Release panel report, `tg release retry`, and the target
-//! resolution behind `tg wait --released`.
+//! Release surfaces (technical-design.md 16.1, 16.2, 17.4, and 17.7): the release status that
+//! `tg status`, `tg release status`, and the desktop Release panel report, `tg release retry`, and
+//! the target resolution behind `tg wait --released`.
 //!
-//! `tg release retry` reruns the newest `staging` tip as a `Release`-kind run (section 8.5). It
-//! covers what the automatic trigger never requeues: a tip whose latest run failed or was
+//! `tg release retry` reruns the newest `staging` tip as a `Release`-kind run (technical-design.md
+//! 12.7). It covers what the automatic trigger never requeues: a tip whose latest run failed or was
 //! canceled, and a tip that `release` already holds without a passing run under the active
-//! release-stage digest (after a release-stage configuration change or an uncertified
-//! adoption), which `tg push` refuses to publish. The run and the command result commit in one
-//! transaction, so a replay of the command after a crash returns the run it queued.
+//! release-stage digest (after a release-stage configuration change or an uncertified adoption),
+//! which `tg push` refuses to publish. The run and the command result commit in one transaction, so
+//! a replay of the command after a crash returns the run it queued.
 
 use super::*;
 use tollgate_store::ReleaseTriggerCommand;
@@ -309,7 +309,8 @@ pub struct ReleaseWaitStatus {
 }
 
 impl TollgateService {
-    /// `tg release retry`: reruns the newest `staging` tip as a release run (section 8.5).
+    /// `tg release retry`: reruns the newest `staging` tip as a release run (technical-design.md
+    /// 12.7).
     ///
     /// Under the mutation lock, a normal release trigger pass first coalesces runs and retires
     /// those frozen under another release-stage digest. Then:

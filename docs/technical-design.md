@@ -1,6 +1,6 @@
 # Tollgate Technical Design
 
-Status: proposed v1 design | Date: 2026-08-10 | Product: Tollgate desktop application and `tg` CLI
+Status: v1 design | Date: 2026-08-10 | Product: Tollgate desktop application and `tg` CLI
 
 ## 1. Summary
 
@@ -12,6 +12,8 @@ The non-negotiable invariant is:
 
 > Every commit that Tollgate writes to local `refs/heads/staging` or `refs/heads/release` or pushes to the configured remote branch is the exact Git object ID for which every applicable voting validation completed successfully under the frozen configuration for that item's validation generation.
 
+Validation runs in two stages. The gate stage certifies every promotion to `staging`, the integration branch that feature work bases on. An optional release stage runs afterwards on the newest `staging` tip, off every candidate's critical path: a passing release run moves `release` to exactly its tested OID, and only `release` is pushed to the remote. A release failure never rolls anything back. `staging` keeps moving, the fix lands as an ordinary follow-up commit, and the next passing release run advances `release` past the broken commit. A repository without release-stage steps moves `staging` and `release` together on every promotion (sections 10.9 and 12.7).
+
 Tollgate maximizes incremental build reuse with persistent detached Git worktree slots, preserved ignored files, APFS clone-on-write seed snapshots, slot affinity, and optional use of already-installed shared caches such as `sccache`. The execution engine remains language-agnostic: a validation step is primarily a name and a shell command. Data-driven initialization templates may propose commands for Rust, Node, Python, Unity, or mixed repositories, but the scheduler has no language-specific test logic.
 
 ## 2. Goals
@@ -22,6 +24,7 @@ Tollgate maximizes incremental build reuse with persistent detached Git worktree
 - Prevent unvalidated commits from being promoted by Tollgate to local `staging`, local `release`, or remote `master`.
 - Apply Zuul's dependent-gate semantics to local branches and worktrees.
 - Keep the common path small: create a worktree, make one commit, run `tg approve`, and continue working.
+- Keep promotion fast: a cheap gate stage certifies promotion to `staging`, and an optional slow release stage validates the newest `staging` tip before it reaches remote `master`.
 - Make queue state, running capacity, steps, logs, timing, failures, promotion, push state, and history legible in the desktop UI.
 - Make the same operational capabilities available through `tg` for scripts and fast interaction.
 - Survive application crashes, explicit quits, restarts, external Git movement, and partial promotion/push operations without accepting a stale result.
@@ -53,6 +56,7 @@ Tollgate maximizes incremental build reuse with persistent detached Git worktree
 - Early failure detection by matching streamed output.
 - A general replacement for Git. `tg` wraps only operations where gate-aware behavior provides a concrete safety guarantee.
 - Telemetry, analytics, remote log upload, or automatic crash reporting.
+- Automatic revert or bisection of a failing release run, per-commit release evidence (`release` may advance past a commit whose own release run failed once a later tip passes), or more than two validation stages.
 
 ## 4. Terms
 
@@ -70,6 +74,15 @@ Tollgate maximizes incremental build reuse with persistent detached Git worktree
 | Slot | A persistent detached worktree in the execution mirror, including its retained ignored files. One slot owns an entire buildset at a time. |
 | Seed | An immutable published APFS clone generation of eligible ignored artifacts captured at a safe successful boundary. It preserves original cache metadata for later writable slot clones and is never modified in place. |
 | Pass certificate | Durable evidence tying one tested OID and validation generation to all required successful step results. |
+| `staging` | The Tollgate-owned integration branch. Every promotion advances it with a compare-and-swap, and feature worktrees, `tg update`, and the gated queue base on it. |
+| `release` | The Tollgate-owned released branch. It is `staging` or a first-parent ancestor of it, and it is the only source of remote pushes. |
+| Gate stage | The steps with `stage = "gate"` (the default). Gate runs certify promotion to `staging`. |
+| Release stage | The steps with `stage = "release"`. Release runs certify `release` advances. A repository without release-stage steps is opt-out: `staging` and `release` move together. |
+| Release run | A queue item of kind `release`: one buildset of the release stage on one exact `staging` OID. It never promotes. |
+| Release certificate | The pass certificate of a passed release run: the tested OID, every successful voting result, and the frozen release-stage graph digest. |
+| Release advance | The compare-and-swap of `release` to the newest release-certified `staging` commit, followed by its leased push when pushing is enabled. |
+| Release lag | The first-parent commits on `staging` that `release` does not contain, and how long `staging` has been ahead. |
+| Release hold | A release block reason (`push-blocked`, `remote-preflight-mismatch`, `release-range-unattributed`) that holds back release advances without blocking the repository. |
 | Structural staleness | Invalidity caused by a changed OID, parent, queue prefix/order, configuration, applicable voting-step graph, or promotion base. Age alone is not staleness. |
 
 ## 5. Normative invariants
@@ -80,13 +93,13 @@ The implementation must make the following invariants explicit in domain types, 
 
 For every completed Tollgate promotion event, all of the following are true:
 
-- `staging`'s new OID equals the pass certificate's tested OID, and `release` moves to the same OID in the same ref transaction.
+- `staging`'s new OID equals the pass certificate's tested OID. In an opt-out repository `release` moves to the same OID in the same ref transaction; with release-stage steps the transaction verifies `release` at its persisted OID and leaves it there.
 - The new commit's first and only parent equals `staging`'s OID immediately before promotion.
 - The certificate belongs to the current queue head and matches that item's currently assigned validation generation.
 - Every applicable voting step in the frozen step graph has a successful terminal result.
 - The tracked checkout and initialized submodules matched the tested commit after validation.
 - The frozen configuration and step-graph digests still match the item's validation generation.
-- The ref update compared the actual old `staging` and `release` OIDs with the expected OID and succeeded atomically.
+- The ref update compared the actual old `staging` and `release` OIDs with their expected OIDs and succeeded atomically.
 
 There is no merge, cherry-pick, amend, signing, message edit, or commit creation after validation and before promotion.
 
@@ -122,6 +135,16 @@ Remote push never overwrites an unexpected remote OID. A push uses an exact leas
 
 Cleanup, reset, pruning, and cache operations resolve and verify Tollgate-owned paths before mutation. They never delete a primary developer worktree, authoritative Git data, audit metadata, or a branch whose OID has moved since approval.
 
+### R1–R5. Staged release
+
+These invariants govern `release` in a repository with release-stage steps (sections 10.9 and 12.7). Domain property tests drive them through random interleavings of promotions, release passes and failures, crashed advances, restarts, pulls, pushes, and external movement (section 21.1).
+
+- **R1. Ancestry.** `release` is always `staging` or a first-parent ancestor of it. Both are linear.
+- **R2. Exact release.** For every `release` advance: the new OID is the tested OID of a release certificate whose buildset verified a clean checkout and whose sealed logs are intact; it descends from the old `release` and is an ancestor of, or equal to, current `staging`; every first-parent commit in `old..new` was promoted to `staging` by Tollgate or adopted by an explicit `tg reconcile` (the provenance rule); and the certificate's release-stage graph digest equals both the active configuration's and that of the configuration on disk.
+- **R3. No rollback.** A release outcome never moves `staging` or `release` backwards and never cancels or invalidates gate work.
+- **R4. Remote follows `release`.** The remote push publishes only `release` OIDs that R2 admitted, or that `tg push` re-verifies against a release certificate under the active release-stage digest. Each push uses an exact lease on the observed remote OID, which must lie in Tollgate-certified history below the pushed OID, so the remote never moves backwards. I8 applies to that push.
+- **R5. Opt-out equivalence.** With no release-stage steps, every Tollgate ref change updates `staging` and `release` to the same OID in one `update-ref --stdin` transaction, and promotion pushes as in section 10.4.
+
 ## 6. User and application model
 
 ### 6.1 Application lifecycle
@@ -150,9 +173,11 @@ The app may supervise several repositories concurrently using one global resourc
 
 Initialization leaves the developer's checkout unchanged and creates local `staging` and `release` at the exact local `master` OID in one ref transaction. Tollgate exclusively owns both refs; neither may be checked out in any worktree while the repository is active, and a checkout of either blocks the repository (`staging-checked-out` or `release-checked-out`).
 
-`release` is always `staging` or a first-parent ancestor of it. A repository with no release-stage steps is opt-out: every Tollgate ref change updates `staging` and `release` to the same OID in one `update-ref --stdin` transaction that verifies both expected old OIDs, so the two refs hold the same OID after every event, nothing is unreleased, and the persisted repository state records equal `staging_oid` and `release_oid`. Where this document describes promoted or certified `release` history for such a repository, it describes `staging` equally. A repository with release-stage steps promotes to `staging` alone, in a transaction that moves `staging` and verifies `release` at its expected OID, so `release` trails `staging` (section 12.7). In this version nothing advances `release` in such a repository: release runs record their verdicts, and `release` and the remote stay at their last released OID. An opt-out promotion in a repository whose `release` still trails, because its configuration dropped its release stage, moves `release` to the promoted OID with `staging`. Debug builds assert on every persisted repository projection that the release projection agrees with the refs, and for opt-out repositories that `staging` equals `release`. [staged-release-design.md](staged-release-design.md) describes the rest of the staged-release design.
+`release` is always `staging` or a first-parent ancestor of it. A repository with no release-stage steps is opt-out: every Tollgate ref change updates `staging` and `release` to the same OID in one `update-ref --stdin` transaction that verifies both expected old OIDs, so the two refs hold the same OID after every event, nothing is unreleased, and the persisted repository state records equal `staging_oid` and `release_oid`. Where this document describes promoted or certified `release` history for such a repository, it describes `staging` equally. A repository with release-stage steps promotes to `staging` alone, in a transaction that moves `staging` and verifies `release` at its expected OID, so `release` trails `staging` (section 12.7). There a promotion requests a release run on the newest `staging` tip, and only a release advance moves `release`: to exactly the tested OID of a passed release run, which it then pushes when pushing is enabled (section 10.9). An opt-out promotion in a repository whose `release` still trails, because its configuration dropped its release stage, moves `release` to the promoted OID with `staging`. Debug builds assert on every persisted repository projection that the release projection agrees with the refs, and for opt-out repositories that `staging` equals `release`. Invariants R1–R5 (section 5) govern `release` in a repository with release-stage steps.
 
-Repositories registered while `release` was the only Tollgate ref migrate during startup activation, under the repository ownership lock and before recovery: Tollgate creates `staging` at the current `release` OID with an expected-nonexistent compare-and-swap (an existing `staging` is accepted only at exactly that OID), keeps every active validation generation (generations anchor to OIDs, not ref names, so none is invalidated), and persists the new ref names together with a `refs.staged-release-migrated` event listing the re-anchored generations. Local `master` remains user-owned, may track `origin/master`, and may be committed to or pushed through ordinary Git. After a certified local promotion, or after its exact remote push when pushing is enabled, Tollgate fast-forwards local `master` by default. If a clean checked-out `master` has instead diverged through a linear range of unsubmitted commits, Tollgate rebases that range onto the new certified `release` without submitting or authorizing it; conflicts, merge commits, concurrent movement, and dirty state leave the original checkout intact and produce a non-blocking needs-attention result. For active items captured directly from `master`, Tollgate retains their current speculative tested object in the authoritative repository and may project the last such item onto that exact object whenever certified history advances. The expected-old transaction accepts only the unchanged source tip or one of that item's prior generated tips, so newly certified commits appear beneath the submitted work without overwriting later user commits. A checked-out `master` is updated only when its index and worktree are clean; a non-checked-out `master` uses an expected-old ref transaction but is not automatically rebased. Git reports linked worktree roots nested beneath the primary checkout as untracked directories, so the synchronization safety check excludes only exact nested paths that are still registered, directly discoverable worktrees of the same repository. Every other staged, modified, or non-ignored untracked path blocks synchronization and is included in the needs-attention event. `sync_user_master = false` opts out. Direct pushes are explicitly uncertified external movement; Tollgate's remote lease detects them and requires adoption into `release` before certified promotion continues.
+Repositories registered while `release` was the only Tollgate ref migrate during startup activation, under the repository ownership lock and before recovery: Tollgate creates `staging` at the current `release` OID with an expected-nonexistent compare-and-swap (an existing `staging` is accepted only at exactly that OID), keeps every active validation generation (generations anchor to OIDs, not ref names, so none is invalidated), and persists the new ref names together with a `refs.staged-release-migrated` event listing the re-anchored generations.
+
+Local `master` remains user-owned, may track `origin/master`, and may be committed to or pushed through ordinary Git. By default Tollgate fast-forwards it to the Tollgate ref that `sync_user_master` names (section 11.2), `staging` unless configured otherwise. Without release-stage steps both refs move together, and synchronization follows a certified local promotion, or its exact remote push when pushing is enabled. With release-stage steps, `"staging"` synchronizes local `master` as soon as a promotion moves `staging`, so local `master` may be ahead of the remote, and `"release"` synchronizes it when a release advance moves `release`. A `tg push` that publishes a pending promotion synchronizes it to the configured ref as well. If a clean checked-out `master` has instead diverged through a linear range of unsubmitted commits, Tollgate rebases that range onto the newly certified OID without submitting or authorizing it; conflicts, merge commits, concurrent movement, and dirty state leave the original checkout intact and produce a non-blocking needs-attention result. For active items captured directly from `master`, Tollgate retains their current speculative tested object in the authoritative repository and may project the last such item onto that exact object whenever certified history advances. The expected-old transaction accepts only the unchanged source tip or one of that item's prior generated tips, so newly certified commits appear beneath the submitted work without overwriting later user commits. A checked-out `master` is updated only when its index and worktree are clean; a non-checked-out `master` uses an expected-old ref transaction but is not automatically rebased. Git reports linked worktree roots nested beneath the primary checkout as untracked directories, so the synchronization safety check excludes only exact nested paths that are still registered, directly discoverable worktrees of the same repository. Every other staged, modified, or non-ignored untracked path blocks synchronization and is included in the needs-attention event. `sync_user_master = false` opts out. Direct pushes are explicitly uncertified external movement; Tollgate's remote lease detects them and requires adoption through `tg pull` before certified pushing continues: before the next promotion in an opt-out repository with pushing enabled, and before the next release advance with release-stage steps.
 
 ### 6.3 Normal workflow
 
@@ -161,7 +186,8 @@ Repositories registered while `release` was the only Tollgate ref migrate during
 3. `tg candidate` captures `HEAD`, validates its shape and dependencies, creates `refs/tollgate/sources/<item-id>`, durably enqueues a non-promotable item, and returns its ID. `--retain-worktree` captures an immutable retained cleanup policy for workflows that continue using the same source worktree after promotion. `tg approve HEAD` remains a combined submit-and-authorize convenience and accepts the same policy.
 4. The app constructs synthetic prefixes, assigns new validation generations to affected items, and schedules eligible buildsets.
 5. `tg approve <candidate-id>` durably grants promotion authority to that exact retained source. Ordinary worktree candidates have no active source dependencies. For the explicit `push-master` workflow, authority covers the submitted local commit's active ancestor closure as one queue-revision transaction. The authorized candidate or closure may temporarily bypass unrelated unauthorized items. Candidate-ID approvals serialize against the current authoritative queue even when clients submit the same expected revision; their commit order becomes the relative order of independently authorized candidates. Tollgate reactivates only exact completed generations whose complete validation identity and certificate still match that order. A passing authorized head is promoted automatically, so an unrelated candidate awaiting human authority cannot indefinitely block approved work.
-6. After local promotion, or after push succeeds when push is enabled, Tollgate synchronizes user-owned local `master` under the safe default-on policy, then automatically cleans up the source worktree and branch if all safety checks still pass.
+6. After local promotion, Tollgate synchronizes user-owned local `master` under the safe default-on policy (section 6.2), then automatically cleans up the source worktree and branch if all safety checks still pass. In an opt-out repository with pushing enabled, both wait for the exact remote push.
+7. With release-stage steps, the promotion also requests a release run on the newest `staging` tip (section 12.7). A passing run advances `release` to exactly its tested OID and pushes it (section 10.9). `tg wait --released` waits for that outcome; a failing run is repaired by an ordinary follow-up candidate.
 
 Automatic cleanup requires a non-primary linked worktree that is still at the captured source OID and has no tracked, staged, or non-ignored untracked changes. Branch deletion is an old-OID compare-and-swap. Ignored files in an eligible linked worktree are disposable by default. A retained-worktree candidate finishes promotion with cleanup `not-eligible`, preserving its recorded worktree and branch. Candidate authorization and retry preserve the captured cleanup policy. If any automatic cleanup check fails, cleanup becomes `needs-attention`; promotion is never rolled back. The hidden source ref retains the commit for audit.
 
@@ -209,7 +235,7 @@ The app exposes one `SOCK_STREAM` Unix-domain socket in the per-user application
 
 The v1 wire protocol uses a fixed magic, protocol version, frame kind, flags, correlation ID, and unsigned 32-bit big-endian payload length. Control JSON frames are limited to 8 MiB; binary log frames are limited to 1 MiB; zero length is permitted only for defined control kinds. A length over the negotiated maximum, unknown mandatory frame kind, malformed UTF-8/JSON, duplicate live correlation ID, or payload/declared-length mismatch closes the connection and emits no command. State-changing requests carry client-instance and command UUIDs and receive exactly one stored idempotent response.
 
-Request/response frames coexist with resumable event streams. A subscription supplies repository event sequence and per-log-stream offsets. The server returns contiguous durable frames after those positions or an explicit `gap/pruned` response with the earliest available offset; it never silently jumps. High-volume log frames contain repository ID, run/attempt ID, stream, per-stream byte offset, broker observation sequence, and payload. Every handshake identifies CLI version, protocol range, app version, JSON schema version (currently 4), maximum frame sizes, and supported frame kinds. The highest mutually supported protocol version is selected; no overlap fails before commands with a structured upgrade instruction. The JSON schema version must match exactly, because payloads of different schema versions rename fields. The app answers a client of another schema version with a handshake acknowledgement carrying a structured `schema-version-mismatch` rejection and then answers every request on that connection with the same error, running none of them, so even a client too old to read the rejection reports it as a command error. `tg` compares the acknowledged schema version itself as well, so it refuses an app from before this negotiation. The rejection says which side to upgrade: an older `tg` is upgraded to the version bundled with the app, and an older running app is quit and restarted.
+Request/response frames coexist with resumable event streams. A subscription supplies repository event sequence and per-log-stream offsets. The server returns contiguous durable frames after those positions or an explicit `gap/pruned` response with the earliest available offset; it never silently jumps. High-volume log frames contain repository ID, run/attempt ID, stream, per-stream byte offset, broker observation sequence, and payload. Every handshake identifies CLI version, protocol range, app version, JSON schema version (currently 5), maximum frame sizes, and supported frame kinds. The highest mutually supported protocol version is selected; no overlap fails before commands with a structured upgrade instruction. The JSON schema version must match exactly, because payloads of different schema versions rename fields. The app answers a client of another schema version with a handshake acknowledgement carrying a structured `schema-version-mismatch` rejection and then answers every request on that connection with the same error, running none of them, so even a client too old to read the rejection reports it as a command error. `tg` compares the acknowledged schema version itself as well, so it refuses an app from before this negotiation. The rejection says which side to upgrade: an older `tg` is upgraded to the version bundled with the app, and an older running app is quit and restarted.
 
 The Tauri frontend calls the same `tollgate-service` handlers in-process. Tauri commands are used for bounded request/response operations; Tauri channels carry ordered logs and state changes. Generated TypeScript types and a checked-in protocol schema prevent Rust/UI drift.
 
@@ -261,16 +287,16 @@ Required database policy:
 
 The v1 schema must represent each of these logical entities. Migrations may split an entity across tables or add indexes/materialized read models, but may not omit an entity or merge the independent state dimensions defined below into one overloaded status:
 
-- `repository_state`: repository UUID, schema/engine epoch, the `staging` and `release` ref names and OIDs, release lag and release state, queue revision, pause/block state, and active configuration digest.
-- `queue_items`: UUIDv7/short ID, source OID/ref/worktree snapshot, source metadata, enqueue order, queue-item state, terminal reason, immutable cleanup policy, and separate remote and cleanup states.
+- `repository_state`: repository UUID, schema/engine epoch, the `staging` and `release` ref names and OIDs, release lag and release state, release block reasons and the `max_release_lag` promotion pause, queue revision, pause/block state, and active configuration digest.
+- `queue_items`: UUIDv7/short ID, kind (`gate`, `independent-check`, or `release`), source OID/ref/worktree snapshot, source metadata, enqueue order, queue-item state, terminal reason, immutable cleanup policy, release-fix flag, the run a retry repeats, and separate remote and cleanup states.
 - `item_dependencies`: hard Git dependency edges.
-- `source_promotions`: permanent exact mapping from queue item/source OID to promoted synthetic OID, old `release` OID, certificate, and promotion event.
+- `source_promotions`: permanent exact mapping from queue item/source OID to promoted synthetic OID, old `staging` OID, certificate, and promotion event. These promotion edges are the provenance that R2 checks.
 - `validation_generations`: item, anchored base OID, ordered prefix/digest through the item, dependency inputs, prefix OIDs, configuration and step-graph digests, engine epoch, and invalidation lineage.
 - `buildsets`: item/validation generation, exact tested OID and parent, environment snapshot fingerprint, slot, status, `retry_of_buildset_id`, and whole-buildset attempt number.
 - `steps` and `step_attempts`: frozen command/resource data, timing, result class, exit/signal/timeout, log ranges, retry number.
-- `pass_certificates`: tested OID, all validity inputs, successful voting result set, tracked-clean result, creation event.
+- `pass_certificates`: tested OID, all validity inputs, successful voting result set, tracked-clean result, creation event. A release run's certificate is a release certificate; its step-graph digest is the release-stage graph digest.
 - `configuration_snapshots`: schema version, canonical effective bytes, configuration and step-graph digests, activation event, and supersession lineage.
-- `operation_intents`: typed approval, tested-object, result, promotion, push, cleanup, artifact, seed, pruning, backup, and migration intents with expected identities/old values, independent intent state, timestamps, attempts, and recovery evidence. Promotion and push may use specialized child tables for their OID fields.
+- `operation_intents`: typed approval, tested-object, result, promotion, push, release-run (the trigger request a promotion records), release-advance (the release intent with its frozen push), reconcile, cleanup, artifact, seed, pruning, backup, and migration intents with expected identities/old values, independent intent state, timestamps, attempts, and recovery evidence. Promotion and push may use specialized child tables for their OID fields.
 - `slots`, `seed_generations`, and `cache_manifests`: ownership paths, compatibility keys, source OIDs, logical size, last use, health.
 - `artifacts`: run/step, source path, retained path, hash, size, retention/pin state, and a needs-attention record for each artifact whose pruning failed.
 - `log_streams` and `log_chunks`: run/step/stream identity, per-stream offsets, broker sequences, sealed chunk hashes, compression/pruning state, and retained range metadata.
@@ -328,9 +354,9 @@ All Tollgate-internal plumbing operations, including mirror fetches, synthetic c
 - the integration branch exists and is not checked out;
 - the selected worktree has no staged changes, tracked modifications, or non-ignored untracked files;
 - the resolved source is one commit object with exactly one parent;
-- the source is not already an ancestor of `release`;
+- the source is not already an ancestor of `staging`;
 - the source OID is not already active in the queue;
-- an ordinary candidate has no unmerged source ancestor: its single task commit is based only on promoted `release` history;
+- an ordinary candidate has no unmerged source ancestor: its single task commit is based only on promoted `staging` history;
 - the explicit `push-master` workflow may preserve unmerged ancestors from the user's already-authored linear local commit chain while submitting that chain oldest-first;
 - effective configuration is valid enough to construct a gate buildset.
 
@@ -348,14 +374,14 @@ Re-approving a changed OID from the same source branch follows Zuul's new-patchs
 
 ### 9.3 Hard Git dependencies
 
-Queue order alone creates a speculative relationship, not a hard dependency. Ordinary worktree candidates may not create hard dependencies: their source commit must remain based only on promoted `release`. Tollgate can still synthesize clean combinations internally for validation without exposing those speculative commits as supported source bases.
+Queue order alone creates a speculative relationship, not a hard dependency. Ordinary worktree candidates may not create hard dependencies: their source commit must remain based only on promoted `staging`. Tollgate can still synthesize clean combinations internally for validation without exposing those speculative commits as supported source bases.
 
-The explicit `push-master` workflow is the exception because it submits a user-owned linear sequence that already exists beyond `release`. For source B in that workflow, Tollgate walks from B's parent through first-parent ancestry until it reaches a literal ancestor of current `release`. Every intervening commit is resolved by exact OID, never by branch name, patch ID, or content similarity:
+The explicit `push-master` workflow is the exception because it submits a user-owned linear sequence that already exists beyond `staging`. For source B in that workflow, Tollgate walks from B's parent through first-parent ancestry until it reaches a literal ancestor of current `staging`. Every intervening commit is resolved by exact OID, never by branch name, patch ID, or content similarity:
 
 - An OID matching an active queue item's source OID creates an active hard-dependency edge.
 - An OID matching a prefix in a current validation generation can recover the corresponding dependency chain only for the controlled `push-master` submission sequence; ordinary candidates reject it as unpromoted source ancestry.
-- An OID matching a promoted item's source OID is a satisfied dependency only when that item's recorded promoted synthetic OID is a literal ancestor of current `release`.
-- An OID matching only an invalidated, failed, canceled, superseded, or otherwise historical speculative generation returns a retryable result whose only supported recovery base is current promoted `release`.
+- An OID matching a promoted item's source OID is a satisfied dependency only when that item's recorded promoted synthetic OID is a literal ancestor of current `staging`.
+- An OID matching only an invalidated, failed, canceled, superseded, or otherwise historical speculative generation returns a retryable result whose only supported recovery base is current promoted `staging`.
 - An unknown OID returns an actionable source-ancestry rejection rather than silently approving additional code or escaping as an internal invariant failure.
 
 Tollgate retains the durable mapping from each promoted source OID to its exact promoted synthetic OID indefinitely with audit metadata. This allows B, whose original parent is source A, to recognize that dependency after A has landed as synthetic commit `S_A`. Satisfied dependencies remain historical provenance but no longer constrain active queue order; active edges do.
@@ -371,7 +397,7 @@ Hard dependencies impose these rules:
 
 The execution mirror is initialized as a disposable bare repository and is never treated as authoritative. Before constructing affected validation generations, the Git adapter ensures that the mirror contains:
 
-- the exact observed authoritative local `release` OID;
+- the exact observed authoritative local `staging` OID;
 - every active source OID and its required ancestry;
 - any submodule/config objects needed for checkout according to normal Git behavior;
 - internal mirror refs under `refs/tollgate/` that make active synthetic objects reachable.
@@ -382,7 +408,7 @@ Every current speculative generation also has an authoritative retention ref und
 
 ### 9.5 Synthetic prefix construction
 
-Let `M0` be the observed local `release`, and let source commits be A, B, and C in queue order. Tollgate constructs one shared linear prefix chain for the affected queue suffix:
+Let `M0` be the observed local `staging`, and let source commits be A, B, and C in queue order. Tollgate constructs one shared linear prefix chain for the affected queue suffix:
 
 - `S_A = transplant(A, M0)`
 - `S_B = transplant(B, S_A)`
@@ -408,7 +434,7 @@ Builder commands use only the recorded Git-semantics profile. The test suite con
 
 Every queue mutation advances the repository's monotonic queue revision. Commands use that revision to reject stale reorder, cancellation, cleanup, and other impact-sensitive requests. A queue revision is not evidence that code must be retested.
 
-Candidate submission captures the revision used for ancestry classification and synthesis, then compares it again inside the same SQLite transaction that makes the queue item visible. Ordinary candidates accept only promoted `release` ancestry; a prefix already promoted into `release` is authoritative history, while an unpromoted prefix is rejected as internal speculative state. A synthetic construction conflict or empty application is a durable terminal candidate outcome, not a submission error; the transaction stores the retained source and `candidate.created` event without inventing a validation generation. Any lost compare-and-swap returns structured stale-queue data whose recovery points only to promoted `release`. Queue promotion, extension, cancellation, supersession, or replacement must never surface as an internal service invariant failure.
+Candidate submission captures the revision used for ancestry classification and synthesis, then compares it again inside the same SQLite transaction that makes the queue item visible. Ordinary candidates accept only promoted `staging` ancestry; a prefix already promoted into `staging` is authoritative history, while an unpromoted prefix is rejected as internal speculative state. A synthetic construction conflict or empty application is a durable terminal candidate outcome, not a submission error; the transaction stores the retained source and `candidate.created` event without inventing a validation generation. Any lost compare-and-swap returns structured stale-queue data whose recovery points only to promoted `staging`. Queue promotion, extension, cancellation, supersession, or replacement must never surface as an internal service invariant failure.
 
 Each active item is instead assigned an immutable validation generation identified by a digest of:
 
@@ -423,7 +449,7 @@ Appending or changing an item after a given item does not change that earlier it
 
 Successful promotion advances the queue revision and removes the promoted head from the active queue, but it does not change a surviving descendant's validation generation when the descendant's expected parent is the exact promoted OID and every other validation input remains unchanged. The descendant keeps its existing buildset and certificate. Candidate authorization likewise reuses a completed certificate only when it belongs to the exact generation selected by the current plan. A retained generation may become current again when the queue returns to precisely the same complete validation identity before a conflicting promotion; this is reactivation of the original generation and certificate, not transfer to a differently identified generation. The authorization event records every restored item. A later reconstruction may use the promoted OID as a new anchor, but it cannot transfer an old certificate to different inputs.
 
-Authorization priority, cancellation/dequeue, conclusive failure, conflict, re-approval, retry enqueue, and manual reorder recompute only affected validation generations. An accepted external `release` movement or adopted remote-base movement, an applied configuration change, an engine-epoch change, or recovery that cannot prove inputs unchanged invalidates every affected unpromoted generation.
+Authorization priority, cancellation/dequeue, conclusive failure, conflict, re-approval, retry enqueue, and manual reorder recompute only affected validation generations. An accepted external `staging` movement or adopted remote-base movement, an applied configuration change, an engine-epoch change, or recovery that cannot prove inputs unchanged invalidates every affected unpromoted generation.
 
 ### 9.7 Zuul-style queue behavior
 
@@ -434,7 +460,7 @@ The gate follows Zuul's dependent-pipeline behavior:
 - Authorization is an ordering decision. Already-authorized candidates retain their relative order, and each newly authorized independent candidate follows them; concurrent authorization therefore promotes in authorization order. Queue reconstruction may reuse retained evidence only when its complete validation identity still matches that order.
 - Manual reorder (`tg reorder`) replaces the admission-order baseline, preserves the dependency DAG, and restarts every item whose prefix changed. Later authorization convergence respects that explicit order.
 - Each eligible item is tested with every active item ahead of it when their independent patches compose cleanly inside Tollgate's disposable builder.
-- An independent candidate that conflicts with the current speculative prefix is retained and validated in a separate lane anchored directly to promoted `release`. Authorization can prioritize a contender without changing either source commit; after promotion, incompatible lanes become merge-conflicted against the new base. If the separate lane cannot be constructed against promoted `release`, submission still creates a terminal `merge-conflict` item with no generation or tested OID.
+- An independent candidate that conflicts with the current speculative prefix is retained and validated in a separate lane anchored directly to promoted `staging`. Authorization can prioritize a contender without changing either source commit; after promotion, incompatible lanes become merge-conflicted against the new base. If the separate lane cannot be constructed against promoted `staging`, submission still creates a terminal `merge-conflict` item with no generation or tested OID.
 - A speculative composition conflict never instructs or permits a source worktree to adopt an internal prefix.
 - A conclusive failure or merge conflict removes that item from the active queue.
 - Affected independent descendants discard their results and restart without the failed item.
@@ -449,12 +475,13 @@ Each repository maintains a Zuul-style adaptive active window. The initial windo
 
 V1 uses separate closed enums for independent state dimensions. Repository execution state is `active`, `paused`, `configuration-pending`, or `blocked`; pause and block never overwrite an item's actual validation state. A block has one or more typed reasons and recorded recovery actions.
 
-Queue-item state is exactly:
+Queue items have kind `gate` (the dependent gate), `independent-check` (section 12.6), or `release` (section 12.7). Queue-item state is exactly:
 
 - pre-promotion: `constructing`, `queued`, `preparing`, `running`, `ready`, `promoting`;
 - locally integrated: `promoted-local-push-pending`, used only after local CAS when remote push is enabled;
 - terminal success: `promoted`, `externally-integrated`;
-- terminal non-success: `failed`, `merge-conflict`, `dependency-failed`, `canceled`, `superseded`, `infrastructure-exhausted`.
+- terminal non-success: `failed`, `merge-conflict`, `dependency-failed`, `canceled`, `superseded`, `infrastructure-exhausted`;
+- terminal outcomes of independent checks and release runs, which never promote: `check-passed` and `check-failed`, besides `canceled`, `superseded`, and `infrastructure-exhausted`.
 
 Remote state is orthogonal and exactly `disabled`, `preflight-pending`, `ready`, `pushing`, `push-blocked`, `synchronized`, or `abandoned`. `abandoned` requires the explicit reconciled remote-promise abandonment in Section 10.4 and remains permanent audit history. Cleanup state is orthogonal and exactly `not-eligible`, `pending`, `running`, `completed`, or `needs-attention`. A successfully promoted item remains successful even when cleanup needs attention. When push is enabled, local CAS changes the item to `promoted-local-push-pending`; only exact remote observation or explicit abandonment changes it to `promoted` and releases the next promotion barrier.
 
@@ -533,15 +560,16 @@ The repository supervisor may begin promotion only when:
 
 - the app and repository locks are held;
 - the repository is neither paused nor blocked;
+- with release-stage steps, promotion is not paused by `max_release_lag`, unless the head is a release fix (section 10.9);
 - the item is the active queue head;
 - its certificate passes every current validity check;
 - a synchronous re-open, parse, canonicalization, and digest of `<repository-root>/.tollgate/config.toml` equals the certificate's frozen configuration digest; filesystem watching is never sufficient evidence for this check;
 - a synchronous probe confirms that the recorded Git executable path/file identity, versioned Git-semantics profile, object format, and engine epoch still match the validation generation;
-- authoritative local `staging` still equals the certificate's expected parent, and `release` still equals its recorded OID (which equals `staging`'s); a moved `release` blocks with `external-release-movement` instead of attempting the transaction;
+- authoritative local `staging` still equals the certificate's expected parent, and `release` still equals its recorded OID (which equals `staging`'s in an opt-out repository); a moved `release` blocks with `external-release-movement` instead of attempting the transaction;
 - neither `staging` nor `release` is checked out in any authoritative worktree;
 - every active certificate log reaches its recorded completion offset and matches its recorded integrity hash; missing or corrupt active evidence blocks promotion rather than silently weakening the certificate;
 - the tested object has been copied from the mirror into `refs/tollgate/tested/<buildset-id>` and re-verified in the authoritative object database;
-- when push is enabled, a fresh fetch proves the configured remote is at the expected remote OID.
+- when push is enabled in an opt-out repository, a fresh fetch proves the configured remote is at the expected remote OID.
 
 Tested-object retention itself uses an intent before promotion: record the expected tested OID and nonexistent destination ref, fetch/copy that object into the authoritative object database through an explicit refspec to `refs/tollgate/tested/<buildset-id>`, verify object type/content/parent/tree and the exact ref OID, then complete the intent. A missing ref permits retry; an exact ref permits completion; a different ref blocks. Promotion never relies on an unreachable object that exists only in the disposable mirror.
 
@@ -551,7 +579,7 @@ SQLite and Git cannot share one transaction, so promotion uses a durable intent 
 
 1. In a full-durability SQLite transaction, insert `promotion_intent(expected_old, tested_new, certificate_id)` and emit `promotion.started`.
 2. Re-read and verify all preconditions outside the database transaction.
-3. Use one `git update-ref --stdin` transaction that moves `staging` and `release` from the expected old OID to the tested OID, so either both refs move or neither does.
+3. Use one `git update-ref --stdin` transaction that moves `staging` and `release` from the expected old OID to the tested OID in an opt-out repository, or moves `staging` and verifies `release` at its persisted OID with release-stage steps, so the whole transaction applies or nothing does.
 4. In a second full-durability SQLite transaction, mark the intent complete, the item promoted, and the next head eligible; emit `promotion.completed` with the actual OID.
 
 All authoritative internal ref changes use the frozen hooks-disabled Git profile. A multi-ref `update-ref` transaction gives all-or-none command success and per-ref atomic replacement, but readers outside the transaction may observe ref updates at different instants. No correctness decision therefore depends on a simultaneous unlocked read of `release` and a hidden ref. The supervisor serializes its own reads, and recovery verifies each ref independently against the intent before finalizing or blocking.
@@ -568,7 +596,7 @@ The implementation must fault-inject a crash before and after every durable boun
 
 ### 10.3 Consecutive ready promotion
 
-After promoting A, the supervisor reevaluates B rather than blindly consuming a ready flag. If B's tested commit has A's exact promoted OID as parent and B's assigned validation generation still matches its certificate, B may promote immediately. Promotion of A advances the queue revision but does not by itself change B's validation generation. This repeats for C and later ready descendants. Each commit gets its own local CAS, remote barrier when enabled, audit event, and cleanup decision.
+After promoting A, the supervisor reevaluates B rather than blindly consuming a ready flag. If B's tested commit has A's exact promoted OID as parent and B's assigned validation generation still matches its certificate, B may promote immediately. Promotion of A advances the queue revision but does not by itself change B's validation generation. This repeats for C and later ready descendants. Each commit gets its own local CAS, remote barrier when pushing is enabled in an opt-out repository, audit event, and cleanup decision. With release-stage steps, consecutive promotions coalesce into one release run on the newest tip (section 12.7).
 
 ### 10.4 Optional remote push
 
@@ -614,7 +642,7 @@ Before deciding among these, and holding the repository mutation lock, `tg pull`
 
 With release-stage steps, step 2 applies when remote `master` is a strict fast-forward of `staging`: one transaction moves both `staging` and `release` (from their separate persisted OIDs) to the remote OID, because the remote already published every commit up to it; unfinished release advances are abandoned and release blocks cleared. A remote that fast-forwards `release` but not `staging` diverges from the gated history and blocks with `remote-diverged`. A remote equal to or behind `staging` is no inbound update, whether or not `release` trails `staging`. Every outcome but divergence clears a `remote-preflight-mismatch` release block, so the next release advance retries its preflight, and requests a release trigger and advance pass.
 
-When automatic pushing is enabled, remote `master` is authoritative: periodic fetch and the mandatory pre-promotion fetch adopt an inbound fast-forward immediately, invalidating runs that can no longer promote/push as tested. Fetch errors are visible but do not stop tests. With pushing disabled, automatic fetch only notifies; the user chooses when `tg pull` adopts the remote.
+When automatic pushing is enabled, remote `master` is authoritative: periodic fetch and the mandatory pre-promotion fetch adopt an inbound fast-forward immediately, invalidating runs that can no longer promote/push as tested. Fetch errors are visible but do not stop tests. With pushing disabled, automatic fetch only notifies; the user chooses when `tg pull` adopts the remote. The periodic observation runs `tg pull`'s service operation once a minute for every active repository with pushing enabled. A repository with release-stage steps has no pre-promotion fetch; there the periodic pull and the release advance's remote preflight (section 10.9) observe the remote.
 
 When automatic user-master synchronization is disabled or needs attention, ordinary `git pull --ff-only` remains the fallback in the primary `master` worktree. It updates the user-owned branch and its files, never Tollgate-owned `staging` or `release`.
 
@@ -622,9 +650,9 @@ When automatic user-master synchronization is disabled or needs attention, ordin
 
 `tg push` pushes only a contiguous chain of exact Tollgate-promoted local `release` commits to the configured remote branch. It is not a feature-branch push wrapper. It refuses when local `release` contains an uncertified external commit, when the remote lease is unknown/stale, or when history diverges. Before comparing the remote with `release`, and holding the repository mutation lock, it requires local `staging` and `release` to equal their persisted OIDs, exactly as `tg pull` does: a moved ref blocks with its external-movement code and fails the push without pushing or reporting the remote up to date.
 
-With release-stage steps, `tg push` publishes `release` only when it is the tested OID of a passed release run whose certificate carries the active release-stage digest (or the target of an unfinished release advance that froze a push of that certificate, which R2 admitted when `release` advanced), and every first-parent commit between the remote OID and `release` was promoted by Tollgate or adopted by reconciliation (the R2 provenance rule of section 10.9). A successful push, or a remote that already equals `release`, completes every unfinished release advance whose OID `release` contains, clears the `push-blocked` and `remote-preflight-mismatch` release blocks, and requests a release advance pass. `tg push`, `tg pull`, and `tg reconcile` take the repository's release-advance lock before its mutation lock, so none of them observes a release push in flight.
+With release-stage steps, `tg push` publishes `release` only when it is the tested OID of a passed release run whose certificate carries the active release-stage digest (or the target of an unfinished release advance that froze a push of that certificate, which R2 admitted when `release` advanced), and every first-parent commit between the remote OID and `release` was promoted by Tollgate or adopted by reconciliation (R2's provenance rule, section 5). A successful push, or a remote that already equals `release`, completes every unfinished release advance whose OID `release` contains, clears the `push-blocked` and `remote-preflight-mismatch` release blocks, and requests a release advance pass. `tg push`, `tg pull`, and `tg reconcile` take the repository's release-advance lock before its mutation lock, so none of them observes a release push in flight.
 
-`tg reconcile` is an explicit guided operation for rewritten/deleted/diverged refs. It presents local staging and release, last certified release, remote master, active queue base, and pending intents. Accepting a new base never blesses it as Tollgate-validated; it records external adoption, invalidates all active validation generations, and rebuilds. Any Git history repair itself remains an explicit user-directed Git action unless a previewed fast-forward/CAS is sufficient.
+`tg reconcile` is an explicit recovery operation for rewritten, deleted, or diverged refs and for unfinished remote promises. It adopts the observed local refs: in an opt-out repository one OID for both refs (section 10.5); with release-stage steps `staging` and `release` each where they are, refusing while `release` is not an ancestor of `staging` (R1) and recording the adopted `staging` range for R2's provenance rule. It then clears the external-movement, `remote-diverged`, `remote-preflight-mismatch`, and ambiguous pull and push recovery blocks and every release hold; marks every `promoted-local-push-pending` item `promoted` with remote state `abandoned`; and abandons every unfinished push and release-advance intent. When the adopted `staging` differs from the persisted one, it advances the queue revision and rebuilds every active gate item on the adopted base. Accepting a new base never blesses it as Tollgate-validated: with release-stage steps, the next release run must still pass before `release` advances past it. A caller that previewed the repository may pass the observed `staging` OID and queue revision it saw, and reconciliation refuses when either changed. The command result reports the adopted `staging` OID, the queue revision, and the rebuilt items. Any Git history repair itself remains an explicit user-directed Git action.
 
 ### 10.8 Gate-aware Git conveniences
 
@@ -639,7 +667,7 @@ General feature fetching, staging, committing, inspection, and pushing remain or
 In a repository with release-stage steps, a passing release run (section 12.7) leaves a release certificate, and a release advance pass moves `release` to the newest certified `staging` commit and publishes exactly that OID. A pass runs after every release outcome, after every release trigger pass (so after every promotion, configuration change, and activation), and after `tg push`, `tg pull`, and `tg reconcile`; concurrent requests coalesce. Each pass holds the repository's release-advance lock and runs:
 
 1. **Resume.** An unfinished `release-advance` intent is settled before any newer advance: a `prepared` one recovers from the refs (below), and an `external-applied` or `needs-attention` one resumes its frozen push (step 5).
-2. **Plan**, under the mutation lock. The repository is active with no release block and no unfinished advance; both refs are at their persisted OIDs (an uncertified fast-forward of `release` is adopted first, section 10.5); and the target is the newest first-parent commit in `release..staging` that a passed release run under the active release-stage digest certified, with a verified checkout and intact sealed logs. These are R2: the target equals the certificate's tested OID; it descends from `release` and is an ancestor of (or equal to) `staging`; every commit in `release..target` was promoted by Tollgate or adopted by reconciliation (otherwise the `release-range-unattributed` release block); and the on-disk configuration's release-stage digest equals the certificate's.
+2. **Plan**, under the mutation lock. The repository is active with no release block and no unfinished advance; both refs are at their persisted OIDs (an uncertified fast-forward of `release` is adopted first, section 10.5); and the target is the newest first-parent commit in `release..staging` that a passed release run under the active release-stage digest certified, with a verified checkout and intact sealed logs. These are the R2 preconditions (section 5): the target equals the certificate's tested OID; it descends from `release` and is an ancestor of (or equal to) `staging`; every commit in `release..target` was promoted by Tollgate or adopted by reconciliation (otherwise the `release-range-unattributed` release block); and the on-disk configuration's release-stage digest equals the certificate's.
 3. **Remote preflight**, outside the mutation lock, when pushing is enabled: resolve the configured remote's push URL and fetch the remote branch into the remote-observation ref. A fetch failure defers the advance and schedules a delayed advance pass, so the advance is retried even when nothing else requests a pass; consecutive unobservable passes back off exponentially from 5 seconds to at most 10 minutes, and a pass that observes the remote resets the backoff.
 4. **Local advance**, under the mutation lock again: re-plan, and require the re-planned remote, branch, and push URL to equal the observed ones. A configuration applied between the two locks that retargets the push sends the pass back to step 2, so only an observed remote is ever classified. Then classify the observed remote. A remote already at the target needs no push. A remote that is an ancestor of the target through Tollgate-certified history becomes the push lease; normally it is the previous `release`, and it may be older after a `release` that never reached the remote. Anything else records the `remote-preflight-mismatch` release block. Then one durable `release-advance` intent records the release intent (expected old `release`, target, certificate, release run) together with the frozen push (remote, URLs, branch, expected remote OID); `release` is compare-and-swapped from the expected old OID to the target in one `update-ref --stdin` transaction that verifies `staging`; and one transaction persists the advanced projection, emits `release.advanced`, and marks the intent `external-applied` while a push is owed or `completed` otherwise. User-owned `master` following `"release"` synchronizes now.
 5. **Push**, outside the mutation lock: re-check the frozen remote identity, observe the remote, and push the target with the exact lease only while the remote still holds it, then observe it exactly. Published, the intent completes with `release.pushed`. Otherwise it becomes `needs-attention` with the `push-blocked` release block and `release.push-blocked` (notifying on the first failure). A remote that cannot be observed, before the push or after a failed one, or that no longer resolves to the frozen push URL, is `push-blocked` the same way and also schedules a delayed advance pass with the step 3 backoff, so an owed push in an idle repository is retried until the remote is observed. The next pass observes again: a push that landed meanwhile completes, a remote back at the lease is pushed again, and a diverged remote stays blocked until `tg push` or `tg reconcile`.
@@ -672,6 +700,24 @@ name = "ci"
 run = "./ci"
 ```
 
+Staged release adds a second, slower stage that runs after promotion (section 12.7):
+
+```toml
+version = 1
+
+[resources]
+max_release_lag = 5
+
+[[step]]
+name = "fast"
+run = "./ci fast"
+
+[[step]]
+name = "full"
+stage = "release"
+run = "./ci full"
+```
+
 The execution engine understands only generic fields:
 
 - stable step name and shell command;
@@ -680,6 +726,7 @@ The execution engine understands only generic fields:
 - ordered dependencies (`needs`), with declaration order forming an implicit sequential chain when no DAG is supplied;
 - timeout, default 60 minutes;
 - voting flag, default true;
+- validation stage, `gate` (default) or `release`;
 - environment additions/removals;
 - CPU/memory reservations, optional hard RSS cap, and named semaphores;
 - include/exclude path globs;
@@ -747,7 +794,7 @@ Running buildsets never change configuration in place. Tracked scripts invoked b
 
 File watching exists only to make pending changes visible promptly. Before constructing a validation generation, dispatching a buildset, retrying infrastructure work, or promoting, the supervisor synchronously opens and canonicalizes the configuration and compares its digest with the repository's active digest. A missing, unreadable, concurrently changing, or invalid file enters `configuration-pending` or `blocked` and prevents the transition. To avoid accepting a torn read, Tollgate reads from an open descriptor, records file identity and metadata before and after parsing, and retries once when they change; a second change is reported as unstable configuration.
 
-`tg config explain` and the UI show each effective field, its explicit or defaulted value, the active and pending digests, and which buildsets a candidate change would invalidate.
+`tg config explain` and the UI show each effective field, its explicit or defaulted value, the active and pending digests, and which buildsets a candidate change would invalidate. Its human output names the gate and release-stage graph digests, the `sync_user_master` target, `release_concurrency`, `max_release_lag`, and each step's stage. The checked-in `schemas/config-v1.schema.json` declares `stage`, `sync_user_master`, `release_concurrency`, and `max_release_lag` with their defaults.
 
 ## 12. Execution environment and step semantics
 
@@ -878,7 +925,7 @@ A release run is a queue item of kind `release`: one buildset of the release sta
 - **Trigger.** A promotion in a repository with release-stage steps records a durable `release-run` operation intent in its promotion transaction (promotion recovery records it the same way). The release trigger never runs inside the promotion's mutation lock: once `promote_ready` releases the lock it spawns a task, which takes the mutation lock itself and settles every outstanding intent in one store transaction. A configuration change and repository activation also request a trigger, so startup replays outstanding intents and queues a run for an unreleased tip that no run covers.
 - **Coalescing.** Each trigger pass refreshes the release projection, retires every active release run frozen under a release-stage digest other than the active configuration's (`superseded`, reason `release-stage-configuration-changed`), and then, when `release` trails `staging`, ensures one run targets the newest `staging` tip. A run that already targets the tip, or a passed, failed, or canceled run on the tip under the current digest, settles the request. Otherwise a queued run that never started is retargeted: it becomes `superseded` (reason `superseded-by-newer-staging-tip`) and a new run is queued for the tip. A started run is never canceled for a newer tip, so each repository has at most one started and one queued release run. Events record `release.run-queued` (with the tested OID and range) and `release.run-superseded`.
 - **Scheduling.** A repository runs at most one release run at a time, in queue order: only its oldest active release run may start, decided under the mutation lock that starts it, and a queued successor is dispatched once that run ends. This holds whatever the `release_concurrency` permit count, so outcomes and notifications arrive in target order, and after a restart the interrupted run reruns before its queued successor. A release run holds the repository's `release_concurrency` permit, never its execution permit, so it cannot delay gate admission beyond the global buildset and slot limits. It still takes one global buildset permit and one slot, with normal slot affinity and seeds. Its priority sits between speculative gate descendants and independent checks.
-- **Outcomes.** A passing run ends in `check-passed` and writes a release certificate: the tested OID, tree, every successful voting step, the configuration digest, and the frozen release-stage graph digest. A failing run ends in `check-failed` with reason `release-run-failed` (or a checkout-verification failure). Either outcome records `release.run-passed` or `release.run-failed` with the item, buildset, tested OID, range (`from`, `to`, and its first-parent commit count), certificate or failing voting steps, and the resulting release state. A pass then lets the release advance move `release` to the newest certified tip and push it (section 10.9). A failure never moves either ref and never affects gate work, and nothing retries it automatically: the next promotion triggers a run on the new tip. `tg retry` rejects release runs; `tg release retry` reruns the newest `staging` tip as a `release`-kind run instead (see Retry below). An infrastructure interruption reruns the same target under the rules of section 12.4; a run interrupted by a restart is started, so it is never retargeted. `tg cancel` cancels a release run like an independent check.
+- **Outcomes.** A passing run ends in `check-passed` and writes a release certificate: the tested OID, tree, every successful voting step, the configuration digest, and the frozen release-stage graph digest. A failing run ends in `check-failed` with reason `release-run-failed` (or a checkout-verification failure). Either outcome records `release.run-passed` or `release.run-failed` with the item, buildset, tested OID, range (`from`, `to`, and its first-parent commit count), certificate or failing voting steps, and the resulting release state. A pass then lets the release advance move `release` to the newest certified tip and push it (section 10.9). A failure never moves either ref and never affects gate work, and nothing retries it automatically: the next promotion triggers a run on the new tip. `tg retry` rejects release runs; `tg release retry` reruns the newest `staging` tip as a `release`-kind run instead (see Retry below). An infrastructure interruption reruns the same target under the rules of section 12.4; a run interrupted by a restart is started, so it is never retargeted. `tg cancel` cancels a release run like an independent check. `tg status <id>` and `tg diagnose <id>` report a failed release run's failure attribution, because release-stage steps vote within their own run, but diagnosis never replays or repairs a release run (`--replay` and `--verify-repair` are refused).
 - **Retry.** `tg release retry` runs a release trigger pass under the mutation lock, then queues a release run for the newest `staging` tip whose `retry_of_item_id` names the newest earlier run on that tip. It also covers a tip that `release` already holds without a passing run under the active release-stage digest (after a release-stage configuration change or an uncertified adoption), which `tg push` refuses to publish and which no trigger requeues; such a run anchors at the previous run's base, or the tip's parent, so its path filters still see the tip's changes. A queued run for an older tip that never started is superseded, and a started one keeps running. When a run for the tip is already queued or running, the command returns it (`already-active`) and queues nothing. With no release stage, or when the tip already passed under the active digest, it fails with the structured error `release-retry-unavailable` (`reason` `no-release-stage` or `already-certified`). The queued run, its `release.run-queued` event (outcome action `retried`), and the command result commit in one transaction, so replaying the command ID, including the CLI's resend after a restart, returns the same run, and startup recovery resumes it like any queued release run.
 - **Notifications.** A failure notifies once per failing streak (the event's `notify` is true only when the release state was not already failing), and the first pass after a failing streak notifies once as a recovery (`recovered`). Release-run item updates never notify on their own.
 - **Release projection.** `release_lag.commits` counts the first-parent commits on `staging` that `release` does not contain, and `release_lag.since` is when `staging` first advanced past `release`. `release_state` is `green` when `release` equals `staging`, `failing` when the latest conclusive release run (the one with the newest target) failed, and `pending` otherwise. Promotion, every release outcome, and every trigger pass recompute both.
@@ -1011,7 +1058,7 @@ Disk admission is tracked per mounted volume, not per path or as one global byte
 - If the authoritative Git/SQLite volume falls below the critical threshold, the repository blocks before any non-recovery mutation. Recovery writes and an orderly worker termination use a separately accounted emergency allowance established at initialization.
 - APFS logical size is not charged as immediate physical allocation, but the admission model assumes future copy-on-write divergence and continuously monitors real free space. Clone success never waives reserve enforcement.
 
-Each repository may set a concurrency cap and scheduler weight. A buildset acquires one global simultaneous-buildset permit, one repository concurrency permit, and one slot before preparation, and holds them until all steps, finalizers, artifact collection, and final checkout verification finish.
+Each repository may set a concurrency cap and scheduler weight. A buildset acquires one global simultaneous-buildset permit, one repository concurrency permit (a release run takes the repository's separate `release_concurrency` permit instead, section 12.7), and one slot before preparation, and holds them until all steps, finalizers, artifact collection, and final checkout verification finish.
 
 CPU reservations, memory reservations, and named semaphores belong to individual steps. Immediately before launching a runnable step, the scheduler acquires that step's complete resource request atomically; partial acquisition is prohibited. It releases those resources after the process and step post-processing finish. Concurrent DAG roots request independently, and steps in the same buildset contend for a named semaphore exactly like steps in different buildsets. Aggregate reserved CPU and memory are the sums for currently running steps, not every future step in an admitted buildset.
 
@@ -1033,7 +1080,9 @@ The scheduler selects both buildsets awaiting slots and runnable steps awaiting 
 
 Repository `pause` stops new dispatch and promotion while allowing active commands to finish and record results. `resume` rechecks structural validity before using any completed result. Global pause applies the same rule to all repositories. Cancel/dequeue is separate and destructive to active work.
 
-Blocking states such as remote divergence, invalid trusted config, checked-out `staging` or `release`, exhausted push failure, state corruption, or ambiguous recovery stop promotion and any work whose inputs cannot be proven. Unrelated repositories continue.
+Blocking states such as remote divergence, invalid trusted config, checked-out `staging` or `release`, exhausted push failure in an opt-out repository, state corruption, or ambiguous recovery stop promotion and any work whose inputs cannot be proven. Unrelated repositories continue.
+
+Two narrower holds exist in a repository with release-stage steps (section 10.9). Release holds (`push-blocked`, `remote-preflight-mismatch`, `release-range-unattributed`) hold back `release` advances only, while `staging` promotions continue. The `max_release_lag` promotion pause holds back promotion only, except for release fixes. Neither stops gate validation or release runs.
 
 ### 15.4 Background behavior
 
@@ -1055,7 +1104,7 @@ The initial CLI surface is:
 | `tg push-master [--wait\|--status]` | Rebase a clean stale local `master` range onto certified `staging` when needed, authorize each linear commit oldest-first, and return after scheduling by default. While validation runs, project an unchanged clean local tip onto rebuilt speculative history whenever certified `staging` advances; `--wait` additionally waits for the tail result, while read-only `--status` reports the latest durably identified master push and any failed step. |
 | `tg queue` | Ordered active queue, queue revision, per-item validation generations, dependencies, states, and prefix OIDs. |
 | `tg status [<id>]` | Repository/item/buildset/slot summary, including both Tollgate refs, the release lag in commits and age, the release state with the active release run, and release holds. |
-| `tg wait <id>` | Subscribe until terminal/blocked outcome; handle Ctrl-C without canceling CI. |
+| `tg wait <id>` | Subscribe until terminal/blocked outcome; handle Ctrl-C without canceling CI. A gate item's wait ends at promotion to `staging`. |
 | `tg wait --released [<candidate-id\|rev>]` | Wait until `release` contains the target, or the newest release run covering it fails. A candidate first waits for promotion; with no argument the target is the newest promotion from the current worktree, else the `staging` tip, frozen at the first observation. Exits `0` released, `1` release run failed (`5` infrastructure exhausted), `2` not on `staging`, `3` candidate canceled or superseded, `4` blocked or held. |
 | `tg release status` | `staging`, `release`, lag, release state, holds, promotion pause, and the latest release runs with target, range, state, step results, and failing steps. |
 | `tg release retry [--wait]` | Rerun the newest `staging` tip as a release run (section 12.7); exits `3` when the tip is already certified and `2` without a release stage. |
@@ -1066,9 +1115,9 @@ The initial CLI surface is:
 | `tg check [<rev>] [--wait]` | Independent validation with no promotion. |
 | `tg diagnose <id> [--replay] [--verify-repair]` | Attribute a voting failure from comparable retained evidence by default; explicitly probe ambiguity or flakiness with the minimum missing cold checks, and optionally verify one structured repair into an immutable patch artifact. |
 | `tg pause/resume` | Non-destructive repository gate hold. |
-| `tg pull` | Gate-aware fetch and fast-forward adoption. |
-| `tg push` | Push only contiguous certified local `release` commits to the configured remote branch with a lease. |
-| `tg reconcile` | Guided external movement/divergence recovery. |
+| `tg pull` | Gate-aware fetch and fast-forward adoption of the remote into `staging` and `release` (section 10.6). |
+| `tg push` | Push only contiguous certified local `release` commits to the configured remote branch with a lease; with release-stage steps, only a `release` that a release certificate under the active release-stage digest covers (section 10.7). |
+| `tg reconcile` | Adopt the observed refs after external movement or divergence, clear remote blocks and release holds, and abandon unfinished remote promises (section 10.7). |
 | `tg update` | Safe one-commit feature rebase onto current gated `staging`. |
 | `tg worktree create/remove` | Gate-aware feature worktree lifecycle. |
 | `tg env reload/show` | Bootstrap and diagnose shell environment. |
@@ -1125,7 +1174,7 @@ The header of every repository view shows the `staging` and `release` OIDs and t
 
 ### 17.5 Operations
 
-Every normal queue/CI operation available in the CLI is available in the UI: approve from a selected clean worktree, cancel/dequeue, retry/cold retry, reorder, pause/resume, pull, push retry, reconcile, check, worktree cleanup, slot reset, seed/cache purge, retained artifact/log management, and environment reload.
+Every normal queue/CI operation available in the CLI is available in the UI: approve from a selected clean worktree, cancel/dequeue, retry/cold retry, reorder, pause/resume, pull, push retry, reconcile, check, release retry, worktree cleanup, slot reset, seed/cache purge, retained artifact/log management, and environment reload.
 
 Operations that invalidate descendants, kill a process, delete a worktree/branch, discard caches, adopt an external base, or reorder the queue present a concrete impact preview. UI commands carry observed queue revision and are rejected/repreviewed if state changed before confirmation.
 
@@ -1197,7 +1246,7 @@ The app acquires its single-instance lock, opens/migrates global preferences, an
 5. Reconciles mirror/worktree/slot registrations and terminates or quarantines leftover workers.
 6. Marks active buildsets interrupted and creates new attempts or validation generations as required.
 7. Reloads the trusted local configuration and captures a new shell-environment snapshot.
-8. Blocks or resumes the repository based on proof, never on optimistic inference.
+8. Blocks or resumes the repository based on proof, never on optimistic inference. With release-stage steps, activation requests a release trigger pass, which replays outstanding `release-run` intents and queues a run for an unreleased tip that no run covers, and a release advance pass, which resumes an owed release push (sections 10.9 and 12.7).
 
 One corrupt/blocked repository does not prevent other registered repositories or the app UI from starting: an activation failure marks only that repository unavailable, with its error and recovery action. The repository is recorded unavailable before it stops being activating, so every snapshot and registry save lists it in one of the two states. Activation never prunes expired artifacts; the maintenance sweep owns artifact retention.
 
@@ -1210,7 +1259,7 @@ Intent reconciliation uses this evidence matrix:
 | Result completion | matching live worker terminal frame was received without lifetime-channel loss, logs are complete/durable, process group is reaped, and final checkout verification is recorded | any missing supervision evidence means the buildset is interrupted, never successful | block on contradictory durable evidence |
 | Promotion | authoritative `staging` equals recorded tested-new OID, `release` equals tested-new for an opt-out promotion or still equals its persisted OID for a staging-only promotion (decided by the configuration the promotion activates), and certificate still verifies | `staging` equals expected-old and `release` equals its persisted OID | `ambiguous-promotion-recovery` block |
 | Pull | `staging` and `release` both equal the frozen remote OID, a descendant of the recorded expected-old | `staging` equals expected-old (a `release` that moved anyway is reported by the startup external-movement check) | `ambiguous-pull-recovery` block |
-| Reconciliation | `staging` and `release` both equal the recorded adopted OID; only then are the external-movement blocks cleared | — | `needs-attention`; startup's external-movement blocks stay for another explicit reconcile |
+| Reconciliation | `staging` equals the recorded adopted OID and `release` equals it too (or, with release-stage steps, equals the separately recorded adopted `release`); only then are the external-movement blocks cleared | — | `needs-attention`; startup's external-movement blocks stay for another explicit reconcile |
 | Push | direct remote observation equals recorded tested OID | remote still equals exact expected-old/nonexistence and local promoted chain still verifies | `push-blocked`/divergence |
 | Release advance | prepared: `release` equals the recorded target, which finalizes the advance; external-applied or needs-attention: direct remote observation equals the target | prepared: `release` equals the recorded expected-old OID; a remote still at the frozen lease is pushed again by the next advance pass | prepared: cancel and leave the moved `release` to the external-movement check; push: `push-blocked`, and an unobservable remote also schedules a retry pass |
 | Cleanup | each worktree path, registration, branch ref, and old OID independently matches the completed sub-operation evidence | unchanged owned worktree/ref still matches the pre-cleanup snapshot | `needs-attention`; never recreate or delete by guess |
@@ -1280,7 +1329,7 @@ The pure domain state machine must have exhaustive transition tests and property
 
 - no `promotion.completed` without a current valid certificate;
 - promoted OID always equals certified tested OID;
-- promoted commit parent always equals old release;
+- promoted commit parent always equals old `staging`;
 - queue order always topologically respects hard dependencies;
 - any prefix change invalidates exactly the affected descendant buildsets;
 - appending a tail item never invalidates an earlier item's validation generation;
@@ -1295,7 +1344,10 @@ The pure domain state machine must have exhaustive transition tests and property
 - repository pause/block, item validation, remote synchronization, cleanup, and buildset states remain orthogonal and accept only transitions listed in the domain transition table;
 - local CAS with push enabled produces `promoted-local-push-pending`, cannot release the next promotion before exact remote observation, and never loses local success when push or cleanup needs attention;
 - command UUID replay returns the stored result without repeating a Git/filesystem effect;
-- configuration canonicalization is deterministic, rejects unknown fields/invalid graphs, and freezes exactly one runner/environment/matcher/applicable-voting-step contract.
+- configuration canonicalization is deterministic, rejects unknown fields/invalid graphs, and freezes exactly one runner/environment/matcher/applicable-voting-step contract;
+- configurations without release-stage fields keep their digests, and the gate and release-stage graph digests change independently;
+- R1–R5 hold under random interleavings of promotions (including release fixes), release passes and failures, advances that crash at every durable boundary, restarts, pulls, `tg push`, external `release` fast-forwards, and adding or removing the release stage, and recovery always settles every prepared release intent;
+- a release-fix candidate always promotes whatever the release lag and verdict, and `max_release_lag` pauses only past its limit after a failed release run.
 
 A small serial reference gate should model “test one item, promote, repeat.” Random all-pass dependent-gate executions must produce the same final commit chain as the parallel scheduler.
 
@@ -1325,13 +1377,23 @@ Use temporary real Git repositories and the supported system Git. Cover:
 - hidden-ref/object reachability and garbage collection;
 - SHA-1 and SHA-256 repositories produce and promote correct native-format objects;
 - submodule and LFS-compatible checkout cleanliness;
-- source worktree/branch cleanup CAS and dirty safety.
+- source worktree/branch cleanup CAS and dirty safety;
+- migration of a repository registered with only `release`, which creates `staging` without invalidating its queue;
+- the opt-out two-ref transaction, with the existing promotion and push suite run against configurations without release-stage steps and debug assertions that `staging` equals `release` after every persisted event;
+- release runs that coalesce to the newest `staging` tip, start one at a time whatever the permit count, select steps by every commit in the unreleased range, and pass without running prerequisites when no release-stage step is selected;
+- three fast promotions that advance `release` once and push only the newest tested OID;
+- a release trigger that never runs inside the promotion's mutation lock under load;
+- release-only configuration edits that keep gate validation, gate edits that rebuild it, and release-stage changes that retire stale release runs;
+- `max_release_lag` pausing promotion until a release fix lands;
+- a blocked release push holding `release` while `staging` promotes, until `tg push`; an unobservable remote retried with backoff; a remote retargeted during an advance observed again before it is classified; and configuration refused from changing the remote while a release push is owed;
+- `tg pull`, `tg push`, `tg reconcile`, and external `release` movement under a release stage, including uncertified adoption and the release-certificate requirement of `tg push`;
+- `tg release retry` on a failed tip, without a release stage, across a restart, and on a tip `release` holds after a release-stage change.
 
 ### 21.3 Fault-injection tests
 
 Inject process death or I/O error before/after every boundary in approval, tested-object retention, result completion, promotion, push, cleanup, seed publication, artifact retention, pruning, backup, and migration. Restart and assert one of three permitted outcomes: the exact operation is finalized once from matching external evidence; no external change occurred and it is safely retried/canceled; or mismatching/insufficient evidence blocks for attention. No recovery path infers success from an intent or path name alone.
 
-Promotion tests must kill between SQLite intent commit, object transfer, Git lock prepare, ref commit, and SQLite completion. Push tests cover remote movement at every preflight/push point.
+Promotion tests must kill between SQLite intent commit, object transfer, Git lock prepare, ref commit, and SQLite completion. Push tests cover remote movement at every preflight/push point. Release-advance tests stop the advance before its intent, after the intent, after the `release` compare-and-swap, after the advance is persisted, and after the push, then restart and require the advance to finalize, cancel, or resume its frozen push exactly once. Staging-only promotion recovery is tested with `release` unchanged and with `release` moved too.
 
 ### 21.4 Runner and cache tests
 
@@ -1412,6 +1474,7 @@ Complete Tahoe Apple-Silicon performance/soak testing, signed/notarized packagin
 | --- | --- |
 | Incremental cache poisoning | Build-tool invalidation is explicit trust assumption; cold retry, slot reset, cache epoch/purge, per-slot isolation, no automatic cold retry masking failures. |
 | APFS clones consume unexpected physical space after mutation | Global budget and reserve, free-space monitoring, generational pruning, separate logical/physical estimates, cold refusal before reserve violation. |
+| A slow validation suite delays every promotion | Staged release: a fast gate stage certifies promotion to `staging`, and the slow release stage runs once on the newest `staging` tip, coalescing promotions, before `release` and the remote advance. |
 | Shell startup hangs or produces a different environment | Shell-family helper protocol, short timeout, blocking diagnostic, explicit fallback/reload, recorded fingerprint. |
 | CI process survives app crash | Ephemeral parent-watching supervisor, process groups, restart reconciliation, never accept worker-authored success. |
 | Git/SQLite cross-system partial commit | Durable intents, old-OID ref CAS, idempotent recovery, exhaustive fault injection. |

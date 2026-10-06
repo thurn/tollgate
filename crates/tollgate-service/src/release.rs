@@ -1,4 +1,4 @@
-//! `release` advance and push (staged-release-design.md sections 9 and 10) for repositories with
+//! `release` advance and push (technical-design.md 10.9) for repositories with
 //! release-stage steps.
 //!
 //! A passing release run leaves a release certificate. An advance pass then moves `release` to
@@ -375,10 +375,11 @@ impl TollgateService {
         }
     }
 
-    /// Startup recovery of release advances (section 9), before the external-movement check:
-    /// a prepared intent finalizes when `release` holds its new OID, cancels when `release`
-    /// still holds the expected old OID, and otherwise cancels and leaves the moved `release` to
-    /// external-movement reconciliation. An owed push resumes in the first advance pass.
+    /// Startup recovery of release advances (technical-design.md 10.9), before the
+    /// external-movement check: a prepared intent finalizes when `release` holds its new OID,
+    /// cancels when `release` still holds the expected old OID, and otherwise cancels and leaves
+    /// the moved `release` to external-movement reconciliation. An owed push resumes in the first
+    /// advance pass.
     pub(crate) async fn reconcile_release_intents(
         self: &Arc<Self>,
         runtime: &Arc<RepositoryRuntime>,
@@ -439,9 +440,9 @@ impl TollgateService {
         }
     }
 
-    /// Plans an advance under the mutation lock (section 9, step 1). `None` means no advance is
-    /// possible now: no release stage, a blocked or paused repository, a held release, an
-    /// unfinished advance, moved refs, nothing unreleased, no certified target, an on-disk
+    /// Plans an advance under the mutation lock (technical-design.md 10.9, step 2). `None` means no
+    /// advance is possible now: no release stage, a blocked or paused repository, a held release,
+    /// an unfinished advance, moved refs, nothing unreleased, no certified target, an on-disk
     /// release stage that no longer matches the certificate, or unverifiable evidence.
     async fn plan_release_advance(
         self: &Arc<Self>,
@@ -562,11 +563,11 @@ impl TollgateService {
         }))
     }
 
-    /// The local half of an advance under the mutation lock (section 9, steps 2–4): remote
-    /// preflight, the release intent with its frozen push, the compare-and-swap, and the persisted
-    /// advance. The preflight classifies only the remote that was observed: when the configured
-    /// remote, branch, or push URL no longer matches the observation, nothing is recorded and the
-    /// caller observes again.
+    /// The local half of an advance under the mutation lock (technical-design.md 10.9, step 4):
+    /// remote preflight, the release intent with its frozen push, the compare-and-swap, and the
+    /// persisted advance. The preflight classifies only the remote that was observed: when the
+    /// configured remote, branch, or push URL no longer matches the observation, nothing is
+    /// recorded and the caller observes again.
     async fn advance_release_locally(
         self: &Arc<Self>,
         runtime: &Arc<RepositoryRuntime>,
@@ -778,10 +779,10 @@ impl TollgateService {
         Ok(())
     }
 
-    /// Settles an owed or blocked release push (section 9, step 5) outside the mutation lock.
-    /// It re-checks the frozen remote identity and observes the remote first, so a push that
-    /// already landed completes and a diverged remote stays blocked; only a remote that still
-    /// holds the lease is pushed, with that exact lease.
+    /// Settles an owed or blocked release push (technical-design.md 10.9, step 5) outside the
+    /// mutation lock. It re-checks the frozen remote identity and observes the remote first, so a
+    /// push that already landed completes and a diverged remote stays blocked; only a remote that
+    /// still holds the lease is pushed, with that exact lease.
     async fn release_push_step(
         self: &Arc<Self>,
         runtime: &Arc<RepositoryRuntime>,
@@ -1123,10 +1124,10 @@ impl TollgateService {
     }
 
     /// Requires both Tollgate refs at their persisted OIDs (callers hold the mutation lock), with
-    /// one exception for a repository with release-stage steps (section 10): an external
-    /// fast-forward of `release` alone that stays a first-parent ancestor of `staging` is
-    /// adopted as uncertified, and the next push still needs a passing release run. Anything
-    /// else blocks the repository with its external-movement code and returns the error.
+    /// one exception for a repository with release-stage steps (technical-design.md 10.5): an
+    /// external fast-forward of `release` alone that stays a first-parent ancestor of `staging` is
+    /// adopted as uncertified, and the next push still needs a passing release run. Anything else
+    /// blocks the repository with its external-movement code and returns the error.
     pub(crate) async fn verify_tollgate_refs(
         &self,
         runtime: &RepositoryRuntime,
@@ -1174,7 +1175,7 @@ impl TollgateService {
         )
     }
 
-    /// Adopts an external fast-forward of `release` as uncertified (section 10).
+    /// Adopts an external fast-forward of `release` as uncertified (technical-design.md 10.5).
     pub(crate) async fn adopt_uncertified_release(
         &self,
         runtime: &RepositoryRuntime,
@@ -1311,12 +1312,11 @@ impl TollgateService {
         }))
     }
 
-    /// The `max_release_lag` pause (section 6), re-evaluated before each promotion attempt under
-    /// the mutation lock. The queue head waits while the release stage is configured, the limit
-    /// is positive, `release` trails `staging` by more than the limit, the latest release run
-    /// failed, and the head was not approved with `--release-fix`. Changes persist with
-    /// `promotion.paused` (which notifies) or `promotion.resumed`. Returns whether promotion
-    /// waits.
+    /// The `max_release_lag` pause (technical-design.md 10.9), re-evaluated before each promotion
+    /// attempt under the mutation lock. The queue head waits while the release stage is configured,
+    /// the limit is positive, `release` trails `staging` by more than the limit, the latest release
+    /// run failed, and the head was not approved with `--release-fix`. Changes persist with
+    /// `promotion.paused` (which notifies) or `promotion.resumed`. Returns whether promotion waits.
     pub(crate) fn reconcile_promotion_pause(
         &self,
         runtime: &RepositoryRuntime,

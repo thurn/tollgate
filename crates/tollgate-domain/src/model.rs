@@ -53,9 +53,10 @@ pub struct RepositoryState {
     pub active_window_ceiling: u16,
     pub remote_enabled: bool,
     /// Conditions that hold back `release` advances without blocking the repository:
-    /// `push-blocked` (a release push failed or diverged after the local advance) and
+    /// `push-blocked` (a release push failed or diverged after the local advance),
     /// `remote-preflight-mismatch` (the remote is not in Tollgate-certified history below the
-    /// release target). `staging` promotions continue meanwhile.
+    /// release target), and `release-range-unattributed` (the unreleased range has a commit
+    /// Tollgate neither promoted nor adopted). `staging` promotions continue meanwhile.
     pub release_block_reasons: Vec<BlockReason>,
     /// Set while promotion to `staging` waits on `max_release_lag` (`release-lag`); gate
     /// validation continues.

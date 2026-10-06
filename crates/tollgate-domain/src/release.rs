@@ -1,4 +1,4 @@
-//! Staged-release decisions (staged-release-design.md sections 5, 9, and 10): which certified
+//! Staged-release decisions (technical-design.md R1–R5 and sections 10.5 and 10.9): which certified
 //! `staging` commit `release` may advance to, how an interrupted advance recovers, how external
 //! `release` movement is classified, and when `max_release_lag` pauses promotion.
 //!
@@ -52,7 +52,8 @@ pub fn newest_release_target<T>(range: &[T], certified: impl Fn(&T) -> bool) -> 
     range.iter().rposition(certified)
 }
 
-/// How an unfinished release intent recovers from the observed `release` OID (section 9).
+/// How an unfinished release intent recovers from the observed `release` OID (technical-design.md
+/// 10.9).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReleaseIntentRecovery {
     /// `release` holds the intent's new OID: the compare-and-swap applied, so finalize.
@@ -104,7 +105,7 @@ pub fn classify_release_push<T: PartialEq>(
     }
 }
 
-/// The remote preflight of a release advance (section 9, step 2).
+/// The remote preflight of a release advance (technical-design.md 10.9, step 4).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReleasePreflight<T> {
     /// The remote already holds the target; the advance needs no push.
@@ -130,7 +131,8 @@ pub fn classify_release_preflight<T: PartialEq + Clone>(
     }
 }
 
-/// External movement of `release` in a repository with release-stage steps (section 10).
+/// External movement of `release` in a repository with release-stage steps (technical-design.md
+/// 10.5).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReleaseMovement {
     Unchanged,
@@ -156,10 +158,10 @@ pub fn classify_release_movement<T: PartialEq>(
     }
 }
 
-/// The `max_release_lag` safety valve (section 6): with a positive limit, promotion to `staging`
-/// waits while `release` trails it by more than the limit and the latest release run failed. A
-/// candidate approved with `--release-fix` is never held back, so the fix for a red release can
-/// always land.
+/// The `max_release_lag` safety valve (technical-design.md 10.9): with a positive limit, promotion
+/// to `staging` waits while `release` trails it by more than the limit and the latest release run
+/// failed. A candidate approved with `--release-fix` is never held back, so the fix for a red
+/// release can always land.
 pub fn release_lag_pauses_promotion(
     max_release_lag: u32,
     lag_commits: u64,
@@ -270,7 +272,7 @@ mod tests {
         assert!(!release_lag_pauses_promotion(2, 3, true, true));
     }
 
-    /// Where an advance stops when the process "crashes" (staged-release-design.md 12).
+    /// Where an advance stops when the process "crashes" (technical-design.md 21.3).
     #[derive(Clone, Copy, Debug)]
     enum Crash {
         None,

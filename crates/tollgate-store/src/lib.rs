@@ -31,7 +31,7 @@ pub const ARTIFACT_PRUNE_BATCH_KIND: &str = "artifact-prune-batch";
 /// durable `release.run-requested` intent the release trigger settles.
 pub const RELEASE_RUN_INTENT_KIND: &str = "release-run";
 
-/// Operation-intent kind of one `release` advance (staged-release-design.md 9): the release
+/// Operation-intent kind of one `release` advance (technical-design.md 10.9): the release
 /// intent (expected old `release`, new OID, release certificate) together with the frozen push
 /// of the new OID when pushing is enabled. It is `prepared` before the local compare-and-swap,
 /// `external-applied` once `release` advanced locally while the push is still owed, `completed`
