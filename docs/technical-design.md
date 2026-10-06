@@ -1184,6 +1184,8 @@ The desktop UI offers four operations, all on the Release route. Each calls the 
 
 The rest of the UI reads state: the Gate, Checks, and Release routes, the item inspector, paged history, a step's log tail, **Open raw** for a step's log file, and a **Refresh** button that reloads the snapshot.
 
+Quitting while work is active opens a confirmation whose **Quit** calls the shell's `confirm_quit` command (Section 19.2).
+
 Every other operation is CLI-only:
 
 - submission and authority: `tg candidate`, `tg approve`, and `tg push-master`;
@@ -1299,7 +1301,7 @@ Completion based on recovery evidence emits the same idempotent domain result as
 
 On explicit Quit, stop admitting work, persist shutdown intent, signal all worker groups, wait a bounded grace period, force-kill, checkpoint databases, release power assertions/locks, and mark clean shutdown. Running buildsets rerun in full next time.
 
-- **Confirmation.** Quit asks for confirmation first while work is active: a preparing or running buildset, or a gate item, independent check, or release run that is preparing or running.
+- **Confirmation.** Quit asks for confirmation first while work is active: a preparing or running buildset, or a gate item, independent check, or release run that is preparing or running. The shell keeps running, shows the main window, and emits `tollgate://quit-confirmation-required`. The window then opens a modal confirmation listing, per repository, the running buildset count and each gate item, check, and release run that is preparing or running, read from the live snapshot. **Quit** calls the `confirm_quit` command, which begins the shutdown below; **Keep running** (or Escape) dismisses the request and the app carries on, so a later Quit asks again.
 - **Admission.** Quit interrupts every preparing or running gate or release item under the repository mutation lock. An item task already dispatched but not yet preparing never starts once Quit begins, so its item stays queued.
 - **Settling.** Quit waits, within the same grace period, for every background task acting for a repository to finish: item execution, release triggers, and release advances. None spawns another once Quit begins. A task still running at the deadline leaves the shutdown unclean, and its repository stays locked until the process exits.
 - **Locks.** Only after every task settles and the databases are checkpointed does Quit release each repository ownership lock, so the repository can reopen at once in the same or a new process. Startup then recovers it like any other: an interrupted release run is started, so it keeps its target and reruns before its queued successor (section 12.7).

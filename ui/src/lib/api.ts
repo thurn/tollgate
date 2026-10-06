@@ -3,6 +3,9 @@ import type { AppSnapshot, GitOid, HistoryItemsPage, QueueItemView, ReleaseRetry
 import { demoSnapshot } from "./demo-data";
 import { isTauri } from "./utils";
 
+/** The Tauri shell emits this when Quit would interrupt active work; quitting then waits for {@link confirmQuit}. */
+export const QUIT_CONFIRMATION_EVENT = "tollgate://quit-confirmation-required";
+
 export async function getSnapshot(): Promise<AppSnapshot> {
   if (!isTauri()) return structuredClone(demoSnapshot);
   return invoke<AppSnapshot>("snapshot");
@@ -79,4 +82,9 @@ export async function getLogs(repositoryId: string, itemId: string, buildsetId: 
 
 export async function openRawLog(repositoryId: string, itemId: string, buildsetId: string | undefined, step?: string): Promise<void> {
   return invoke("open_raw_log", { repositoryId, itemId, buildsetId, step });
+}
+
+/** Quit after the user confirms interrupting active work; the shell then shuts down and exits. */
+export async function confirmQuit(): Promise<void> {
+  return invoke("confirm_quit");
 }

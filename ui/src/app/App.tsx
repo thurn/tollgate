@@ -8,8 +8,16 @@ import { ReleaseView } from "../features/release/ReleaseView";
 import { retryRelease, runRemoteOperation } from "../lib/api";
 import { EmptyState } from "./EmptyState";
 import { Button } from "../components/ui/Button";
+import { QuitConfirmation } from "./QuitConfirmation";
 
 export function App() {
+  return <>
+    <Workspace />
+    <QuitConfirmation />
+  </>;
+}
+
+function Workspace() {
   const state = useAppState();
 
   if (state.isLoading) return <div className="loading" role="status">Loading Tollgate…</div>;

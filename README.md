@@ -198,6 +198,8 @@ including `tg approve`, `tg cancel`, `tg retry`, `tg reorder`, `tg pause`,
 `tg check`, `tg worktree remove`, `tg slot reset`, `tg cache purge`,
 `tg artifact`, and `tg env reload`, runs from the CLI; see section 17.5 of
 [the technical design](docs/technical-design.md#175-operations).
+Quitting the app while work is active first opens a confirmation listing the
+running buildsets, gate items, checks, and release runs that Quit interrupts.
 
 ## Diagnosing CI failures
 

@@ -122,6 +122,21 @@ svg { stroke-width: 1.8; }
 .remote-ops__confirm-actions { display: flex; justify-content: flex-end; gap: 6px; margin-top: 12px; }
 .remote-ops .release-feedback { margin: 12px 0 0; }
 .remote-ops__result { opacity: .8; }
+.quit-confirm__backdrop { position: fixed; inset: 0; z-index: 50; display: grid; place-items: center; padding: 16px; background: rgba(24,31,27,.28); }
+.quit-confirm { width: min(440px, 100%); max-height: calc(100vh - 32px); overflow: auto; padding: 18px 20px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); box-shadow: 0 24px 60px rgba(24,31,27,.18); }
+.quit-confirm h2 { margin: 0 0 6px; font-size: 13px; letter-spacing: -.01em; }
+.quit-confirm > p { margin: 0 0 12px; color: var(--ink-muted); font-size: 9px; }
+.quit-confirm__note { font-weight: 600; }
+.quit-confirm__work { margin: 0 0 12px; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 10px; font-size: 9px; }
+.quit-confirm__work > li > strong { font-size: 10px; }
+.quit-confirm__count { margin-left: 8px; color: var(--amber); font-weight: 600; }
+.quit-confirm__work ul { margin: 6px 0 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 4px; }
+.quit-confirm__work ul li { display: grid; grid-template-columns: 70px minmax(0, 1fr) auto; gap: 8px; padding: 6px 8px; border-radius: 6px; background: var(--subtle); }
+.quit-confirm__kind { color: var(--ink-muted); }
+.quit-confirm__subject { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.quit-confirm__state { color: var(--brand); font-weight: 600; }
+.quit-confirm .release-feedback { margin: 0 0 12px; }
+.quit-confirm__actions { display: flex; justify-content: flex-end; gap: 6px; }
 .release-run { margin-bottom: 18px; padding: 16px 18px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
 .release-run.is-failing { border-color: #e2b9b6; box-shadow: inset 3px 0 var(--red); }
 .release-run__header { display: grid; grid-template-columns: 30px minmax(0, 1fr) auto; align-items: center; gap: 11px; }
