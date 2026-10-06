@@ -142,7 +142,7 @@ export const demoSnapshot: AppSnapshot = {
         { id: "event-81", repository_id: "019fef58-aaaa-7000-8000-e6aff447a5ba", sequence: 81, actor: "app", kind: "promotion.completed", payload: {}, created_at: ago(85) },
       ],
       configuration: {
-        digest: "0aa71db513e868d166f3640ef91bf93c", step_graph_digest: "c1d06b0345e664abafcb13713532aac8", remote_enabled: false,
+        digest: "0aa71db513e868d166f3640ef91bf93c", step_graph_digest: "c1d06b0345e664abafcb13713532aac8", remote_enabled: false, remote_name: "origin", remote_branch: "master",
         runner: ["/bin/zsh", "-c"],
         steps: [
           { name: "format", command: { kind: "shell", script: "cargo fmt --check" }, working_directory: ".", needs: [], soft_needs: [], voting: true, final_step: false, reuse_on_retry: false, timeout_ns: 3_600_000_000_000, cpu_tokens: 1, memory_bytes: 268435456, semaphores: [], include: ["**/*.rs"], exclude: [], environment: {}, remove_environment: [], artifacts: [] },
@@ -171,7 +171,7 @@ export const demoSnapshot: AppSnapshot = {
       },
       observed_master_oid: oid("61fa3c2"),
       queue: [], checks: [], history_items: [], history: [],
-      configuration: { digest: "acf214", step_graph_digest: "bb19fc", steps: [], remote_enabled: true, runner: ["/bin/sh", "-c"] },
+      configuration: { digest: "acf214", step_graph_digest: "bb19fc", steps: [], remote_enabled: true, remote_name: "origin", remote_branch: "main", runner: ["/bin/sh", "-c"] },
       resources: { max_buildsets: 4, repository_concurrency: 2, cpu_tokens: 8, memory_bytes: 17179869184, active_runs: 0, queued_runs: 0, cpu_reserved: 0, memory_reserved: 0, named_semaphores: {}, authoritative_volume_available: 68719476736, recovery_reserve: 10737418240, volumes: [{ id: "fs-2a", roles: ["artifacts", "authoritative", "database", "execution-cache", "logs"], available_bytes: 68719476736, warning_threshold: 16106127360, critical_threshold: 10737418240, emergency_allowance: 536870912, state: "healthy" }] }, slots: [], seeds: [], artifacts: [],
     },
   ],

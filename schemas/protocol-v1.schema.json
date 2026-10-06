@@ -87,7 +87,34 @@
     },
     "response": {
       "type": "object", "additionalProperties": false, "required": ["ok"],
-      "properties": { "ok": { "type": "boolean" }, "result": {}, "error": { "type": ["object", "null"], "properties": { "code": { "type": "string" }, "message": { "type": "string" }, "retryable": { "type": "boolean" } } } }
+      "properties": { "ok": { "type": "boolean" }, "result": {}, "error": { "$ref": "#/$defs/structuredError" } }
+    },
+    "oid": {
+      "type": "object", "required": ["format", "bytes"],
+      "properties": { "format": { "enum": ["sha1", "sha256"] }, "bytes": { "type": "string" } }
+    },
+    "structuredError": {
+      "type": ["object", "null"],
+      "properties": { "code": { "type": "string" }, "message": { "type": "string" }, "retryable": { "type": "boolean" }, "details": {} },
+      "allOf": [
+        {
+          "$comment": "Candidate rejections name the promoted staging tip as the only rebase target (JSON schema version 6).",
+          "if": { "type": "object", "required": ["code"], "properties": { "code": { "enum": ["stale-queue-prefix", "unknown-source-ancestor", "unpromoted-source-ancestor"] } } },
+          "then": {
+            "required": ["details"],
+            "properties": {
+              "details": {
+                "type": "object", "required": ["staging_oid", "retry"],
+                "properties": {
+                  "staging_oid": { "$ref": "#/$defs/oid" }, "ancestor_oid": { "$ref": "#/$defs/oid" }, "source_parent_oid": { "$ref": "#/$defs/oid" },
+                  "current_prefix_oid": { "$ref": "#/$defs/oid" }, "queue_revision": { "type": "integer" }, "retry": { "type": "string" }
+                },
+                "not": { "required": ["release_oid"] }
+              }
+            }
+          }
+        }
+      ]
     }
   }
 }

@@ -109,7 +109,7 @@ tg --no-launch --json status
 tg --no-launch --json candidate HEAD
 ```
 
-Ordinary `candidate` and `approve` submissions reject commits containing unpromoted source ancestry and return the promoted `staging` OID (the structured error's `release_oid` field) as the only supported rebase target. The explicit `push-master` workflow is the exception: it preserves the user's already-authored linear local commit chain and records dependencies between those commits while submitting them oldest-first.
+Ordinary `candidate` and `approve` submissions reject commits containing unpromoted source ancestry and return the promoted `staging` OID (the structured error's `staging_oid` detail) as the only supported rebase target. The explicit `push-master` workflow is the exception: it preserves the user's already-authored linear local commit chain and records dependencies between those commits while submitting them oldest-first.
 
 To submit every clean, linear commit on local `master` after the certified
 `staging` tip and have Tollgate push the resulting certified chain, run:
@@ -185,7 +185,12 @@ tg wait --released <candidate-id>   # wait until release contains the promoted c
 
 `tg wait --released` exits `0` once `release` contains the target and `1` when
 the release run covering it fails. The desktop app's Release view shows the
-same refs, lag, holds, and runs, and offers **Retry release run**.
+same refs, lag, holds, and runs, and offers **Retry release run**. Its Remote
+panel runs **Pull** and **Push** when the repository pushes to a remote, and
+**Reconcile** in every repository. Reconcile first previews the observed
+`staging` it adopts, the blocks and holds it clears, and the remote pushes it
+abandons, and it applies only if the queue revision and observed `staging` still
+match that preview.
 
 ## Diagnosing CI failures
 

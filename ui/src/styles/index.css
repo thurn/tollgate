@@ -107,6 +107,18 @@ svg { stroke-width: 1.8; }
 .release-refs__cell small { color: var(--ink-muted); font: 8px ui-monospace, SFMono-Regular, Menlo, monospace; }
 .release-feedback { margin: 0 0 14px; padding: 10px 13px; border: 1px solid #cfe1d8; border-radius: 7px; background: var(--brand-soft); color: var(--brand); font-size: 9px; }
 .release-feedback--error { border-color: #e7c9c7; background: var(--red-soft); color: var(--red); }
+.remote-ops { margin-bottom: 18px; padding: 14px 16px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface); }
+.remote-ops__header { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.remote-ops__header h2 { margin: 0 0 4px; font-size: 13px; letter-spacing: -.01em; }
+.remote-ops__header p { margin: 0; color: var(--ink-muted); font-size: 9px; }
+.remote-ops__actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.remote-ops__confirm { margin-top: 12px; padding: 12px 14px; border: 1px solid #ead9bb; border-radius: 7px; background: #fbf6eb; color: #5f4823; }
+.remote-ops__confirm h3 { margin: 0 0 8px; font-size: 11px; }
+.remote-ops__confirm ul { margin: 0; padding-left: 16px; display: flex; flex-direction: column; gap: 4px; font-size: 9px; }
+.remote-ops__stale { margin: 10px 0 0; color: var(--amber); font-size: 9px; font-weight: 600; }
+.remote-ops__confirm-actions { display: flex; justify-content: flex-end; gap: 6px; margin-top: 12px; }
+.remote-ops .release-feedback { margin: 12px 0 0; }
+.remote-ops__result { opacity: .8; }
 .release-run { margin-bottom: 18px; padding: 16px 18px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
 .release-run.is-failing { border-color: #e2b9b6; box-shadow: inset 3px 0 var(--red); }
 .release-run__header { display: grid; grid-template-columns: 30px minmax(0, 1fr) auto; align-items: center; gap: 11px; }
@@ -192,6 +204,7 @@ svg { stroke-width: 1.8; }
   .release-refs__cell { border-right: 0; border-bottom: 1px solid var(--line); }
   .release-refs__cell:last-child { border-bottom: 0; }
   .page-heading { flex-wrap: wrap; }
+  .remote-ops__header { flex-direction: column; align-items: flex-start; }
   .release-run__header { grid-template-columns: 30px minmax(0, 1fr); }
   .release-run__open { grid-column: 2; justify-self: start; }
 }

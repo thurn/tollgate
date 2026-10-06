@@ -5,7 +5,7 @@ import { ItemInspector } from "../features/queue/ItemInspector";
 import { RunsView } from "../features/runs/RunsView";
 import { ChecksView } from "../features/checks/ChecksView";
 import { ReleaseView } from "../features/release/ReleaseView";
-import { retryRelease } from "../lib/api";
+import { retryRelease, runRemoteOperation } from "../lib/api";
 import { EmptyState } from "./EmptyState";
 import { Button } from "../components/ui/Button";
 
@@ -22,7 +22,7 @@ export function App() {
       {!state.repository || !state.snapshot?.repositories.length ? <EmptyState /> : <div className="workspace__body">
         <main className="main-content">
           {state.route === "runs" && <RunsView repository={state.repository} historyItems={state.historyItems} selectedItemId={state.selectedItem?.item.id ?? null} onSelect={state.selectItem} hasMore={state.hasMoreHistory} loadingMore={state.isLoadingMoreHistory} onLoadMore={state.loadMoreHistory} />}
-          {state.route === "release" && <ReleaseView repository={state.repository} selectedItemId={state.selectedItem?.item.id ?? null} onSelect={state.selectItem} onRetry={async () => { const result = await retryRelease(state.repository!.state.id); void state.refetch(); return result; }} />}
+          {state.route === "release" && <ReleaseView repository={state.repository} selectedItemId={state.selectedItem?.item.id ?? null} onSelect={state.selectItem} onRetry={async () => { const result = await retryRelease(state.repository!.state.id); void state.refetch(); return result; }} onRemote={async (operation) => { try { return await runRemoteOperation(state.repository!.state.id, operation); } finally { void state.refetch(); } }} />}
           {state.route === "checks" && <ChecksView repository={state.repository} historyItems={state.historyItems} selectedItemId={state.selectedItem?.item.id ?? null} onSelect={state.selectItem} hasMore={state.hasMoreHistory} loadingMore={state.isLoadingMoreHistory} onLoadMore={state.loadMoreHistory} />}
         </main>
         <ItemInspector view={state.selectedItem} repository={state.repository} onClose={() => state.selectItem(null)} />

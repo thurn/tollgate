@@ -128,29 +128,32 @@ pub enum ServiceError {
     #[error("queue revision conflict: expected {expected}, actual {actual}")]
     RevisionConflict { expected: u64, actual: u64 },
     #[error(
-        "candidate source parent {source_parent_oid} belongs to a stale speculative queue prefix; current promoted release {release_oid}, queue revision {queue_revision}, internal queue prefix {current_prefix_oid}. Rebase the single task commit onto promoted `release` {release_oid}, never onto the speculative prefix, resolve and regenerate, then resubmit"
+        "candidate source parent {source_parent_oid} belongs to a stale speculative queue prefix; current promoted `staging` {staging_oid}, queue revision {queue_revision}, internal queue prefix {current_prefix_oid}. Rebase the single task commit onto promoted `staging` {staging_oid}, never onto the speculative prefix, resolve and regenerate, then resubmit"
     )]
     StaleQueuePrefix {
         source_parent_oid: GitOid,
-        release_oid: GitOid,
+        /// The promoted `staging` tip: the only supported rebase target.
+        staging_oid: GitOid,
         queue_revision: u64,
         current_prefix_oid: GitOid,
     },
     #[error(
-        "candidate source has unknown unmerged ancestor {ancestor}; current promoted release {release_oid}, queue revision {queue_revision}, internal queue prefix {current_prefix_oid}. Rebase the single task commit onto promoted `release` {release_oid}, never onto the speculative prefix, then resubmit"
+        "candidate source has unknown unmerged ancestor {ancestor}; current promoted `staging` {staging_oid}, queue revision {queue_revision}, internal queue prefix {current_prefix_oid}. Rebase the single task commit onto promoted `staging` {staging_oid}, never onto the speculative prefix, then resubmit"
     )]
     UnknownSourceAncestor {
         ancestor: GitOid,
-        release_oid: GitOid,
+        /// The promoted `staging` tip: the only supported rebase target.
+        staging_oid: GitOid,
         queue_revision: u64,
         current_prefix_oid: GitOid,
     },
     #[error(
-        "candidate source includes unpromoted ancestor {ancestor}; current promoted release is {release_oid}. Ordinary candidates must contain exactly one task commit based only on promoted `release`; speculative queue prefixes are internal Tollgate state and must never be incorporated into a source branch. Rebase the single task commit onto `release` {release_oid}, then resubmit"
+        "candidate source includes unpromoted ancestor {ancestor}; current promoted `staging` is {staging_oid}. Ordinary candidates must contain exactly one task commit based only on promoted `staging`; speculative queue prefixes are internal Tollgate state and must never be incorporated into a source branch. Rebase the single task commit onto `staging` {staging_oid}, then resubmit"
     )]
     UnpromotedSourceAncestor {
         ancestor: GitOid,
-        release_oid: GitOid,
+        /// The promoted `staging` tip: the only supported rebase target.
+        staging_oid: GitOid,
     },
     #[error("{message}")]
     ReleaseRetryUnavailable {
@@ -1669,7 +1672,7 @@ async fn migrate_to_staged_release(
     Ok(())
 }
 
-fn release_construction_failure(error: &GitError, release_oid: &GitOid) -> String {
+fn staging_construction_failure(error: &GitError, staging_oid: &GitOid) -> String {
     match error {
         GitError::SyntheticConflict {
             source_oid,
@@ -1677,10 +1680,12 @@ fn release_construction_failure(error: &GitError, release_oid: &GitOid) -> Strin
             conflicting_paths,
             ..
         } => format!(
-            "candidate could not be constructed on promoted release {release_oid}: applying source {source_oid} (source base {source_parent_oid}) produced merge conflicts in {conflicting_paths:?}. Rebase the single task commit onto the latest promoted `release` {release_oid}, resolve and regenerate, then resubmit"
+            "candidate could not be constructed on promoted `staging` {staging_oid}: applying source {source_oid} (source base {source_parent_oid}) produced merge conflicts in {conflicting_paths:?}. Rebase the single task commit onto the latest promoted `staging` {staging_oid}, resolve and regenerate, then resubmit"
         ),
         _ => {
-            format!("candidate could not be constructed on promoted release {release_oid}: {error}")
+            format!(
+                "candidate could not be constructed on promoted `staging` {staging_oid}: {error}"
+            )
         }
     }
 }
@@ -4675,7 +4680,7 @@ impl TollgateService {
             Ok(synthetic) => Some(synthetic),
             Err(error) if error.is_synthetic_rejection() && item.dependencies.is_empty() => {
                 // An independent candidate that conflicts with the current speculative
-                // prefix still gets a release-anchored validation lane.
+                // prefix still gets a staging-anchored validation lane.
                 ordered_ids = vec![item.id];
                 sources = vec![item.source_oid.clone()];
                 match runtime
@@ -4694,7 +4699,7 @@ impl TollgateService {
                             .state
                             .transition(ItemEvent::MergeConflict)
                             .map_err(|error| ServiceError::Invariant(error.to_string()))?;
-                        item.terminal_reason = Some(release_construction_failure(
+                        item.terminal_reason = Some(staging_construction_failure(
                             &standalone_error,
                             &state.staging_oid,
                         ));
@@ -7217,7 +7222,7 @@ impl TollgateService {
                 if !satisfied {
                     return Err(ServiceError::UnpromotedSourceAncestor {
                         ancestor: ancestor.clone(),
-                        release_oid: state.staging_oid.clone(),
+                        staging_oid: state.staging_oid.clone(),
                     });
                 }
             }
@@ -7259,14 +7264,14 @@ impl TollgateService {
             if historical_prefix {
                 return Err(ServiceError::StaleQueuePrefix {
                     source_parent_oid: probe.parent_oid.clone(),
-                    release_oid: state.staging_oid.clone(),
+                    staging_oid: state.staging_oid.clone(),
                     queue_revision: state.queue_revision,
                     current_prefix_oid,
                 });
             }
             return Err(ServiceError::UnknownSourceAncestor {
                 ancestor: ancestor.clone(),
-                release_oid: state.staging_oid.clone(),
+                staging_oid: state.staging_oid.clone(),
                 queue_revision: state.queue_revision,
                 current_prefix_oid,
             });
@@ -7406,7 +7411,7 @@ impl TollgateService {
                 let current_generations = runtime.store.generations()?;
                 return Err(ServiceError::StaleQueuePrefix {
                     source_parent_oid: probe.parent_oid,
-                    release_oid: current_state.staging_oid.clone(),
+                    staging_oid: current_state.staging_oid.clone(),
                     queue_revision: current_state.queue_revision,
                     current_prefix_oid: current_queue_prefix_from(
                         &current_state,
@@ -24491,7 +24496,8 @@ run = "true"
         assert!(message.contains("messages.json"));
         assert!(message.contains(&source_base));
         assert!(message.contains(&release));
-        assert!(message.contains("latest promoted `release`"));
+        assert!(message.contains("latest promoted `staging`"));
+        assert!(!message.contains("`release`"));
         assert!(!message.contains("earlier candidate"));
         assert_eq!(result.terminal_reason.as_deref(), Some(message));
         let snapshot = service
@@ -24964,11 +24970,18 @@ run = "true"
             )
             .await
             .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("`staging`"), "{message}");
+        assert!(!message.contains("`release`"), "{message}");
+        assert!(
+            message.contains(&initialized.state.staging_oid.to_string()),
+            "{message}"
+        );
         assert!(matches!(
             error,
-            ServiceError::UnpromotedSourceAncestor { ancestor, release_oid }
+            ServiceError::UnpromotedSourceAncestor { ancestor, staging_oid }
                 if ancestor == prerequisite.source_oid
-                    && release_oid == initialized.state.staging_oid
+                    && staging_oid == initialized.state.staging_oid
         ));
         let snapshot = service
             .repository_snapshot(initialized.state.id)
@@ -25228,10 +25241,10 @@ run = "true"
         match error {
             ServiceError::UnpromotedSourceAncestor {
                 ancestor,
-                release_oid,
+                staging_oid,
             } => {
                 assert_eq!(ancestor, *queued.tested_oid.as_ref().unwrap());
-                assert_eq!(release_oid, after_cancel.state.staging_oid);
+                assert_eq!(staging_oid, after_cancel.state.staging_oid);
             }
             error => panic!("expected unpromoted source ancestor, got {error}"),
         }

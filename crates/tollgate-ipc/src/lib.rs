@@ -20,7 +20,10 @@ pub const PROTOCOL_VERSION: u16 = 1;
 /// `release_fix`, and the `release_fix` flag of candidate authorization.
 /// Version 5 added the `release-retry` and `release-wait-status` commands, `tg release status`,
 /// and `tg wait --released`.
-pub const SCHEMA_VERSION: u16 = 5;
+/// Version 6 renamed the `release_oid` detail of the `stale-queue-prefix`,
+/// `unknown-source-ancestor`, and `unpromoted-source-ancestor` candidate rejections to
+/// `staging_oid`, the promoted `staging` tip they name as the only rebase target.
+pub const SCHEMA_VERSION: u16 = 6;
 /// Structured error code for a handshake between a `tg` and an app whose `SCHEMA_VERSION`s differ.
 pub const SCHEMA_MISMATCH_CODE: &str = "schema-version-mismatch";
 pub const MAX_CONTROL_PAYLOAD: usize = 8 * 1024 * 1024;

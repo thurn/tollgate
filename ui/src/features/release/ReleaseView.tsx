@@ -1,12 +1,14 @@
 import { useMutation } from "@tanstack/react-query";
 import { ChevronRight, RotateCcw } from "lucide-react";
-import { oidHex, type GitOid, type QueueItemView, type ReleaseRetryResult, type ReleaseState, type RepositorySnapshot } from "../../lib/types";
+import type { RemoteOperation } from "../../lib/api";
+import { oidHex, type GitOid, type QueueItemView, type ReleaseRetryResult, type ReleaseState, type RemoteSyncResult, type RepositorySnapshot } from "../../lib/types";
 import { Badge } from "../../components/ui/Badge";
 import { Button } from "../../components/ui/Button";
 import { StatusGlyph, itemStatus } from "../../components/StatusGlyph";
 import { cn, formatDuration, shortId } from "../../lib/utils";
 import { QueueCard } from "../queue/QueueCard";
 import { failingSteps, hasReleaseStage, releaseLagLabel, releaseRuns } from "./release";
+import { RemoteOperations } from "./RemoteOperations";
 
 const stateBadges: Record<ReleaseState, { label: string; tone: "success" | "info" | "danger" }> = {
   green: { label: "Released", tone: "success" },
@@ -14,11 +16,12 @@ const stateBadges: Record<ReleaseState, { label: string; tone: "success" | "info
   failing: { label: "Failing", tone: "danger" },
 };
 
-export function ReleaseView({ repository, selectedItemId, onSelect, onRetry }: {
+export function ReleaseView({ repository, selectedItemId, onSelect, onRetry, onRemote }: {
   repository: RepositorySnapshot;
   selectedItemId: string | null;
   onSelect: (id: string | null) => void;
   onRetry: () => Promise<ReleaseRetryResult>;
+  onRemote: (operation: RemoteOperation) => Promise<RemoteSyncResult>;
 }) {
   const state = repository.state;
   const stage = hasReleaseStage(repository);
@@ -55,6 +58,7 @@ export function ReleaseView({ repository, selectedItemId, onSelect, onRetry }: {
       ? <>Release run queued for <code>{shortId(oidHex(retry.data.target_oid), 8)}</code>.</>
       : <>A release run for <code>{shortId(oidHex(retry.data.target_oid), 8)}</code> is already queued or running.</>}</p>}
     {retry.isError && <p className="release-feedback release-feedback--error" role="alert">{retry.error instanceof Error ? retry.error.message : String(retry.error)}</p>}
+    <RemoteOperations key={state.id} repository={repository} onRun={onRemote} />
     {!stage ? <section className="empty-state"><h2>No release stage</h2><p>Add steps with <code>stage = "release"</code> to validate releases after promotion.</p></section> : <>
       {featured && <FeaturedRun view={featured} current={featured === active} onOpen={() => toggle(featured.item.id)} />}
       {runs.length ? <section className="runs-list" aria-label="Release runs">

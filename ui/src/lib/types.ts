@@ -77,7 +77,7 @@ export interface EffectiveStep {
 export interface DomainEvent { id: string; repository_id: string; sequence: number; actor: string; command_id?: string; kind: string; payload: unknown; created_at: Timestamp }
 export interface QueueItemView { item: QueueItem; generation?: ValidationGeneration; buildset?: Buildset; attempts?: Buildset[]; attempt_generations?: ValidationGeneration[]; certificate?: PassCertificate; certificates?: PassCertificate[]; included_items: string[]; elapsed_ms?: number; failure_attribution?: FailureAttribution }
 export interface HistoryItemsPage { items: QueueItemView[]; total: number; offset: number }
-export interface ConfigurationView { digest: string; step_graph_digest: string; steps: EffectiveStep[]; remote_enabled: boolean; runner: string[] }
+export interface ConfigurationView { digest: string; step_graph_digest: string; steps: EffectiveStep[]; remote_enabled: boolean; remote_name: string; remote_branch: string; runner: string[] }
 export interface VolumeView { id: string; roles: string[]; available_bytes: number; warning_threshold: number; critical_threshold: number; emergency_allowance: number; state: "healthy" | "warning" | "critical" }
 export interface ResourceView { max_buildsets: number; repository_concurrency: number; cpu_tokens: number; memory_bytes: number; active_runs: number; queued_runs: number; cpu_reserved: number; memory_reserved: number; named_semaphores: Record<string, number>; authoritative_volume_available: number; recovery_reserve: number; volumes: VolumeView[] }
 export interface SlotView { id: string; path: string; state: string; checkout_oid?: GitOid; health: string; last_used?: Timestamp }
@@ -95,6 +95,13 @@ export interface AppSnapshot { version: string; generated_at: Timestamp; reposit
 export interface ReleaseRetryResult {
   repository_id: string; action: "queued" | "already-active"; item_id: string; target_oid: GitOid;
   staging_oid: GitOid; release_oid: GitOid; retry_of_item_id: string | null; superseded_item_ids: string[];
+}
+
+export type RemoteSyncAction = "up-to-date" | "adopted-remote" | "local-ahead" | "pushed" | "reconciled-local" | "diverged";
+/** The result of `tg pull`, `tg push`, and `tg reconcile`. */
+export interface RemoteSyncResult {
+  action: RemoteSyncAction; local_master: GitOid; remote_master: GitOid | null; queue_revision: number;
+  affected_item_ids: string[]; message: string;
 }
 
 export function oidHex(oid?: GitOid) { return oid?.bytes ?? ""; }

@@ -789,18 +789,10 @@ pub fn run() {
             let quit = quit.clone();
             let shutting_down = shutting_down.clone();
             tauri::async_runtime::spawn(async move {
-                let has_active_work = service.snapshot().await.is_ok_and(|snapshot| {
-                    snapshot.repositories.iter().any(|repository| {
-                        repository.resources.active_runs > 0
-                            || repository.queue.iter().any(|item| {
-                                matches!(
-                                    item.item.state,
-                                    tollgate_domain::QueueItemState::Preparing
-                                        | tollgate_domain::QueueItemState::Running
-                                )
-                            })
-                    })
-                });
+                let has_active_work = service
+                    .snapshot()
+                    .await
+                    .is_ok_and(|snapshot| has_active_work(&snapshot));
                 if has_active_work && !quit.confirmed.load(Ordering::Acquire) {
                     let _ = app.emit("tollgate://quit-confirmation-required", ());
                     if let Some(window) = app.get_webview_window("main") {
@@ -817,6 +809,26 @@ pub fn run() {
             });
         }
     });
+}
+
+/// Whether Quit would interrupt work and so needs confirmation: a running buildset, or a gate
+/// item, independent check, or release run that is preparing or running.
+fn has_active_work(snapshot: &AppSnapshot) -> bool {
+    snapshot.repositories.iter().any(|repository| {
+        repository.resources.active_runs > 0
+            || repository
+                .queue
+                .iter()
+                .chain(&repository.checks)
+                .chain(&repository.release_runs)
+                .any(|view| {
+                    matches!(
+                        view.item.state,
+                        tollgate_domain::QueueItemState::Preparing
+                            | tollgate_domain::QueueItemState::Running
+                    )
+                })
+    })
 }
 
 async fn monitor_failure_notifications(
@@ -1119,6 +1131,173 @@ fn event_notification(kind: &str, payload: &serde_json::Value) -> Option<(String
         }
     });
     Some((subject, body))
+}
+
+#[cfg(test)]
+mod quit_tests {
+    use super::*;
+
+    const REPOSITORY_ID: &str = "019ffe40-a60d-7722-a369-2635222d1204";
+
+    fn oid() -> serde_json::Value {
+        serde_json::json!({ "format": "sha1", "bytes": "1111111111111111111111111111111111111111" })
+    }
+
+    fn item(id: &str, kind: &str, state: &str) -> serde_json::Value {
+        serde_json::json!({
+            "item": {
+                "id": id,
+                "repository_id": REPOSITORY_ID,
+                "kind": kind,
+                "enqueue_sequence": 1,
+                "source_oid": oid(),
+                "source_ref": "refs/tollgate/sources/test",
+                "metadata": {
+                    "subject": "subject",
+                    "message_hash": "message-hash",
+                    "author_name": "Test Author",
+                    "author_email": "test@example.com",
+                    "branch": null,
+                    "worktree_path": null,
+                    "signature_state": "unsigned",
+                    "approved_at": [2026, 227, 0, 0, 0, 0, 0, 0, 0],
+                    "purpose": null
+                },
+                "state": state,
+                "terminal_reason": null,
+                "remote_state": "disabled",
+                "cleanup_state": "not-eligible",
+                "dependencies": [],
+                "promotion_authorized": false,
+                "promotion_authorized_at": null,
+                "promotion_authorized_by": null,
+                "current_generation_id": null,
+                "buildset_id": null,
+                "certificate_id": null
+            },
+            "generation": null,
+            "buildset": null,
+            "attempts": [],
+            "attempt_generations": [],
+            "certificate": null,
+            "certificates": [],
+            "included_items": [],
+            "elapsed_ms": null,
+            "failure_attribution": null
+        })
+    }
+
+    /// An app snapshot of one repository with no running buildset and the given items.
+    fn snapshot(
+        queue: Vec<serde_json::Value>,
+        checks: Vec<serde_json::Value>,
+        release_runs: Vec<serde_json::Value>,
+    ) -> AppSnapshot {
+        serde_json::from_value(serde_json::json!({
+            "version": "test",
+            "generated_at": [2026, 227, 0, 0, 0, 0, 0, 0, 0],
+            "repositories": [{
+                "state": {
+                    "id": REPOSITORY_ID,
+                    "name": "test-repository",
+                    "path": "/tmp/test-repository",
+                    "staging_ref": "refs/heads/staging",
+                    "staging_oid": oid(),
+                    "release_ref": "refs/heads/release",
+                    "release_oid": oid(),
+                    "release_lag": { "commits": 0, "since": null },
+                    "release_state": "pending",
+                    "queue_revision": 1,
+                    "event_sequence": 1,
+                    "engine_epoch": 1,
+                    "execution_state": "active",
+                    "block_reasons": [],
+                    "active_configuration_digest": "configuration-digest",
+                    "active_window": 1,
+                    "active_window_floor": 1,
+                    "active_window_ceiling": 1,
+                    "remote_enabled": false
+                },
+                "observed_master_oid": oid(),
+                "queue": queue,
+                "checks": checks,
+                "release_runs": release_runs,
+                "master_push": null,
+                "history_items": [],
+                "history": [],
+                "configuration": {
+                    "digest": "configuration-digest",
+                    "step_graph_digest": "step-graph-digest",
+                    "steps": [],
+                    "remote_enabled": false,
+                    "remote_name": "origin",
+                    "remote_branch": "main",
+                    "runner": []
+                },
+                "resources": {
+                    "max_buildsets": 1,
+                    "repository_concurrency": 1,
+                    "cpu_tokens": 1,
+                    "memory_bytes": 1,
+                    "active_runs": 0,
+                    "queued_runs": 0,
+                    "cpu_reserved": 0,
+                    "memory_reserved": 0,
+                    "named_semaphores": {},
+                    "authoritative_volume_available": 1,
+                    "recovery_reserve": 1,
+                    "volumes": []
+                },
+                "slots": [],
+                "seeds": [],
+                "artifacts": []
+            }],
+            "unavailable_repositories": [],
+            "environment": {
+                "snapshot_id": "environment",
+                "fingerprint": "fingerprint",
+                "path": "/usr/bin",
+                "variable_count": 0
+            }
+        }))
+        .unwrap()
+    }
+
+    const ITEM_ID: &str = "019ffe40-a60d-7722-a369-2635222d1205";
+
+    #[test]
+    fn quit_asks_for_confirmation_while_a_release_run_is_in_flight() {
+        for state in ["preparing", "running"] {
+            let release = snapshot(vec![], vec![], vec![item(ITEM_ID, "release", state)]);
+            assert!(has_active_work(&release), "release run {state}");
+        }
+        let finished = snapshot(
+            vec![],
+            vec![],
+            vec![item(ITEM_ID, "release", "check-failed")],
+        );
+        assert!(!has_active_work(&finished));
+        let queued = snapshot(vec![], vec![], vec![item(ITEM_ID, "release", "queued")]);
+        assert!(!has_active_work(&queued));
+    }
+
+    #[test]
+    fn quit_asks_for_confirmation_while_a_gate_item_or_check_is_in_flight() {
+        assert!(!has_active_work(&snapshot(vec![], vec![], vec![])));
+        assert!(has_active_work(&snapshot(
+            vec![item(ITEM_ID, "gate", "running")],
+            vec![],
+            vec![]
+        )));
+        assert!(has_active_work(&snapshot(
+            vec![],
+            vec![item(ITEM_ID, "independent-check", "preparing")],
+            vec![]
+        )));
+        let mut running_buildset = snapshot(vec![], vec![], vec![]);
+        running_buildset.repositories[0].resources.active_runs = 1;
+        assert!(has_active_work(&running_buildset));
+    }
 }
 
 #[cfg(test)]
@@ -2007,7 +2186,7 @@ fn encode_service_error(error: ServiceError) -> String {
         }),
         ServiceError::StaleQueuePrefix {
             source_parent_oid,
-            release_oid,
+            staging_oid,
             queue_revision,
             current_prefix_oid,
         } => Some(StructuredError {
@@ -2016,15 +2195,15 @@ fn encode_service_error(error: ServiceError) -> String {
             retryable: true,
             details: Some(serde_json::json!({
                 "source_parent_oid": source_parent_oid,
-                "release_oid": release_oid,
+                "staging_oid": staging_oid,
                 "queue_revision": queue_revision,
                 "current_prefix_oid": current_prefix_oid,
-                "retry": "Rebase the single task commit onto release_oid only, never current_prefix_oid; resolve and regenerate, then resubmit."
+                "retry": "Rebase the single task commit onto staging_oid only, never current_prefix_oid; resolve and regenerate, then resubmit."
             })),
         }),
         ServiceError::UnknownSourceAncestor {
             ancestor,
-            release_oid,
+            staging_oid,
             queue_revision,
             current_prefix_oid,
         } => Some(StructuredError {
@@ -2033,23 +2212,23 @@ fn encode_service_error(error: ServiceError) -> String {
             retryable: true,
             details: Some(serde_json::json!({
                 "ancestor_oid": ancestor,
-                "release_oid": release_oid,
+                "staging_oid": staging_oid,
                 "queue_revision": queue_revision,
                 "current_prefix_oid": current_prefix_oid,
-                "retry": "Rebase the single task commit onto release_oid only, never current_prefix_oid, then resubmit."
+                "retry": "Rebase the single task commit onto staging_oid only, never current_prefix_oid, then resubmit."
             })),
         }),
         ServiceError::UnpromotedSourceAncestor {
             ancestor,
-            release_oid,
+            staging_oid,
         } => Some(StructuredError {
             code: "unpromoted-source-ancestor".into(),
             message: message.clone(),
             retryable: true,
             details: Some(serde_json::json!({
                 "ancestor_oid": ancestor,
-                "release_oid": release_oid,
-                "retry": "Rebase the single task commit onto release_oid only, then resubmit."
+                "staging_oid": staging_oid,
+                "retry": "Rebase the single task commit onto staging_oid only, then resubmit."
             })),
         }),
         ServiceError::ReleaseRetryUnavailable {
@@ -2130,14 +2309,14 @@ mod ipc_error_tests {
 
     #[test]
     fn stale_candidate_error_preserves_retry_context() {
-        let release_oid = GitOid::from_hex("1111111111111111111111111111111111111111").unwrap();
+        let staging_oid = GitOid::from_hex("1111111111111111111111111111111111111111").unwrap();
         let source_parent_oid =
             GitOid::from_hex("2222222222222222222222222222222222222222").unwrap();
         let current_prefix_oid =
             GitOid::from_hex("3333333333333333333333333333333333333333").unwrap();
         let encoded = encode_service_error(ServiceError::StaleQueuePrefix {
             source_parent_oid: source_parent_oid.clone(),
-            release_oid: release_oid.clone(),
+            staging_oid: staging_oid.clone(),
             queue_revision: 42,
             current_prefix_oid: current_prefix_oid.clone(),
         });
@@ -2151,8 +2330,8 @@ mod ipc_error_tests {
         assert!(error.retryable);
         assert_eq!(error.details.as_ref().unwrap()["queue_revision"], 42);
         assert_eq!(
-            error.details.as_ref().unwrap()["release_oid"],
-            serde_json::to_value(release_oid).unwrap()
+            error.details.as_ref().unwrap()["staging_oid"],
+            serde_json::to_value(staging_oid).unwrap()
         );
         assert_eq!(
             error.details.as_ref().unwrap()["source_parent_oid"],
@@ -2166,8 +2345,77 @@ mod ipc_error_tests {
             error.details.as_ref().unwrap()["retry"]
                 .as_str()
                 .unwrap()
-                .contains("release_oid only")
+                .contains("staging_oid only")
         );
+    }
+
+    /// Every candidate rejection names `staging`, the only supported rebase target, in its
+    /// message and in a `staging_oid` detail, and reports no `release_oid`.
+    #[test]
+    fn candidate_rejections_name_staging_as_the_rebase_target() {
+        let staging_oid = GitOid::from_hex("1111111111111111111111111111111111111111").unwrap();
+        let other = GitOid::from_hex("2222222222222222222222222222222222222222").unwrap();
+        let prefix = GitOid::from_hex("3333333333333333333333333333333333333333").unwrap();
+        let rejections = [
+            (
+                "stale-queue-prefix",
+                ServiceError::StaleQueuePrefix {
+                    source_parent_oid: other.clone(),
+                    staging_oid: staging_oid.clone(),
+                    queue_revision: 7,
+                    current_prefix_oid: prefix.clone(),
+                },
+            ),
+            (
+                "unknown-source-ancestor",
+                ServiceError::UnknownSourceAncestor {
+                    ancestor: other.clone(),
+                    staging_oid: staging_oid.clone(),
+                    queue_revision: 7,
+                    current_prefix_oid: prefix.clone(),
+                },
+            ),
+            (
+                "unpromoted-source-ancestor",
+                ServiceError::UnpromotedSourceAncestor {
+                    ancestor: other.clone(),
+                    staging_oid: staging_oid.clone(),
+                },
+            ),
+        ];
+        for (code, rejection) in rejections {
+            let encoded = encode_service_error(rejection);
+            let error: StructuredError = serde_json::from_str(
+                encoded
+                    .strip_prefix(STRUCTURED_SERVICE_ERROR_PREFIX)
+                    .expect("candidate rejections cross IPC as structured errors"),
+            )
+            .unwrap();
+            assert_eq!(error.code, code);
+            assert!(
+                error
+                    .message
+                    .contains(&format!("`staging` {}", staging_oid.to_hex())),
+                "{code}: {}",
+                error.message
+            );
+            assert!(
+                !error.message.contains("release"),
+                "{code}: {}",
+                error.message
+            );
+            let details = error.details.unwrap();
+            assert_eq!(
+                details["staging_oid"],
+                serde_json::to_value(&staging_oid).unwrap(),
+                "{code}"
+            );
+            assert!(details.get("release_oid").is_none(), "{code}");
+            assert!(
+                details["retry"].as_str().unwrap().contains("staging_oid"),
+                "{code}"
+            );
+        }
     }
 
     #[test]
@@ -2229,11 +2477,11 @@ mod ipc_error_tests {
 
     #[test]
     fn unpromoted_source_error_never_exposes_the_speculative_prefix_as_a_base() {
-        let release_oid = GitOid::from_hex("1111111111111111111111111111111111111111").unwrap();
+        let staging_oid = GitOid::from_hex("1111111111111111111111111111111111111111").unwrap();
         let ancestor = GitOid::from_hex("2222222222222222222222222222222222222222").unwrap();
         let encoded = encode_service_error(ServiceError::UnpromotedSourceAncestor {
             ancestor: ancestor.clone(),
-            release_oid: release_oid.clone(),
+            staging_oid: staging_oid.clone(),
         });
         let error: StructuredError = serde_json::from_str(
             encoded
@@ -2244,8 +2492,8 @@ mod ipc_error_tests {
         assert_eq!(error.code, "unpromoted-source-ancestor");
         assert!(error.retryable);
         assert_eq!(
-            error.details.as_ref().unwrap()["release_oid"],
-            serde_json::to_value(release_oid).unwrap()
+            error.details.as_ref().unwrap()["staging_oid"],
+            serde_json::to_value(staging_oid).unwrap()
         );
         assert_eq!(
             error.details.as_ref().unwrap()["ancestor_oid"],
@@ -2518,6 +2766,98 @@ mod startup_ipc_tests {
         let snapshot = snapshot(&mut client).await;
         assert!(snapshot.activating_repositories.is_empty());
         assert_eq!(snapshot.repositories.len(), 2);
+        server.abort();
+    }
+
+    /// The CLI prints a rejected candidate's structured error verbatim under `--json`, so the
+    /// IPC response is the JSON contract: it names promoted `staging` as the rebase target.
+    #[tokio::test]
+    async fn a_rejected_candidate_reports_staging_as_its_rebase_target() {
+        let temporary = tempfile::tempdir().unwrap();
+        let support = temporary.path().join("support");
+        let repository = committed_repository(temporary.path(), "repository");
+        let prerequisite = temporary.path().join("prerequisite");
+        let dependent = temporary.path().join("dependent");
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "prerequisite",
+                prerequisite.to_str().unwrap(),
+                "master",
+            ],
+        );
+        std::fs::write(prerequisite.join("a.txt"), "a\n").unwrap();
+        git(&prerequisite, &["add", "a.txt"]);
+        git(&prerequisite, &["commit", "-m", "prerequisite"]);
+        git(&repository, &["switch", "--detach", "master"]);
+        let socket = support.join("tollgate.sock");
+        let (_service, server) = start_serving(&socket, || TollgateService::start(support.clone()))
+            .await
+            .unwrap();
+        let mut client = connect(&socket).await;
+        let initialized = request(
+            &mut client,
+            IpcCommand::Initialize {
+                path: repository.to_string_lossy().into_owned(),
+                run: Some("true".into()),
+                bootstrap: false,
+                detach_master: false,
+            },
+        )
+        .await;
+        assert!(initialized.ok, "{:?}", initialized.error);
+        let initialized: RepositorySnapshot =
+            serde_json::from_value(initialized.result.unwrap()).unwrap();
+        let candidate = |path: &Path| IpcCommand::Candidate {
+            repository_id: initialized.state.id,
+            revision: "HEAD".into(),
+            worktree_path: Some(path.to_string_lossy().into_owned()),
+            retain_worktree: false,
+            command_id: CommandId::new(),
+        };
+        let queued = request(&mut client, candidate(&prerequisite)).await;
+        assert!(queued.ok, "{:?}", queued.error);
+        let queued: ApproveResult = serde_json::from_value(queued.result.unwrap()).unwrap();
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "dependent",
+                dependent.to_str().unwrap(),
+                &queued.source_oid.to_hex(),
+            ],
+        );
+        std::fs::write(dependent.join("b.txt"), "b\n").unwrap();
+        git(&dependent, &["add", "b.txt"]);
+        git(&dependent, &["commit", "-m", "dependent"]);
+
+        let rejected = request(&mut client, candidate(&dependent)).await;
+        assert!(!rejected.ok);
+        let error = rejected.error.unwrap();
+        assert_eq!(error.code, "unpromoted-source-ancestor");
+        let staging_oid = initialized.state.staging_oid;
+        assert!(
+            error
+                .message
+                .contains(&format!("`staging` {}", staging_oid.to_hex())),
+            "{}",
+            error.message
+        );
+        let details = error.details.unwrap();
+        assert_eq!(
+            details["staging_oid"],
+            serde_json::to_value(&staging_oid).unwrap()
+        );
+        assert_eq!(
+            details["ancestor_oid"],
+            serde_json::to_value(&queued.source_oid).unwrap()
+        );
+        assert!(details.get("release_oid").is_none());
         server.abort();
     }
 

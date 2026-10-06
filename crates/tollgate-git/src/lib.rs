@@ -48,7 +48,7 @@ pub enum GitError {
     #[error("Git could not rebase the requested commit")]
     Unmergeable,
     #[error(
-        "cannot speculatively combine source {source_oid} with the current internal queue prefix {prefix_oid}: merge conflicts in {conflicting_paths:?} (source base {source_parent_oid}). Keep the source commit based only on promoted `release`; never rebase it onto a speculative prefix. Retry after the conflicting earlier candidate is promoted, canceled, or reordered. If promoted `release` itself has advanced incompatibly, rebase onto the latest `release`, resolve and regenerate, then resubmit"
+        "cannot speculatively combine source {source_oid} with the current internal queue prefix {prefix_oid}: merge conflicts in {conflicting_paths:?} (source base {source_parent_oid}). Keep the source commit based only on promoted `staging`; never rebase it onto a speculative prefix. Retry after the conflicting earlier candidate is promoted, canceled, or reordered. If promoted `staging` itself has advanced incompatibly, rebase onto the latest `staging`, resolve and regenerate, then resubmit"
     )]
     SyntheticConflict {
         source_oid: GitOid,
@@ -3601,7 +3601,8 @@ mod tests {
         assert!(message.contains("messages.json"));
         assert!(message.contains(&source_base));
         assert!(message.contains(&prefix.to_hex()));
-        assert!(message.contains("based only on promoted `release`"));
+        assert!(message.contains("based only on promoted `staging`"));
+        assert!(!message.contains("`release`"));
         assert!(message.contains("never rebase it onto a speculative prefix"));
     }
 
