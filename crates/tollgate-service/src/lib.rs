@@ -821,7 +821,8 @@ struct RepositoryRuntime {
     /// The `release_concurrency` permit. Release runs hold it instead of an execution permit,
     /// so they never delay gate admission beyond the global buildset and slot limits. A larger
     /// count never starts a second release run: [`release_run_may_start`] admits only the
-    /// oldest active one.
+    /// oldest active one, and none while a retired run's worker is still live. A configuration
+    /// apply replaces this semaphore while a retired run may still hold a permit of the old one.
     release_permits: RwLock<Arc<Semaphore>>,
     /// Set when a release trigger is owed: a promotion recorded a release-run intent, the
     /// configuration changed, or the repository activated. Cleared by the spawned trigger.
@@ -11989,6 +11990,7 @@ impl TollgateService {
             return Ok(());
         }
         let (mut item, generation, retry_of, attempt) = {
+            let live = runtime.dispatching.lock().clone();
             let data = runtime.data.lock();
             let item = data
                 .items
@@ -12004,8 +12006,9 @@ impl TollgateService {
             }
             // Decided under the mutation lock that starts the run, so two dispatched release
             // runs can never both start; the one left queued is dispatched again when the
-            // started one ends.
-            if item.kind == QueueItemKind::Release && !release_run_may_start(&data, item_id) {
+            // started one's task ends.
+            if item.kind == QueueItemKind::Release && !release_run_may_start(&data, &live, item_id)
+            {
                 return Ok(());
             }
             if item.kind == QueueItemKind::Gate {
@@ -13655,6 +13658,7 @@ impl TollgateService {
             return;
         }
         let eligible = {
+            let live = runtime.dispatching.lock().clone();
             let data = runtime.data.lock();
             let mut eligible = data
                 .items
@@ -13671,7 +13675,7 @@ impl TollgateService {
                         item.kind != QueueItemKind::Gate
                             && item.state == QueueItemState::Queued
                             && (item.kind != QueueItemKind::Release
-                                || release_run_may_start(&data, item.id))
+                                || release_run_may_start(&data, &live, item.id))
                     })
                     .map(|item| item.id),
             );
@@ -16947,12 +16951,30 @@ fn promotion_activated_configuration(
 /// them in queue order: only the oldest active release run may start, and it stays the oldest
 /// until it ends. With the trigger's coalescing, this keeps at most one started and one queued
 /// release run per repository and delivers their outcomes in target order.
-fn release_run_may_start(data: &RuntimeData, item_id: QueueItemId) -> bool {
-    data.items
-        .iter()
-        .filter(|item| item.kind == QueueItemKind::Release && !item.state.is_terminal())
-        .min_by_key(|item| item.enqueue_sequence)
-        .is_some_and(|oldest| oldest.id == item_id)
+///
+/// A run retired or canceled while running is terminal at once, but its worker keeps its slot
+/// until its process group exits and its task ends. `live` holds the items whose task is still
+/// dispatching or executing, so such a run keeps the repository's release run slot until then,
+/// across a configuration change that replaces the `release_concurrency` permit. The ending task
+/// dispatches the successor.
+fn release_run_may_start(
+    data: &RuntimeData,
+    live: &HashSet<QueueItemId>,
+    item_id: QueueItemId,
+) -> bool {
+    let retired_worker_live = data.items.iter().any(|item| {
+        item.kind == QueueItemKind::Release
+            && item.state.is_terminal()
+            && item.id != item_id
+            && live.contains(&item.id)
+    });
+    !retired_worker_live
+        && data
+            .items
+            .iter()
+            .filter(|item| item.kind == QueueItemKind::Release && !item.state.is_terminal())
+            .min_by_key(|item| item.enqueue_sequence)
+            .is_some_and(|oldest| oldest.id == item_id)
 }
 
 /// Whether the latest conclusive release run, the one with the newest target, failed.
@@ -28934,6 +28956,106 @@ policy = "clone"
             "outcomes arrive in target order"
         );
         assert_eq!(finished.state.staging_oid, tip_c);
+    }
+
+    #[tokio::test]
+    async fn a_release_stage_change_starts_the_replacement_only_after_the_retired_worker_exits() {
+        let temporary = tempfile::tempdir().unwrap();
+        let gate = temporary.path().join("release-may-finish");
+        let started = temporary.path().join("release-started");
+        let terminating = temporary.path().join("release-terminating");
+        async fn wait_for_file(path: &Path, what: &str) {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+            while !path.exists() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "timed out waiting for {what}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
+        // The step outlives its termination signal until the gate opens, so the retired run's
+        // worker is still live when the replacement becomes the oldest active release run.
+        let release_step = |label: &str| {
+            format!(
+                "\n[[step]]\nname = \"full\"\nstage = \"release\"\nrun = \"trap 'touch {terminating}; while [ ! -f {gate} ]; do sleep 0.05; done; exit 1' TERM; touch {started}; while [ ! -f {gate} ]; do sleep 0.05; done; echo {label}\"\nneeds = [\"fast\"]\n",
+                started = started.display(),
+                terminating = terminating.display(),
+                gate = gate.display(),
+            )
+        };
+        let (service, id, repository) = staged_release_repository(
+            temporary.path(),
+            &[],
+            &[("feature-a", "a.txt", "a\n")],
+            &release_step("first"),
+        )
+        .await;
+        let runtime = service.runtime(id).await.unwrap();
+        let tip = approve_and_promote(&service, id, "feature-a").await;
+        let running =
+            wait_for_release_snapshot(&service, id, "the release run to start", |snapshot| {
+                release_runs_for(snapshot, &tip)
+                    .iter()
+                    .any(|view| view.item.state == QueueItemState::Running)
+            })
+            .await;
+        let retired_run = release_runs_for(&running, &tip)[0].item.id;
+        wait_for_file(&started, "the release step to start").await;
+
+        std::fs::write(
+            repository.join(".tollgate/config.toml"),
+            format!(
+                "version = 1\n\n[[step]]\nname = \"fast\"\nrun = \"true\"\n{}",
+                release_step("second")
+            ),
+        )
+        .unwrap();
+        service
+            .apply_configuration(id, CommandId::new())
+            .await
+            .unwrap();
+        let replaced =
+            wait_for_release_snapshot(&service, id, "the retired run to be replaced", |snapshot| {
+                release_runs_for(snapshot, &tip)
+                    .iter()
+                    .any(|view| view.item.id != retired_run && !view.item.state.is_terminal())
+            })
+            .await;
+        let replacement = release_runs_for(&replaced, &tip)
+            .into_iter()
+            .find(|view| view.item.id != retired_run)
+            .unwrap()
+            .item
+            .id;
+        assert_eq!(
+            service.item_status(id, retired_run).await.unwrap().state,
+            QueueItemState::Superseded
+        );
+        wait_for_file(
+            &terminating,
+            "the retired run's step to see its termination signal",
+        )
+        .await;
+        // Global capacity is free, yet the replacement must wait while the retired run's process
+        // group is still terminating; give a regression time to start it.
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        assert_eq!(
+            service.item_status(id, replacement).await.unwrap().state,
+            QueueItemState::Queued
+        );
+        assert_eq!(item_buildset_count(&runtime, replacement), 0);
+
+        std::fs::write(&gate, "").unwrap();
+        wait_for_release_snapshot(&service, id, "the replacement run to pass", |snapshot| {
+            event_kinds(&snapshot.history, "release.run-passed").len() == 1
+        })
+        .await;
+        assert_eq!(
+            service.item_status(id, replacement).await.unwrap().state,
+            QueueItemState::CheckPassed
+        );
+        assert_release_buildsets_never_overlap(&runtime);
     }
 
     #[tokio::test]
