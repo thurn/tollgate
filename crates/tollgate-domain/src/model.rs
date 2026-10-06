@@ -705,4 +705,20 @@ mod tests {
         assert_eq!(release["stage"], "release");
         assert_eq!(serde_json::from_value::<FrozenStep>(release).unwrap(), step);
     }
+
+    /// Every timestamp in service JSON (IPC results, Tauri payloads, `tg --json`) is the `time`
+    /// crate's tuple, which `timestampMs` in `ui/src/lib/utils.ts` decodes; its tests use this value.
+    #[test]
+    fn timestamps_serialize_as_the_offset_tuple_the_ui_decodes() {
+        let lag = ReleaseLag {
+            commits: 3,
+            since: Some(time::macros::datetime!(2026-08-15 05:43:00 -05:30)),
+        };
+        let value = serde_json::to_value(&lag).unwrap();
+        assert_eq!(
+            value["since"],
+            serde_json::json!([2026, 227, 5, 43, 0, 0, -5, -30, 0])
+        );
+        assert_eq!(serde_json::from_value::<ReleaseLag>(value).unwrap(), lag);
+    }
 }

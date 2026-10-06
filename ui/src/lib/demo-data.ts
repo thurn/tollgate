@@ -1,8 +1,14 @@
-import type { AppSnapshot, GitOid, QueueItemState, QueueItemView } from "./types";
+import type { AppSnapshot, GitOid, QueueItemState, QueueItemView, Timestamp } from "./types";
 
 const oid = (value: string): GitOid => ({ format: "sha1", bytes: value.padEnd(40, value.slice(-1)) });
-const now = new Date();
-const ago = (minutes: number) => new Date(now.getTime() - minutes * 60_000).toISOString();
+const now = Date.now();
+/** `milliseconds` in the service's UTC wire tuple, so demo payloads match what the service sends. */
+function timestamp(milliseconds: number): Timestamp {
+  const date = new Date(milliseconds);
+  const ordinal = Math.floor((milliseconds - Date.UTC(date.getUTCFullYear(), 0, 1)) / 86_400_000) + 1;
+  return [date.getUTCFullYear(), ordinal, date.getUTCHours(), date.getUTCMinutes(), date.getUTCSeconds(), date.getUTCMilliseconds() * 1_000_000, 0, 0, 0];
+}
+const ago = (minutes: number) => timestamp(now - minutes * 60_000);
 
 function item(index: number, state: QueueItemState, subject: string, branch: string, elapsed: number): QueueItemView {
   const id = `019fef58-7147-7${index}73-9c03-e6aff447a5b${index}`;
@@ -103,7 +109,7 @@ const passedRelease = releaseRun(1, "check-passed", "b2cdf95", "9f1e2aa", [["fas
 
 export const demoSnapshot: AppSnapshot = {
   version: "0.1.0",
-  generated_at: now.toISOString(),
+  generated_at: timestamp(now),
   activating_repositories: [],
   unavailable_repositories: [],
   environment: { snapshot_id: "env-019fef58", fingerprint: "44acbc2fa591b40e", path: "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin", variable_count: 42 },

@@ -4,7 +4,6 @@ import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { App } from "../../app/App";
 import { demoSnapshot } from "../../lib/demo-data";
 import type { ReleaseRetryResult, RepositorySnapshot } from "../../lib/types";
-import { timestampMs } from "../../lib/utils";
 import { ReleaseView } from "./ReleaseView";
 import { failingSteps, releaseLagLabel, releaseRuns } from "./release";
 
@@ -112,11 +111,9 @@ test("the Release tab opens a run in the item inspector", async () => {
 
 test("release helpers read lag age, run order, and failing steps", () => {
   const now = Date.UTC(2026, 7, 15, 12, 0, 0);
-  expect(timestampMs([2026, 227, 11, 13, 0, 0, 0, 0, 0])).toBe(Date.UTC(2026, 7, 15, 11, 13, 0));
-  expect(timestampMs([2026, 227, 13, 13, 0, 0, 2, 0, 0])).toBe(Date.UTC(2026, 7, 15, 11, 13, 0));
-  expect(timestampMs("2026-08-15T11:13:00Z")).toBe(Date.UTC(2026, 7, 15, 11, 13, 0));
-  expect(timestampMs("not a time")).toBeNull();
   expect(releaseLagLabel({ commits: 3, since: [2026, 227, 11, 13, 0, 0, 0, 0, 0] }, now)).toContain("47m");
+  expect(releaseLagLabel({ commits: 3, since: [2026, 227, 13, 13, 0, 0, 2, 0, 0] }, now)).toContain("47m");
+  expect(releaseLagLabel({ commits: 3, since: null }, now)).not.toContain("·");
   expect(releaseLagLabel({ commits: 0, since: null }, now)).not.toContain("commit");
   const value = repository();
   const { active, last } = releaseRuns(value);

@@ -239,6 +239,8 @@ Request/response frames coexist with resumable event streams. A subscription sup
 
 The Tauri frontend calls the same `tollgate-service` handlers in-process. Tauri commands are used for bounded request/response operations; Tauri channels carry ordered logs and state changes. Generated TypeScript types and a checked-in protocol schema prevent Rust/UI drift.
 
+Timestamps in control JSON (IPC results, Tauri command and channel payloads, persisted JSON such as event payloads and stored responses, and `tg --json`) use the `time` crate's serde encoding of `OffsetDateTime`: the array `[year, ordinal day, hour, minute, second, nanosecond, offset hours, offset minutes, offset seconds]`, a local date and time at that UTC offset whose offset components share one sign. For example, `[2026, 227, 5, 43, 0, 0, -5, -30, 0]` is 2026-08-15T05:43:00-05:30. This encoding is part of the stable `--json` contract at the current JSON schema version; changing it to RFC 3339 strings requires a schema-version bump and decoding of both encodings in persisted rows. The UI types each timestamp as the `Timestamp` tuple and decodes it only through `timestampMs` in `ui/src/lib/utils.ts`.
+
 ## 8. Filesystem and durable state
 
 ### 8.1 Layout

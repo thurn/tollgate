@@ -1,5 +1,6 @@
 import { clsx, type ClassValue } from "clsx";
 import { twMerge } from "tailwind-merge";
+import type { Timestamp } from "./types";
 
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -26,22 +27,19 @@ export function formatBytes(value: number) {
   return `${(value / 1024 ** exponent).toFixed(exponent > 1 ? 1 : 0)} ${units[exponent]}`;
 }
 
-/** Milliseconds since the epoch for a serialized Rust `OffsetDateTime`, or null when unreadable. */
-export function timestampMs(value: unknown): number | null {
-  if (typeof value === "string") {
-    const parsed = Date.parse(value);
-    return Number.isNaN(parsed) ? null : parsed;
-  }
-  if (Array.isArray(value) && value.length >= 6 && value.every((part) => typeof part === "number")) {
-    const [year = 0, ordinal = 1, hour = 0, minute = 0, second = 0, nanosecond = 0, offsetHours = 0, offsetMinutes = 0, offsetSeconds = 0] = value as number[];
-    const offset = offsetHours * 3_600 + offsetMinutes * 60 + offsetSeconds;
-    return Date.UTC(year, 0, ordinal, hour, minute, second) + Math.floor(nanosecond / 1_000_000) - offset * 1_000;
-  }
-  return null;
+/**
+ * Milliseconds since the epoch for a service {@link Timestamp}. This is the one place the UI
+ * decodes the wire tuple; every timestamp display goes through it.
+ */
+export function timestampMs(value: Timestamp): number {
+  const [year, ordinal, hour, minute, second, nanosecond, offsetHours, offsetMinutes, offsetSeconds] = value;
+  const offset = offsetHours * 3_600 + offsetMinutes * 60 + offsetSeconds;
+  return Date.UTC(year, 0, ordinal, hour, minute, second, Math.floor(nanosecond / 1_000_000)) - offset * 1_000;
 }
 
-export function relativeTime(value: string) {
-  const delta = Date.now() - new Date(value).getTime();
+/** How long before `now` a service {@link Timestamp} was, as a short phrase. */
+export function relativeTime(value: Timestamp, now = Date.now()) {
+  const delta = now - timestampMs(value);
   const minutes = Math.round(delta / 60_000);
   if (minutes < 1) return "just now";
   if (minutes < 60) return `${minutes}m ago`;

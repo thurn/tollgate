@@ -6,10 +6,9 @@ const failedStates = new Set(["check-failed", "infrastructure-exhausted"]);
 /** `release`'s lag behind `staging`, in commits and age. */
 export function releaseLagLabel(lag: ReleaseLag, now = Date.now()) {
   if (lag.commits === 0) return "none";
-  const since = timestampMs(lag.since);
   const commits = `${lag.commits} commit${lag.commits === 1 ? "" : "s"}`;
-  if (since == null) return commits;
-  const minutes = Math.max(0, Math.round((now - since) / 60_000));
+  if (lag.since == null) return commits;
+  const minutes = Math.max(0, Math.round((now - timestampMs(lag.since)) / 60_000));
   const age = minutes < 1 ? "<1m" : minutes < 60 ? `${minutes}m` : minutes < 48 * 60 ? `${Math.floor(minutes / 60)}h ${minutes % 60}m` : `${Math.floor(minutes / 1_440)}d`;
   return `${commits} · ${age}`;
 }

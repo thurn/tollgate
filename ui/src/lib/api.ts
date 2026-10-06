@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { AppSnapshot, HistoryItemsPage, QueueItemView, ReleaseRetryResult } from "./types";
+import type { AppSnapshot, HistoryItemsPage, QueueItemView, ReleaseRetryResult, Timestamp } from "./types";
 import { demoSnapshot } from "./demo-data";
 import { isTauri } from "./utils";
 
@@ -40,7 +40,7 @@ export interface LogFrameView {
     stream_offset: number;
     broker_sequence: number;
     monotonic_ns: number;
-    wall_time: string;
+    wall_time: Timestamp;
     payload_len: number;
   };
   text: string;
