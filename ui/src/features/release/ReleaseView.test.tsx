@@ -158,6 +158,26 @@ test("offers no pull or push without a remote but still offers reconcile", () =>
   expect(within(remote).getByRole("button", { name: /Reconcile/ })).toBeEnabled();
 });
 
+test("the Remote panel lists every active repository block", () => {
+  const value = blockedRemoteRepository((draft) => {
+    draft.state.block_reasons = [...draft.state.block_reasons, { code: "master-moved", message: "staging moved outside Tollgate", recovery_action: "Reconcile" }];
+  });
+  renderView(value);
+  const blocks = within(screen.getByRole("region", { name: "Remote" })).getByRole("list", { name: "Repository blocks" });
+  const entries = within(blocks).getAllByRole("listitem");
+  expect(entries).toHaveLength(value.state.block_reasons.length);
+  value.state.block_reasons.forEach((reason, index) => {
+    expect(entries[index]).toHaveTextContent(reason.code);
+    expect(entries[index]).toHaveTextContent(reason.message);
+    expect(entries[index]).toHaveTextContent(reason.recovery_action);
+  });
+});
+
+test("the Remote panel lists no blocks for an unblocked repository", () => {
+  renderView(repository());
+  expect(within(screen.getByRole("region", { name: "Remote" })).queryByRole("list", { name: "Repository blocks" })).not.toBeInTheDocument();
+});
+
 test("reconcile previews its impact and runs only after confirmation with the previewed state", async () => {
   const value = blockedRemoteRepository((draft) => {
     draft.queue = [structuredClone(demoSnapshot.repositories[0]!.queue[0]!)];

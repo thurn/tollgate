@@ -157,7 +157,7 @@ While any validation runs, the app holds a macOS idle-system-sleep assertion but
 
 ### 6.2 Repository model
 
-Registration is always explicit through `tg init`, `tg repo add`, or Open Repository in the app. Tollgate never scans development directories. Worktrees are deduplicated by their Git common directory and a repository UUID stored in Tollgate's repository-local state.
+Registration is always explicit through `tg init` or `tg repo add`; the desktop UI has no registration control (Section 17.5). Tollgate never scans development directories. Worktrees are deduplicated by their Git common directory and a repository UUID stored in Tollgate's repository-local state.
 
 Each registered repository has:
 
@@ -808,7 +808,7 @@ v1 supplies adapters for zsh, bash, and fish and permits explicit bootstrap argv
 
 Each successful bootstrap creates an immutable in-memory environment snapshot with an ID and salted/redacted fingerprint. Values are not stored in SQLite or logs; history stores variable names, snapshot ID, and fingerprint. A buildset freezes one snapshot before its first step, and every step in that buildset uses it. Explicit project variables from the active configuration override captured variables. Diagnostics show effective `PATH`, shell adapter, and executable resolution without revealing values marked sensitive.
 
-“Reload shell environment” is available in the app and as `tg env reload`. Reload is prospective: it creates the snapshot used by future buildsets and whole-buildset retries, while running buildsets keep their existing in-memory snapshot. Passed buildsets and certificates remain valid and promotable after reload; the environment fingerprint is audit evidence, not a value that must equal the app's current snapshot at promotion. Old snapshot values remain in memory only while active buildsets reference them. After app restart, interrupted buildsets rerun under the newly captured snapshot because previous values were intentionally not persisted. A change to explicit environment additions or removals in `config.toml` remains a configuration change and follows Section 11.5.
+`tg env reload` reloads the shell environment; the desktop UI has no reload control (Section 17.5). Reload is prospective: it creates the snapshot used by future buildsets and whole-buildset retries, while running buildsets keep their existing in-memory snapshot. Passed buildsets and certificates remain valid and promotable after reload; the environment fingerprint is audit evidence, not a value that must equal the app's current snapshot at promotion. Old snapshot values remain in memory only while active buildsets reference them. After app restart, interrupted buildsets rerun under the newly captured snapshot because previous values were intentionally not persisted. A change to explicit environment additions or removals in `config.toml` remains a configuration change and follows Section 11.5.
 
 Tollgate provides no secret store. Commands inherit the user's approved local environment, and Git uses existing credential helpers or SSH agents. The local configuration may explicitly remove variables. Users must understand that validation is unsandboxed code running with their account's authority.
 
@@ -946,7 +946,7 @@ The UI uses virtualization and bounded decoded buffers. Follow mode, pause, stdo
 
 Steps may declare generic paths/globs to retain. At step/buildset completion Tollgate resolves paths beneath the slot, rejects unsafe escaping symlinks, computes size/hash, and APFS-clones files into repository-local artifact history when source/destination allow it; otherwise it copies only after enforcing budgets. Missing required artifacts fail the step's post phase; optional misses are warnings.
 
-Retained artifacts are immutable run outputs and use the 30-day/50-GiB policy. Incremental caches remain mutable slot/seed data and are never retained as historical artifacts merely because they are large. The UI can reveal an artifact in Finder, open it with the default app, pin it, or prune it.
+Retained artifacts are immutable run outputs and use the 30-day/50-GiB policy. Incremental caches remain mutable slot/seed data and are never retained as historical artifacts merely because they are large. `tg artifact list|pin|unpin|prune` lists, pins, unpins, and prunes retained artifacts; the desktop UI has no artifact controls (Section 17.5).
 
 ## 14. Persistent slots and artifact reuse
 
@@ -1038,7 +1038,7 @@ Tollgate may supply stable per-user/per-repository directories and environment v
 - `tg cache purge`: delete eligible seeds.
 - `tg cache purge --all-slots`: rebuild every idle/confirmed slot cold in addition to deleting seeds.
 
-The UI provides the same actions with affected paths, logical size, estimated physical impact, and queue consequences. Automatic cold retry after an ordinary test failure is off by default. Projects may opt failures of a selected step into one whole-buildset cold retry, but it must remain visible as a distinct attempt.
+These recovery actions are CLI-only; the desktop UI has no slot or cache controls (Section 17.5). Automatic cold retry after an ordinary test failure is off by default. Projects may opt failures of a selected step into one whole-buildset cold retry, but it must remain visible as a distinct attempt.
 
 ## 15. Scheduling and resource control
 
@@ -1168,7 +1168,7 @@ Selecting an item opens its frozen configuration, prefix composition, attempts, 
 
 ### 17.3 Slots and resources
 
-A resource panel shows global run capacity, CPU/memory reservations versus observed use, named semaphores, disk reserve, running processes, and scheduler order. Slot detail shows checkout OID, last/next use, cache profile, seed origin, logical/estimated physical size, health, and reset controls.
+A resource panel shows global run capacity, CPU/memory reservations versus observed use, named semaphores, disk reserve, running processes, and scheduler order. Slot detail shows checkout OID, last/next use, cache profile, seed origin, logical/estimated physical size, and health. Slot reset and cache purge are CLI-only (Section 17.5).
 
 ### 17.4 Release panel
 
@@ -1176,11 +1176,28 @@ The header of every repository view shows the `staging` and `release` OIDs and t
 
 ### 17.5 Operations
 
-Every normal queue/CI operation available in the CLI is available in the UI: approve from a selected clean worktree, cancel/dequeue, retry/cold retry, reorder, pause/resume, pull, push retry, reconcile, check, release retry, worktree cleanup, slot reset, seed/cache purge, retained artifact/log management, and environment reload.
+The desktop UI offers four operations, all on the Release route. Each calls the same service command as its CLI counterpart:
 
-Operations that invalidate descendants, kill a process, delete a worktree/branch, discard caches, adopt an external base, or reorder the queue present a concrete impact preview. UI commands carry observed queue revision and are rejected/repreviewed if state changed before confirmation.
+- **Retry release run** (`tg release retry`), described in section 17.4.
+- **Pull** (`tg pull`) and **Push** (`tg push`), offered when the repository's remote is enabled.
+- **Reconcile** (`tg reconcile`), offered in every repository.
 
-The Release route carries the release and remote operations. **Retry release run** is described in section 17.4. Its Remote panel offers **Pull** and **Push** when the repository's remote is enabled, and **Reconcile** in every repository; each calls the same service command as `tg pull`, `tg push`, or `tg reconcile` and shows that command's result message and action, or its error. Reconcile adopts an external base, so it first opens a confirmation previewing the observed `staging` it adopts beside the recorded one, the `release` ref it adopts where it stands, the active blocks and release holds (reconciliation clears those that external ref movement or the remote raised), the unfinished remote pushes it abandons, and the queue revision. The preview is frozen when it opens: confirming sends its observed `staging` and queue revision as the command's expectations, so the service refuses a stale confirmation, and a preview that the live snapshot has outdated offers only a fresh review.
+The rest of the UI reads state: the Gate, Checks, and Release routes, the item inspector, paged history, a step's log tail, **Open raw** for a step's log file, and a **Refresh** button that reloads the snapshot.
+
+Every other operation is CLI-only:
+
+- submission and authority: `tg candidate`, `tg approve`, and `tg push-master`;
+- queue control: `tg cancel`, `tg retry` and `tg retry --cold`, `tg reorder`, `tg pause`, and `tg resume`;
+- independent checks: `tg check`;
+- worktrees and refresh: `tg worktree create|remove` and `tg update`;
+- slots, caches, and storage: `tg slot reset`, `tg cache purge [--all-slots]`, and `tg storage prune`;
+- retained artifacts: `tg artifact pin|unpin|prune`;
+- environment and configuration: `tg env reload` and `tg config regenerate|apply`;
+- repository registration: `tg init`, `tg repo add`, and `tg repo remove`.
+
+The Tauri shell registers commands for most of these service operations, but no UI control calls them. Phase 4 of the roadmap (Section 22) plans UI paths for them.
+
+The Release route's Remote panel lists the repository's active blocks (for example `push-diverged`), each with its code, message, and recovery action, and offers **Pull** and **Push** when the repository's remote is enabled, and **Reconcile** in every repository; each calls the same service command as `tg pull`, `tg push`, or `tg reconcile` and shows that command's result message and action, or its error. Reconcile adopts an external base, so it first opens a confirmation previewing the observed `staging` it adopts beside the recorded one, the `release` ref it adopts where it stands, the active blocks and release holds (reconciliation clears those that external ref movement or the remote raised), the unfinished remote pushes it abandons, and the queue revision. The preview is frozen when it opens: confirming sends its observed `staging` and queue revision as the command's expectations, so the service refuses a stale confirmation, and a preview that the live snapshot has outdated offers only a fresh review.
 
 ### 17.6 History and storage
 
@@ -1190,7 +1207,7 @@ Storage settings show separate budgets/usage for logs, retained artifacts, slots
 
 ### 17.7 Notifications
 
-macOS notifications are failure/attention-only: conclusive validation failure, exhausted infrastructure attempts, setup/bootstrap failure, push failure, a user-master synchronization refusal, repository block requiring reconciliation, a failing release streak and its recovery, a release hold (`release.push-blocked` or `release.held`) and a release push that lands after one, or a promotion paused by `max_release_lag` (`promotion.paused`). Events notify when their payload sets `notify`; a snapshot fallback notifies each release hold or promotion pause once when it appears without an event in the observed history, and again only after it clears and returns. Success, promotion, starts, retries, and ordinary invalidation do not notify. Clicking a notification opens the exact item/step. Per-repository mute and global quiet mode remain available.
+macOS notifications are failure/attention-only: conclusive validation failure, exhausted infrastructure attempts, setup/bootstrap failure, push failure, a user-master synchronization refusal, repository block requiring reconciliation, a failing release streak and its recovery, a release hold (`release.push-blocked` or `release.held`) and a release push that lands after one, or a promotion paused by `max_release_lag` (`promotion.paused`). Events notify when their payload sets `notify`; a snapshot fallback notifies each release hold or promotion pause once when it appears without an event in the observed history, and again only after it clears and returns. Success, promotion, starts, retries, and ordinary invalidation do not notify. Clicking a notification opens the exact item/step. Notifications honor per-repository mute and global quiet mode from the app's `notification-preferences.json`; the desktop UI has no control to change them (Section 17.5).
 
 ### 17.8 Frontend implementation
 
@@ -1467,7 +1484,7 @@ Add shell bootstrap, worker process groups, real generic steps/DAGs, timeouts/re
 
 ### Phase 4: Tauri command center
 
-Build React navigation/sidebar, repository queue/prefix visualization, slot/resource panels, step/log/artifact/history views, all shared-service operations, navigation restoration, storage/config/doctor surfaces, failure notifications, and accessibility. Exit criterion: every normal CLI mutation has a tested UI path, and log/UI scale targets pass.
+Build React navigation/sidebar, repository queue/prefix visualization, slot/resource panels, step/log/artifact/history views, all shared-service operations, navigation restoration, storage/config/doctor surfaces, failure notifications, and accessibility. Exit criterion: every normal CLI mutation has a tested UI path, and log/UI scale targets pass. The UI paths still to build are the CLI-only operations that Section 17.5 lists. Each one that invalidates descendants, kills a process, deletes a worktree or branch, discards caches, or reorders the queue will present a concrete impact preview, and each will carry the observed queue revision so the service refuses it, and the UI re-previews it, when state changed before confirmation, as Reconcile does today.
 
 ### Phase 5: remote synchronization and gate-aware Git wrappers
 

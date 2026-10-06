@@ -186,11 +186,18 @@ tg wait --released <candidate-id>   # wait until release contains the promoted c
 `tg wait --released` exits `0` once `release` contains the target and `1` when
 the release run covering it fails. The desktop app's Release view shows the
 same refs, lag, holds, and runs, and offers **Retry release run**. Its Remote
-panel runs **Pull** and **Push** when the repository pushes to a remote, and
+panel lists the repository's active blocks, such as `push-diverged`, and runs
+**Pull** and **Push** when the repository pushes to a remote, and
 **Reconcile** in every repository. Reconcile first previews the observed
 `staging` it adopts, the blocks and holds it clears, and the remote pushes it
 abandons, and it applies only if the queue revision and observed `staging` still
 match that preview.
+
+These four are the operations the desktop app offers. Every other operation,
+including `tg approve`, `tg cancel`, `tg retry`, `tg reorder`, `tg pause`,
+`tg check`, `tg worktree remove`, `tg slot reset`, `tg cache purge`,
+`tg artifact`, and `tg env reload`, runs from the CLI; see section 17.5 of
+[the technical design](docs/technical-design.md#175-operations).
 
 ## Diagnosing CI failures
 

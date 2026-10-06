@@ -112,6 +112,9 @@ svg { stroke-width: 1.8; }
 .remote-ops__header h2 { margin: 0 0 4px; font-size: 13px; letter-spacing: -.01em; }
 .remote-ops__header p { margin: 0; color: var(--ink-muted); font-size: 9px; }
 .remote-ops__actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.remote-ops__blocks { margin: 12px 0 0; padding: 0; list-style: none; }
+.remote-ops__blocks .notice { margin-bottom: 0; }
+.remote-ops__blocks .notice + .notice { margin-top: 6px; }
 .remote-ops__confirm { margin-top: 12px; padding: 12px 14px; border: 1px solid #ead9bb; border-radius: 7px; background: #fbf6eb; color: #5f4823; }
 .remote-ops__confirm h3 { margin: 0 0 8px; font-size: 11px; }
 .remote-ops__confirm ul { margin: 0; padding-left: 16px; display: flex; flex-direction: column; gap: 4px; font-size: 9px; }

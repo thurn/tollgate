@@ -34,7 +34,10 @@ function previewIsStale(preview: ReconcilePreview, repository: RepositorySnapsho
 
 const short = (oid: GitOid) => shortId(oidHex(oid), 10);
 
-/** Pull, push, and reconcile: the remote and ref-adoption operations of `tg pull`, `tg push`, and `tg reconcile`. */
+/**
+ * Pull, push, and reconcile: the remote and ref-adoption operations of `tg pull`, `tg push`, and
+ * `tg reconcile`, beside the active repository blocks (such as `push-diverged`) that they resolve.
+ */
 export function RemoteOperations({ repository, onRun }: {
   repository: RepositorySnapshot;
   onRun: (operation: RemoteOperation) => Promise<RemoteSyncResult>;
@@ -65,6 +68,12 @@ export function RemoteOperations({ repository, onRun }: {
         <Button size="sm" onClick={() => setPreview(reconcilePreview(repository))} loading={running("reconcile")} disabled={operation.isPending || preview != null} aria-haspopup="dialog"><GitMerge aria-hidden />Reconcile…</Button>
       </div>
     </header>
+    {repository.state.block_reasons.length > 0 && <ul className="remote-ops__blocks" aria-label="Repository blocks">
+      {repository.state.block_reasons.map((reason) => <li key={reason.code} className="notice">
+        <strong>{reason.message}</strong>
+        <span><code>{reason.code}</code> · {reason.recovery_action}</span>
+      </li>)}
+    </ul>}
     {preview && <div className="remote-ops__confirm" role="alertdialog" aria-labelledby="reconcile-title" aria-describedby="reconcile-impact">
       <h3 id="reconcile-title">Reconcile with the observed refs?</h3>
       <ul id="reconcile-impact">
