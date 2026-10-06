@@ -2184,6 +2184,12 @@ fn encode_service_error(error: ServiceError) -> String {
             retryable: true,
             details: serde_json::to_value(&activation).ok(),
         }),
+        ServiceError::ShuttingDown => Some(StructuredError {
+            code: "shutting-down".into(),
+            message: message.clone(),
+            retryable: true,
+            details: None,
+        }),
         ServiceError::StaleQueuePrefix {
             source_parent_oid,
             staging_oid,
@@ -2305,6 +2311,19 @@ mod ipc_error_tests {
         assert_eq!(error.code, "response-too-large");
         assert!(!error.retryable);
         assert!(error.details.unwrap()["declared_bytes"].as_u64().unwrap() > 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn commands_refused_during_quit_cross_ipc_as_a_structured_error() {
+        let encoded = encode_service_error(ServiceError::ShuttingDown);
+        let error: StructuredError = serde_json::from_str(
+            encoded
+                .strip_prefix(STRUCTURED_SERVICE_ERROR_PREFIX)
+                .expect("a refusal during Quit must cross IPC as a structured error"),
+        )
+        .unwrap();
+        assert_eq!(error.code, "shutting-down");
+        assert!(error.retryable);
     }
 
     #[test]

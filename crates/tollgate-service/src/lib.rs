@@ -33,6 +33,7 @@ use tokio::{
     sync::{Notify, RwLock, Semaphore, broadcast},
 };
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::task_tracker::TaskTrackerToken;
 use tollgate_config::{CachePolicy, EffectiveConfig, EffectiveStep, StepStage};
 use tollgate_domain::*;
 use tollgate_git::{
@@ -174,6 +175,8 @@ pub enum ServiceError {
         path: PathBuf,
         reason: String,
     },
+    #[error("Tollgate is quitting and admits no new commands; retry once it restarts")]
+    ShuttingDown,
     #[error("internal service invariant failed: {0}")]
     Invariant(String),
     #[error("I/O error: {0}")]
@@ -1087,10 +1090,63 @@ pub struct TollgateService {
     storage_charged_bytes: AtomicU64,
     volume_reservations: tokio::sync::Mutex<()>,
     shutting_down: AtomicBool,
+    /// Whether Quit has closed admission. Work is admitted only while holding this lock, and
+    /// shutdown closes it while holding it, so either Quit waits for admitted work or the work
+    /// is refused.
+    admission_closed: Mutex<bool>,
+    /// Work admitted before Quit: mutating commands, maintenance passes, and startup activation.
+    /// Orderly shutdown waits for all of it before it sweeps runtimes, so nothing it admitted
+    /// mutates a repository after its checkpoint.
+    admitted: tokio_util::task::TaskTracker,
+    /// Cancelled when Quit begins. Diagnostic replays run under it.
+    quit: CancellationToken,
+    /// Repositories the previous process checkpointed and closed at a clean shutdown, read from
+    /// the clean-shutdown marker that startup consumes. Their startup activation skips the full
+    /// integrity check.
+    cleanly_closed: HashSet<RepositoryId>,
     /// Background tasks that act for a repository runtime: item execution, release triggers,
     /// and release advances. Orderly shutdown waits for every one to settle before it releases
     /// the repository ownership locks.
     background: tokio_util::task::TaskTracker,
+    /// Test hook: the next admitted command signals the first `Notify` and waits on the second
+    /// before it runs.
+    #[cfg(test)]
+    command_gate: Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
+    /// Test hook: how many full integrity checks repository activation has run.
+    #[cfg(test)]
+    full_integrity_checks: AtomicU64,
+}
+
+/// The clean-shutdown marker: written last by an orderly shutdown and consumed at startup.
+#[derive(Serialize, Deserialize)]
+struct CleanShutdownMarker {
+    shutdown_at: OffsetDateTime,
+    /// The repositories whose databases the shutdown checkpointed and closed.
+    repositories: Vec<RepositoryId>,
+}
+
+const CLEAN_SHUTDOWN_MARKER: &str = "clean-shutdown";
+
+/// The terminal reason of an item whose preparing or running buildset Quit interrupted.
+const INTERRUPTED_BY_QUIT: &str = "interrupted-by-orderly-shutdown";
+
+/// Reads and removes the clean-shutdown marker before any repository activates, so the marker
+/// describes only the process that wrote it and a later crash leaves none. A missing or
+/// unreadable marker names no repository.
+async fn consume_clean_shutdown_marker(
+    support_root: &Path,
+) -> Result<HashSet<RepositoryId>, ServiceError> {
+    let path = support_root.join(CLEAN_SHUTDOWN_MARKER);
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(HashSet::new()),
+        Err(error) => return Err(error.into()),
+    };
+    tokio::fs::remove_file(&path).await?;
+    std::fs::File::open(support_root)?.sync_all()?;
+    Ok(serde_json::from_slice::<CleanShutdownMarker>(&bytes)
+        .map(|marker| marker.repositories.into_iter().collect())
+        .unwrap_or_default())
 }
 
 fn failure_attribution(
@@ -1830,6 +1886,7 @@ impl TollgateService {
         } else {
             GlobalCommandJournal::default()
         };
+        let cleanly_closed = consume_clean_shutdown_marker(&support_root).await?;
         let service = Arc::new(Self {
             registry_path: support_root.join("repositories.json"),
             support_root,
@@ -1853,7 +1910,15 @@ impl TollgateService {
             storage_charged_bytes: AtomicU64::new(u64::MAX),
             volume_reservations: tokio::sync::Mutex::new(()),
             shutting_down: AtomicBool::new(false),
+            admission_closed: Mutex::new(false),
+            admitted: tokio_util::task::TaskTracker::new(),
+            quit: CancellationToken::new(),
+            cleanly_closed,
             background: tokio_util::task::TaskTracker::new(),
+            #[cfg(test)]
+            command_gate: Mutex::new(None),
+            #[cfg(test)]
+            full_integrity_checks: AtomicU64::new(0),
         });
         let records = service.load_registry().await?;
         service.spawn_activations(records).await;
@@ -1897,7 +1962,9 @@ impl TollgateService {
             }
         }
         let service = Arc::clone(self);
-        let driver = tokio::spawn(async move {
+        // Startup activation is admitted work: Quit waits for every activation to publish its
+        // runtime or stop between recovery steps before it sweeps runtimes.
+        let driver = self.admitted.spawn(async move {
             let slots = Arc::new(Semaphore::new(MAX_CONCURRENT_ACTIVATIONS));
             let mut activations = tokio::task::JoinSet::new();
             for record in records {
@@ -1916,7 +1983,11 @@ impl TollgateService {
                 }
             }
             // Prepared global commands (such as a repository removal) inspect repository
-            // runtimes, so they reconcile only after every activation has settled.
+            // runtimes, so they reconcile only after every activation has settled. A Quit that
+            // began meanwhile leaves them prepared for the next launch.
+            if service.shutting_down.load(Ordering::Acquire) {
+                return Ok(());
+            }
             let result = service.reconcile_global_commands().await;
             if let Err(error) = &result {
                 eprintln!("Tollgate global command reconciliation failed: {error}");
@@ -1987,9 +2058,9 @@ impl TollgateService {
                 let Some(service) = service.upgrade() else {
                     break;
                 };
-                if service.shutting_down.load(Ordering::Acquire) {
+                let Ok(_pass) = service.admit() else {
                     continue;
-                }
+                };
                 let ids = service
                     .runtimes
                     .read()
@@ -2010,7 +2081,8 @@ impl TollgateService {
                         .is_some_and(|runtime| runtime.data.lock().config.remote.enabled);
                     if ticks.is_multiple_of(30)
                         && remote_enabled
-                        && let Err(error) = service.pull(repository_id, CommandId::new()).await
+                        && let Err(error) =
+                            service.pull_admitted(repository_id, CommandId::new()).await
                     {
                         eprintln!(
                             "Tollgate periodic remote observation failed for {repository_id}: {error}"
@@ -2038,6 +2110,9 @@ impl TollgateService {
                 interval.tick().await;
                 let Some(service) = service.upgrade() else {
                     break;
+                };
+                let Ok(_pass) = service.admit() else {
+                    continue;
                 };
                 if let Err(error) = service.perform_storage_prune(false).await {
                     eprintln!("Tollgate storage maintenance failed: {error}");
@@ -2093,10 +2168,12 @@ impl TollgateService {
             let Some(service) = service.upgrade() else {
                 break;
             };
-            if service.shutting_down.load(Ordering::Acquire) {
+            let Ok(batch) = service.admit() else {
                 break;
-            }
-            match service.prune_expired_artifact_batch(repository_id).await {
+            };
+            let pruned = service.prune_expired_artifact_batch(repository_id).await;
+            drop(batch);
+            match pruned {
                 Ok(Some(result)) => {
                     sweep.batches += 1;
                     sweep.pruned += result.pruned.len();
@@ -2201,6 +2278,7 @@ impl TollgateService {
         bootstrap: bool,
         _legacy_detach_master: bool,
     ) -> Result<RepositorySnapshot, ServiceError> {
+        let _admission = self.admit_command().await?;
         let git = GitRepository::discover(path).await?;
         if let Some(id) = self
             .registered_common_directory(&git.common_dir, None)
@@ -2411,12 +2489,20 @@ impl TollgateService {
         let store = self.open_repository_store(&store_path).await?;
         self.set_activation_progress(*key, ActivationPhase::Opening, "integrity-check")
             .await;
-        let store =
+        // Opening the store ran the quick check. The full check runs unless the previous
+        // process checkpointed and closed this repository at a clean shutdown.
+        let cleanly_closed = key.is_some_and(|id| self.cleanly_closed.contains(&id));
+        let store = if cleanly_closed {
+            store
+        } else {
+            #[cfg(test)]
+            self.full_integrity_checks.fetch_add(1, Ordering::AcqRel);
             tokio::task::spawn_blocking(move || store.full_integrity_check().map(|()| store))
                 .await
                 .map_err(|error| {
                     ServiceError::Invariant(format!("integrity check task: {error}"))
-                })??;
+                })??
+        };
         let mut state = store.repository_state()?;
         // Persisted state can trail `release` only if its active configuration had a release
         // stage; make_runtime refines this once the active configuration is resolved.
@@ -5786,6 +5872,7 @@ impl TollgateService {
         force: bool,
         command_id: CommandId,
     ) -> Result<storage::StoragePruneResult, ServiceError> {
+        let _admission = self.admit_command().await?;
         let request_digest = command_digest(&serde_json::json!({"force": force}))?;
         if let Some(response) = self
             .prepare_global_command(
@@ -6392,6 +6479,7 @@ impl TollgateService {
         verify_repair: bool,
         command_id: CommandId,
     ) -> Result<DiagnoseResult, ServiceError> {
+        let _admission = self.admit_command().await?;
         let runtime = self.runtime(repository_id).await?;
         let (generation, buildset, source_oid, attribution) = {
             let data = runtime.data.lock();
@@ -6745,7 +6833,7 @@ impl TollgateService {
                 &config,
                 execution("before"),
                 &changed_paths,
-                CancellationToken::new(),
+                self.quit.child_token(),
             )
             .await?;
             if !before
@@ -6785,7 +6873,7 @@ impl TollgateService {
                 &config,
                 execution("after"),
                 &changed_paths,
-                CancellationToken::new(),
+                self.quit.child_token(),
             )
             .await?;
             let applicable_voting = config
@@ -6960,6 +7048,7 @@ impl TollgateService {
         cleanup_policy: CleanupPolicy,
         command_id: CommandId,
     ) -> Result<ApproveResult, ServiceError> {
+        let _admission = self.admit_command().await?;
         self.enqueue_gate_from(
             repository_id,
             revision,
@@ -7010,6 +7099,7 @@ impl TollgateService {
         cleanup_policy: CleanupPolicy,
         command_id: CommandId,
     ) -> Result<ApproveResult, ServiceError> {
+        let _admission = self.admit_command().await?;
         self.enqueue_gate_from(
             repository_id,
             revision,
@@ -7487,6 +7577,7 @@ impl TollgateService {
         release_fix: bool,
         command_id: CommandId,
     ) -> Result<CandidateAuthorizationResult, ServiceError> {
+        let _admission = self.admit_command().await?;
         let runtime = self.runtime(repository_id).await?;
         let mut request = serde_json::json!({
             "repository_id": repository_id,
@@ -7511,7 +7602,7 @@ impl TollgateService {
         };
         if observed_before_lock != persisted_master {
             let refreshed = self
-                .reconcile_expected(
+                .reconcile_expected_admitted(
                     repository_id,
                     Some(observed_before_lock),
                     Some(current_revision),
@@ -8000,6 +8091,7 @@ impl TollgateService {
         worktree_path: Option<String>,
         command_id: CommandId,
     ) -> Result<ApproveResult, ServiceError> {
+        let _admission = self.admit_command().await?;
         self.check_from_with_purpose(
             repository_id,
             revision,
@@ -8232,6 +8324,16 @@ impl TollgateService {
     }
 
     pub async fn pull(
+        self: &Arc<Self>,
+        repository_id: RepositoryId,
+        command_id: CommandId,
+    ) -> Result<RemoteSyncResult, ServiceError> {
+        let _admission = self.admit_command().await?;
+        self.pull_admitted(repository_id, command_id).await
+    }
+
+    /// The pull itself, for a caller already admitted or tracked as background work.
+    async fn pull_admitted(
         self: &Arc<Self>,
         repository_id: RepositoryId,
         command_id: CommandId,
@@ -8586,6 +8688,7 @@ impl TollgateService {
         repository_id: RepositoryId,
         command_id: CommandId,
     ) -> Result<RemoteSyncResult, ServiceError> {
+        let _admission = self.admit_command().await?;
         let runtime = self.runtime(repository_id).await?;
         // No release push is in flight while `tg push` publishes (lock order: release_advance,
         // then mutation).
@@ -9017,6 +9120,24 @@ impl TollgateService {
         expected_queue_revision: Option<u64>,
         command_id: CommandId,
     ) -> Result<RemoteSyncResult, ServiceError> {
+        let _admission = self.admit_command().await?;
+        self.reconcile_expected_admitted(
+            repository_id,
+            expected_observed_master,
+            expected_queue_revision,
+            command_id,
+        )
+        .await
+    }
+
+    /// Reconciliation itself, for a caller that is already admitted.
+    async fn reconcile_expected_admitted(
+        self: &Arc<Self>,
+        repository_id: RepositoryId,
+        expected_observed_master: Option<GitOid>,
+        expected_queue_revision: Option<u64>,
+        command_id: CommandId,
+    ) -> Result<RemoteSyncResult, ServiceError> {
         let runtime = self.runtime(repository_id).await?;
         // No release push is in flight while reconciliation abandons release promises (lock
         // order: release_advance, then mutation).
@@ -9253,6 +9374,7 @@ impl TollgateService {
         destination: Option<String>,
         command_id: CommandId,
     ) -> Result<WorktreeOperationResult, ServiceError> {
+        let _admission = self.admit_command().await?;
         let runtime = self.runtime(repository_id).await?;
         let _mutation = runtime.mutation.lock().await;
         let state = runtime.data.lock().state.clone();
@@ -9337,6 +9459,7 @@ impl TollgateService {
         path: String,
         command_id: CommandId,
     ) -> Result<WorktreeOperationResult, ServiceError> {
+        let _admission = self.admit_command().await?;
         let runtime = self.runtime(repository_id).await?;
         let _mutation = runtime.mutation.lock().await;
         let requested = PathBuf::from(path);
@@ -9453,6 +9576,7 @@ impl TollgateService {
         path: String,
         command_id: CommandId,
     ) -> Result<WorktreeOperationResult, ServiceError> {
+        let _admission = self.admit_command().await?;
         let runtime = self.runtime(repository_id).await?;
         let _mutation = runtime.mutation.lock().await;
         let worktree = GitRepository::discover(&path).await?;
@@ -9538,6 +9662,7 @@ impl TollgateService {
         cold: bool,
         command_id: CommandId,
     ) -> Result<ApproveResult, ServiceError> {
+        let _admission = self.admit_command().await?;
         let runtime = self.runtime(repository_id).await?;
         let request_digest = command_digest(&serde_json::json!({
             "repository_id": repository_id,
@@ -9721,6 +9846,7 @@ impl TollgateService {
         expected_revision: u64,
         command_id: CommandId,
     ) -> Result<QueueReorderResult, ServiceError> {
+        let _admission = self.admit_command().await?;
         let runtime = self.runtime(repository_id).await?;
         let _mutation = runtime.mutation.lock().await;
         let request_digest = command_digest(&serde_json::json!({
@@ -9929,6 +10055,7 @@ impl TollgateService {
         repository_id: RepositoryId,
         command_id: CommandId,
     ) -> Result<MutationResult, ServiceError> {
+        let _admission = self.admit_command().await?;
         let request_digest = command_digest(&serde_json::json!({
             "repository_id": repository_id,
         }))?;
@@ -10006,6 +10133,7 @@ impl TollgateService {
         repository_id: RepositoryId,
         command_id: CommandId,
     ) -> Result<RepositorySnapshot, ServiceError> {
+        let _admission = self.admit_command().await?;
         let result = self
             .apply_configuration_locked(repository_id, command_id)
             .await;
@@ -10590,6 +10718,7 @@ impl TollgateService {
         repository_id: RepositoryId,
         command_id: CommandId,
     ) -> Result<EffectiveConfig, ServiceError> {
+        let _admission = self.admit_command().await?;
         use tokio::io::AsyncWriteExt;
 
         let runtime = self.runtime(repository_id).await?;
@@ -10670,6 +10799,7 @@ impl TollgateService {
         pinned: bool,
         command_id: CommandId,
     ) -> Result<MutationResult, ServiceError> {
+        let _admission = self.admit_command().await?;
         let runtime = self.runtime(repository_id).await?;
         let _mutation = runtime.mutation.lock().await;
         let request_digest = command_digest(&serde_json::json!({
@@ -10734,6 +10864,7 @@ impl TollgateService {
         artifact_id: String,
         command_id: CommandId,
     ) -> Result<MutationResult, ServiceError> {
+        let _admission = self.admit_command().await?;
         let runtime = self.runtime(repository_id).await?;
         let _mutation = runtime.mutation.lock().await;
         let request_digest = command_digest(&serde_json::json!({
@@ -10822,6 +10953,7 @@ impl TollgateService {
         slot_id: SlotId,
         command_id: CommandId,
     ) -> Result<SlotView, ServiceError> {
+        let _admission = self.admit_command().await?;
         let runtime = self.runtime(repository_id).await?;
         let _mutation = runtime.mutation.lock().await;
         let slot = runtime
@@ -10918,6 +11050,17 @@ impl TollgateService {
     }
 
     pub async fn snapshot_cache(
+        self: &Arc<Self>,
+        repository_id: RepositoryId,
+        command_id: CommandId,
+    ) -> Result<CacheOperationResult, ServiceError> {
+        let _admission = self.admit_command().await?;
+        self.snapshot_cache_admitted(repository_id, command_id)
+            .await
+    }
+
+    /// The snapshot itself, for a caller already admitted or tracked as background work.
+    async fn snapshot_cache_admitted(
         self: &Arc<Self>,
         repository_id: RepositoryId,
         command_id: CommandId,
@@ -11201,6 +11344,7 @@ impl TollgateService {
         all_slots: bool,
         command_id: CommandId,
     ) -> Result<CacheOperationResult, ServiceError> {
+        let _admission = self.admit_command().await?;
         self.purge_cache_except(repository_id, all_slots, command_id, None)
             .await
     }
@@ -12017,7 +12161,21 @@ impl TollgateService {
                 && !cancellation.is_cancelled()
         };
         if !can_start {
-            ownership.settle(BuildsetEvent::Invalidated, "idle", "healthy")?;
+            // Quit interrupts a preparing buildset of the current generation (section 9.8);
+            // anything else that stops it before its worker starts has made it stale.
+            let interrupted_by_quit = cancellation.is_cancelled()
+                && self.shutting_down.load(Ordering::Acquire)
+                && fresh_item.state == QueueItemState::Preparing
+                && fresh_item.current_generation_id == Some(generation.id);
+            ownership.settle(
+                if interrupted_by_quit {
+                    BuildsetEvent::Interrupted
+                } else {
+                    BuildsetEvent::Invalidated
+                },
+                "idle",
+                "healthy",
+            )?;
             if fresh_item.state == QueueItemState::Preparing {
                 let mut queued = fresh_item;
                 queued.state = queued
@@ -12025,6 +12183,9 @@ impl TollgateService {
                     .transition(ItemEvent::InfrastructureRetry)
                     .map_err(|error| ServiceError::Invariant(error.to_string()))?;
                 queued.buildset_id = None;
+                if interrupted_by_quit {
+                    queued.terminal_reason = Some(INTERRUPTED_BY_QUIT.into());
+                }
                 self.replace_item(&runtime, queued)?;
             }
             runtime.cancellations.lock().remove(&item_id);
@@ -12259,7 +12420,11 @@ impl TollgateService {
                         .map_err(|error| ServiceError::Invariant(error.to_string()))?;
                     current_item.buildset_id = None;
                     current_item.terminal_reason =
-                        Some("execution-canceled-before-completion".into());
+                        Some(if self.shutting_down.load(Ordering::Acquire) {
+                            INTERRUPTED_BY_QUIT.into()
+                        } else {
+                            "execution-canceled-before-completion".into()
+                        });
                     self.replace_item(&runtime, current_item)?;
                 }
                 drop(finalization_guard);
@@ -12656,7 +12821,9 @@ impl TollgateService {
                 self.replace_item(&runtime, attention)?;
             }
             if bootstrap_passed
-                && let Err(error) = self.snapshot_cache(repository_id, CommandId::new()).await
+                && let Err(error) = self
+                    .snapshot_cache_admitted(repository_id, CommandId::new())
+                    .await
             {
                 eprintln!(
                     "Tollgate bootstrap passed but no reusable cache seed was published: {error}"
@@ -15226,6 +15393,7 @@ impl TollgateService {
         expected_revision: u64,
         command_id: CommandId,
     ) -> Result<MutationResult, ServiceError> {
+        let _admission = self.admit_command().await?;
         let runtime = self.runtime(repository_id).await?;
         let mutation = runtime.mutation.lock().await;
         let request_digest = command_digest(&serde_json::json!({
@@ -15371,6 +15539,7 @@ impl TollgateService {
         paused: bool,
         command_id: CommandId,
     ) -> Result<MutationResult, ServiceError> {
+        let _admission = self.admit_command().await?;
         let runtime = self.runtime(repository_id).await?;
         let mutation = runtime.mutation.lock().await;
         let command_kind = if paused { "pause" } else { "resume" };
@@ -15468,6 +15637,7 @@ impl TollgateService {
         self: &Arc<Self>,
         command_id: CommandId,
     ) -> Result<EnvironmentView, ServiceError> {
+        let _admission = self.admit_command().await?;
         let request_digest = command_digest(&serde_json::json!({"action": "reload-environment"}))?;
         if let Some(response) = self
             .prepare_global_command(
@@ -15528,8 +15698,62 @@ impl TollgateService {
         Ok(state)
     }
 
+    /// Admits one unit of work, a mutating command or a maintenance pass, unless Quit has
+    /// begun. Quit waits for every admitted unit to finish before it sweeps runtimes.
+    fn admit(&self) -> Result<TaskTrackerToken, ServiceError> {
+        let closed = self.admission_closed.lock();
+        if *closed {
+            return Err(ServiceError::ShuttingDown);
+        }
+        Ok(self.admitted.token())
+    }
+
+    /// Admits one mutating command; see [`Self::admit`]. The command holds the returned token
+    /// until it returns.
+    async fn admit_command(&self) -> Result<TaskTrackerToken, ServiceError> {
+        let token = self.admit()?;
+        #[cfg(test)]
+        {
+            let gate = self.command_gate.lock().take();
+            if let Some((reached, resume)) = gate {
+                reached.notify_one();
+                resume.notified().await;
+            }
+        }
+        Ok(token)
+    }
+
+    /// Orderly shutdown (technical-design.md 19.2). Quit refuses new commands, signals every
+    /// worker, and waits within one grace period for admitted commands, maintenance passes,
+    /// activations, and then every background task to finish. Only then does it checkpoint each
+    /// database, release each repository ownership lock, and write the clean-shutdown marker
+    /// naming the repositories it closed. Any wait that outlasts the grace period leaves the
+    /// shutdown unclean, with no marker.
     pub async fn shutdown(self: &Arc<Self>) -> Result<(), ServiceError> {
         self.shutting_down.store(true, Ordering::Release);
+        *self.admission_closed.lock() = true;
+        self.quit.cancel();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(12);
+        // Workers wind down while admitted work finishes. A worker canceled at Quit records its
+        // buildset interrupted and requeues its item; an item task registered after this sweep
+        // observes the flag before it dispatches.
+        for runtime in self.runtimes.read().await.values() {
+            for token in runtime.cancellations.lock().values() {
+                token.cancel();
+            }
+        }
+        // A command admitted before Quit runs to completion, and an activation either publishes
+        // its runtime or stops between recovery steps and releases its lock, so the sweep below
+        // covers every runtime and nothing mutates a repository after its checkpoint.
+        self.admitted.close();
+        if tokio::time::timeout_at(deadline, self.admitted.wait())
+            .await
+            .is_err()
+        {
+            return Err(ServiceError::Invariant(
+                "admitted commands or repository activations did not finish within the grace period; shutdown remains unclean".into(),
+            ));
+        }
         let runtimes = self
             .runtimes
             .read()
@@ -15539,31 +15763,8 @@ impl TollgateService {
             .collect::<Vec<_>>();
         for runtime in &runtimes {
             let _mutation = runtime.mutation.lock().await;
-            let (state, interrupted) = {
-                let data = runtime.data.lock();
-                let interrupted = data
-                    .items
-                    .iter()
-                    .filter(|item| {
-                        matches!(
-                            item.state,
-                            QueueItemState::Preparing | QueueItemState::Running
-                        )
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>();
-                (data.state.clone(), interrupted)
-            };
+            let state = runtime.data.lock().state.clone();
             runtime.store.update_repository_state(&state)?;
-            for mut item in interrupted {
-                item.state = item
-                    .state
-                    .transition(ItemEvent::InfrastructureRetry)
-                    .map_err(|error| ServiceError::Invariant(error.to_string()))?;
-                item.buildset_id = None;
-                item.terminal_reason = Some("interrupted-by-orderly-shutdown".into());
-                self.replace_item(runtime, item)?;
-            }
             for token in runtime.cancellations.lock().values() {
                 token.cancel();
             }
@@ -15573,7 +15774,6 @@ impl TollgateService {
         // for the sweep above returns without starting, and a release trigger or advance already
         // in flight finishes its pass. None spawns another, because each checks the flag.
         self.background.close();
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(12);
         let settled = tokio::time::timeout_at(deadline, self.background.wait())
             .await
             .is_ok();
@@ -15594,12 +15794,17 @@ impl TollgateService {
         for runtime in &runtimes {
             drop(runtime.ownership_lock.lock().take());
         }
-        let marker = self.support_root.join("clean-shutdown");
-        tokio::fs::write(&marker, OffsetDateTime::now_utc().to_string()).await?;
-        std::fs::File::open(&marker)?.sync_all()?;
-        if let Some(parent) = marker.parent() {
-            std::fs::File::open(parent)?.sync_all()?;
-        }
+        let marker = CleanShutdownMarker {
+            shutdown_at: OffsetDateTime::now_utc(),
+            repositories: runtimes
+                .iter()
+                .map(|runtime| runtime.data.lock().state.id)
+                .collect(),
+        };
+        let path = self.support_root.join(CLEAN_SHUTDOWN_MARKER);
+        tokio::fs::write(&path, serde_json::to_vec(&marker)?).await?;
+        std::fs::File::open(&path)?.sync_all()?;
+        std::fs::File::open(&self.support_root)?.sync_all()?;
         Ok(())
     }
 
@@ -31129,5 +31334,228 @@ policy = "clone"
         );
         assert_eq!(remote.master(), tip.to_hex());
         service.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn quit_refuses_new_commands_and_waits_for_admitted_ones_before_its_checkpoint() {
+        let temporary = tempfile::tempdir().unwrap();
+        let support = temporary.path().join("support");
+        let repository = committed_repository(temporary.path(), "repository");
+        let service = TollgateService::open(support.clone()).await.unwrap();
+        let id = service
+            .initialize_repository_with_options(&repository, Some("true".into()), false)
+            .await
+            .unwrap()
+            .state
+            .id;
+        let reached = Arc::new(Notify::new());
+        let resume = Arc::new(Notify::new());
+        *service.command_gate.lock() = Some((Arc::clone(&reached), Arc::clone(&resume)));
+        let pause = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move { service.set_paused_command(id, true, CommandId::new()).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(30), reached.notified())
+            .await
+            .expect("the pause is admitted");
+
+        let mut shutdown = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move { service.shutdown().await }
+        });
+        while !service.shutting_down.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        // Commands arriving once Quit has begun are refused without touching the repository.
+        assert!(matches!(
+            service
+                .set_paused_command(id, false, CommandId::new())
+                .await,
+            Err(ServiceError::ShuttingDown)
+        ));
+        assert!(matches!(
+            service.pull(id, CommandId::new()).await,
+            Err(ServiceError::ShuttingDown)
+        ));
+        // The admitted command still runs, and Quit neither checkpoints nor marks a clean
+        // shutdown until it has finished.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), &mut shutdown)
+                .await
+                .is_err(),
+            "Quit waits for the admitted command"
+        );
+        assert!(!support.join(CLEAN_SHUTDOWN_MARKER).exists());
+        resume.notify_one();
+        pause.await.unwrap().unwrap();
+        shutdown.await.unwrap().unwrap();
+        assert!(support.join(CLEAN_SHUTDOWN_MARKER).exists());
+        drop(service);
+
+        let reopened = TollgateService::open(support).await.unwrap();
+        assert_eq!(
+            reopened
+                .repository_snapshot(id)
+                .await
+                .unwrap()
+                .state
+                .execution_state,
+            RepositoryExecutionState::Paused
+        );
+        reopened.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn quit_during_activation_waits_for_it_to_stop_and_release_the_repository() {
+        let temporary = tempfile::tempdir().unwrap();
+        let support = temporary.path().join("support");
+        let repository = committed_repository(temporary.path(), "repository");
+        let id = registered_repositories(&support, &[&repository]).await[0];
+        let probe = ActivationProbe::default();
+        probe.hold(id);
+        let service = TollgateService::start_with_probe(support.clone(), probe.clone())
+            .await
+            .unwrap();
+        wait_for_snapshot(&service, "the held activation to recover", |snapshot| {
+            snapshot.activating_repositories.iter().any(|activation| {
+                activation.id == id && activation.phase == ActivationPhase::Recovering
+            })
+        })
+        .await;
+
+        let mut shutdown = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move { service.shutdown().await }
+        });
+        while !service.shutting_down.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), &mut shutdown)
+                .await
+                .is_err(),
+            "Quit waits for the activation, which holds the repository lock"
+        );
+        assert!(!support.join(CLEAN_SHUTDOWN_MARKER).exists());
+        probe.release(id);
+        shutdown.await.unwrap().unwrap();
+        let marker: CleanShutdownMarker =
+            serde_json::from_slice(&std::fs::read(support.join(CLEAN_SHUTDOWN_MARKER)).unwrap())
+                .unwrap();
+        assert!(
+            marker.repositories.is_empty(),
+            "the stopped activation closed no recovered repository"
+        );
+        drop(service);
+
+        let reopened = TollgateService::open(support).await.unwrap();
+        assert_eq!(
+            reopened
+                .repository_snapshot(id)
+                .await
+                .expect("the stopped activation released the repository")
+                .state
+                .execution_state,
+            RepositoryExecutionState::Active
+        );
+        assert_eq!(reopened.full_integrity_checks.load(Ordering::Acquire), 1);
+        reopened.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn quit_records_a_running_buildset_interrupted_and_requeues_its_item() {
+        let temporary = tempfile::tempdir().unwrap();
+        let support = temporary.path().join("support");
+        let gate = temporary.path().join("release-may-finish");
+        let (service, id, _repository) = staged_release_repository(
+            temporary.path(),
+            &[],
+            &[("feature-a", "a.txt", "a\n")],
+            &format!(
+                "\n[[step]]\nname = \"full\"\nstage = \"release\"\nrun = \"while [ ! -f '{}' ]; do sleep 0.05; done\"\nneeds = [\"fast\"]\n",
+                gate.display()
+            ),
+        )
+        .await;
+        let tip = approve_and_promote(&service, id, "feature-a").await;
+        let running =
+            wait_for_release_snapshot(&service, id, "the release run to start", |snapshot| {
+                release_runs_for(snapshot, &tip)
+                    .iter()
+                    .any(|view| view.item.state == QueueItemState::Running)
+            })
+            .await;
+        let run = release_runs_for(&running, &tip)[0].item.clone();
+        let buildset_id = run.buildset_id.unwrap();
+        service.shutdown().await.unwrap();
+        drop(service);
+
+        let reopened = TollgateService::open(support).await.unwrap();
+        let runtime = reopened.runtime(id).await.unwrap();
+        let interrupted = runtime
+            .store
+            .buildsets()
+            .unwrap()
+            .into_iter()
+            .find(|buildset| buildset.id == buildset_id)
+            .unwrap();
+        assert_eq!(
+            interrupted.state,
+            BuildsetState::Interrupted,
+            "a buildset running at Quit is interrupted, not invalidated"
+        );
+        let requeued = reopened.item_details(id, run.id).await.unwrap().item;
+        assert_eq!(
+            requeued.terminal_reason.as_deref(),
+            Some(INTERRUPTED_BY_QUIT)
+        );
+        std::fs::write(&gate, "").unwrap();
+        wait_for_release_snapshot(&reopened, id, "the rerun to release the tip", |snapshot| {
+            snapshot.state.release_oid == tip
+        })
+        .await;
+        assert_eq!(item_buildset_count(&runtime, run.id), 2);
+        drop(runtime);
+        reopened.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_consumes_the_clean_shutdown_marker_so_a_later_crash_runs_the_full_check() {
+        let temporary = tempfile::tempdir().unwrap();
+        let support = temporary.path().join("support");
+        let repository = committed_repository(temporary.path(), "repository");
+        let service = TollgateService::open(support.clone()).await.unwrap();
+        let id = service
+            .initialize_repository_with_options(&repository, Some("true".into()), false)
+            .await
+            .unwrap()
+            .state
+            .id;
+        service.shutdown().await.unwrap();
+        drop(service);
+        assert!(support.join(CLEAN_SHUTDOWN_MARKER).exists());
+
+        let reopened = TollgateService::open(support.clone()).await.unwrap();
+        assert!(
+            !support.join(CLEAN_SHUTDOWN_MARKER).exists(),
+            "startup consumes the marker"
+        );
+        assert_eq!(
+            reopened.full_integrity_checks.load(Ordering::Acquire),
+            0,
+            "a repository closed at a clean shutdown skips the full integrity check"
+        );
+        reopened.repository_snapshot(id).await.unwrap();
+        // A crash: the process ends without an orderly shutdown.
+        drop(reopened);
+
+        let recovered = TollgateService::open(support).await.unwrap();
+        assert_eq!(
+            recovered.full_integrity_checks.load(Ordering::Acquire),
+            1,
+            "after a crash the full integrity check runs"
+        );
+        recovered.repository_snapshot(id).await.unwrap();
+        recovered.shutdown().await.unwrap();
     }
 }

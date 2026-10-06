@@ -330,6 +330,7 @@ impl TollgateService {
         repository_id: RepositoryId,
         command_id: CommandId,
     ) -> Result<ReleaseRetryResult, ServiceError> {
+        let _admission = self.admit_command().await?;
         let runtime = self.runtime(repository_id).await?;
         let request_digest = command_digest(&serde_json::json!({
             "repository_id": repository_id,
