@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
     time::Instant,
 };
@@ -815,10 +815,18 @@ struct RepositoryRuntime {
     /// Set when a release advance pass is owed; cleared by the pass that runs.
     release_advance_requested: AtomicBool,
     release_advance_passes: AtomicU64,
+    /// Set while a delayed release advance pass is scheduled because the remote could not be
+    /// observed; consecutive unobservable passes back off exponentially.
+    release_retry_scheduled: AtomicBool,
+    release_retry_attempts: AtomicU32,
     /// Test hook: the durable boundary at which the next release advance stops as if the
     /// process crashed there.
     #[cfg(test)]
     release_fault: Mutex<Option<(ReleaseFault, bool)>>,
+    /// Test hook: the next release advance signals the first `Notify` after observing the remote
+    /// and waits on the second before planning again under the mutation lock.
+    #[cfg(test)]
+    release_observation_gate: Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
     scheduler_epoch: AtomicU64,
     dispatching: Mutex<HashSet<QueueItemId>>,
     execution_changed: Notify,
@@ -5594,8 +5602,12 @@ impl TollgateService {
             release_advance: tokio::sync::Mutex::new(()),
             release_advance_requested: AtomicBool::new(false),
             release_advance_passes: AtomicU64::new(0),
+            release_retry_scheduled: AtomicBool::new(false),
+            release_retry_attempts: AtomicU32::new(0),
             #[cfg(test)]
             release_fault: Mutex::new(None),
+            #[cfg(test)]
+            release_observation_gate: Mutex::new(None),
             scheduler_epoch: AtomicU64::new(0),
             dispatching: Mutex::new(HashSet::new()),
             execution_changed: Notify::new(),
@@ -8736,7 +8748,18 @@ impl TollgateService {
             let certified_chain = if staged {
                 // The remote follows `release` only (R4): `release` must be a release run's
                 // tested OID, and every commit after the remote one Tollgate promoted or adopted.
-                if !Self::release_certified(&runtime, &state.release_oid) {
+                let certified = match Self::release_certified(&runtime, &state.release_oid) {
+                    Ok(certified) => certified,
+                    Err(error) => {
+                        runtime.store.set_intent_state(
+                            command_id,
+                            IntentState::Canceled,
+                            &serde_json::json!({"stage": "push-release-certification", "error": error.to_string()}),
+                        )?;
+                        return Err(error);
+                    }
+                };
+                if !certified {
                     runtime.store.set_intent_state(
                         command_id,
                         IntentState::Canceled,
@@ -10030,12 +10053,20 @@ impl TollgateService {
             let _ = runtime.events.send(event);
             return self.repository_snapshot(repository_id).await;
         }
+        // A release advance that froze a push owes it to the configured remote until the push
+        // lands, `tg push` publishes it, or `tg reconcile` abandons it (section 9).
+        let release_push_owed = runtime
+            .store
+            .recoverable_operations(&[tollgate_store::RELEASE_ADVANCE_INTENT_KIND])?
+            .iter()
+            .any(|(_, _, evidence, _)| release::release_intent_owes_push(evidence));
         let (items, old_digest, gate_policy_changed, state) = {
             let mut data = runtime.data.lock();
-            if data
-                .items
-                .iter()
-                .any(|item| item.state == QueueItemState::PromotedLocalPushPending)
+            if (release_push_owed
+                || data
+                    .items
+                    .iter()
+                    .any(|item| item.state == QueueItemState::PromotedLocalPushPending))
                 && (data.config.remote != candidate.remote)
             {
                 return Err(ServiceError::Invariant(
@@ -29980,5 +30011,443 @@ policy = "clone"
         assert_eq!(block_codes(&state), vec!["external-release-movement"]);
         assert_eq!(state.release_oid, tip_b);
         blocked.shutdown().await.unwrap();
+    }
+
+    /// Waits until no release advance pass is requested or running.
+    async fn wait_for_quiescent_release_advances(runtime: &RepositoryRuntime) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            if !runtime.release_advance_requested.load(Ordering::Acquire)
+                && runtime.release_advance.try_lock().is_ok()
+                && !runtime.release_advance_requested.load(Ordering::Acquire)
+            {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "release advance passes never went quiet"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_remote_retargeted_during_a_release_advance_is_observed_before_it_is_classified() {
+        let temporary = tempfile::tempdir().unwrap();
+        let gate = temporary.path().join("release-may-finish");
+        let policy = held_release_policy(&gate);
+        let (service, id, repository, remote, base) = staged_release_repository_with_remote(
+            temporary.path(),
+            &[("feature-a", "a.txt", "a\n")],
+            true,
+            &policy,
+        )
+        .await;
+        let backup = temporary.path().join("backup.git");
+        git(
+            temporary.path(),
+            &[
+                "init",
+                "--bare",
+                "-b",
+                USER_BRANCH,
+                backup.to_str().unwrap(),
+            ],
+        );
+        git(
+            &repository,
+            &["remote", "add", "backup", backup.to_str().unwrap()],
+        );
+        git(
+            &repository,
+            &[
+                "push",
+                "backup",
+                &format!("{}:refs/heads/master", base.to_hex()),
+            ],
+        );
+        let tip = approve_and_promote(&service, id, "feature-a").await;
+        // `origin` already holds the release target, so it alone would need no push.
+        git(
+            &repository,
+            &[
+                "push",
+                "origin",
+                &format!("{}:refs/heads/master", tip.to_hex()),
+            ],
+        );
+        let runtime = service.runtime(id).await.unwrap();
+        let reached = Arc::new(Notify::new());
+        let resume = Arc::new(Notify::new());
+        *runtime.release_observation_gate.lock() =
+            Some((Arc::clone(&reached), Arc::clone(&resume)));
+        std::fs::write(&gate, "").unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(60), reached.notified())
+            .await
+            .expect("the release advance never observed origin");
+
+        // Between the observation and the locked re-plan, the configuration retargets the push
+        // to `backup`, which still holds the base commit.
+        std::fs::write(
+            repository.join(".tollgate/config.toml"),
+            format!(
+                "version = 1\n\n[remote]\nenabled = true\nname = \"backup\"\nbranch = \"master\"\n\n{policy}"
+            ),
+        )
+        .unwrap();
+        service
+            .apply_configuration(id, CommandId::new())
+            .await
+            .unwrap();
+        resume.notify_one();
+
+        wait_for_release_snapshot(&service, id, "release to reach the tip", |snapshot| {
+            snapshot.state.release_oid == tip
+        })
+        .await;
+        wait_for_settled_release_advances(&runtime).await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        while remote_master(&backup) != tip.to_hex() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the retargeted remote was never observed and pushed: backup master stayed at {}",
+                remote_master(&backup)
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let events = runtime.store.events_after(0, 10_000).unwrap();
+        let advanced = event_kinds(&events, "release.advanced");
+        assert_eq!(advanced.len(), 1);
+        assert_eq!(advanced[0].payload["push"], "pending");
+        let pushed = event_kinds(&events, "release.pushed");
+        assert_eq!(pushed.len(), 1);
+        assert_eq!(pushed[0].payload["lease"], serde_json::json!(base));
+        assert_eq!(remote.master(), tip.to_hex());
+        let state = service.repository_snapshot(id).await.unwrap().state;
+        assert!(state.release_block_reasons.is_empty());
+        service.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn configuration_cannot_change_the_remote_while_a_release_push_is_owed() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (service, id, repository, remote, base) = staged_release_repository_with_remote(
+            temporary.path(),
+            &[("feature-a", "a.txt", "a\n")],
+            true,
+            PASSING_RELEASE_POLICY,
+        )
+        .await;
+        std::fs::write(&remote.reject, "").unwrap();
+        let tip = approve_and_promote(&service, id, "feature-a").await;
+        wait_for_release_snapshot(&service, id, "the release push to block", |snapshot| {
+            release_codes(&snapshot.state).contains(&"push-blocked")
+        })
+        .await;
+        let runtime = service.runtime(id).await.unwrap();
+        assert_eq!(
+            release_advance_intents(&runtime),
+            vec![IntentState::NeedsAttention]
+        );
+        let config_path = repository.join(".tollgate/config.toml");
+        let pushing = std::fs::read_to_string(&config_path).unwrap();
+
+        // Disabling the remote, or retargeting it, would strand the frozen release push.
+        for remote_section in [
+            "[remote]\nenabled = false\n",
+            "[remote]\nenabled = true\nbranch = \"elsewhere\"\n",
+        ] {
+            std::fs::write(
+                &config_path,
+                format!("version = 1\n\n{remote_section}\n{PASSING_RELEASE_POLICY}"),
+            )
+            .unwrap();
+            assert!(
+                service
+                    .apply_configuration(id, CommandId::new())
+                    .await
+                    .is_err(),
+                "{remote_section}"
+            );
+            let state = service.repository_snapshot(id).await.unwrap().state;
+            assert!(state.remote_enabled);
+            assert_eq!(
+                release_advance_intents(&runtime),
+                vec![IntentState::NeedsAttention]
+            );
+        }
+        // A change that leaves the remote alone still applies.
+        std::fs::write(
+            &config_path,
+            format!("{pushing}\n[[step]]\nname = \"extra\"\nstage = \"release\"\nrun = \"true\"\n"),
+        )
+        .unwrap();
+        service
+            .apply_configuration(id, CommandId::new())
+            .await
+            .unwrap();
+
+        // `tg reconcile` abandons the frozen push; the remote change then applies.
+        service.reconcile(id, CommandId::new()).await.unwrap();
+        assert!(release_advance_intents(&runtime).is_empty());
+        std::fs::write(
+            &config_path,
+            format!("version = 1\n\n[remote]\nenabled = false\n\n{PASSING_RELEASE_POLICY}"),
+        )
+        .unwrap();
+        service
+            .apply_configuration(id, CommandId::new())
+            .await
+            .unwrap();
+        let state = service.repository_snapshot(id).await.unwrap().state;
+        assert!(!state.remote_enabled);
+        assert_eq!(state.release_oid, tip);
+        assert_eq!(remote.master(), base.to_hex());
+        service.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tg_push_requires_a_release_certificate_under_the_active_release_stage() {
+        let temporary = tempfile::tempdir().unwrap();
+        let gate = temporary.path().join("release-may-finish");
+        let (service, id, repository, remote, base) = staged_release_repository_with_remote(
+            temporary.path(),
+            &[("feature-a", "a.txt", "a\n")],
+            true,
+            &held_release_policy(&gate),
+        )
+        .await;
+        let tip = approve_and_promote(&service, id, "feature-a").await;
+        wait_for_release_snapshot(&service, id, "the first release run to start", |snapshot| {
+            release_runs_for(snapshot, &tip)
+                .iter()
+                .any(|view| view.item.state == QueueItemState::Running)
+        })
+        .await;
+        // The on-disk release stage changes before the first run passes, so its certificate
+        // never advances `release`.
+        let config_path = repository.join(".tollgate/config.toml");
+        let failing_release_stage = "version = 1\n\n[remote]\nenabled = true\n\n[[step]]\nname = \"fast\"\nrun = \"true\"\n\n[[step]]\nname = \"full\"\nstage = \"release\"\nrun = \"false\"\n";
+        std::fs::write(&config_path, failing_release_stage).unwrap();
+        std::fs::write(&gate, "").unwrap();
+        wait_for_release_snapshot(&service, id, "the first release run to pass", |snapshot| {
+            release_runs_for(snapshot, &tip)
+                .iter()
+                .any(|view| view.item.state == QueueItemState::CheckPassed)
+        })
+        .await;
+        let runtime = service.runtime(id).await.unwrap();
+        wait_for_quiescent_release_advances(&runtime).await;
+        assert_eq!(
+            service
+                .repository_snapshot(id)
+                .await
+                .unwrap()
+                .state
+                .release_oid,
+            base
+        );
+        // Under the active release stage the tip fails.
+        service
+            .apply_configuration(id, CommandId::new())
+            .await
+            .unwrap();
+        wait_for_release_snapshot(
+            &service,
+            id,
+            "the release run under the new stage to fail",
+            |snapshot| {
+                release_runs_for(snapshot, &tip)
+                    .iter()
+                    .any(|view| view.item.state == QueueItemState::CheckFailed)
+            },
+        )
+        .await;
+        // An external fast-forward of `release` to the tip is adopted as uncertified, and the
+        // certificate from the earlier release stage does not let `tg push` publish it.
+        git(&repository, &["update-ref", RELEASE_REF, &tip.to_hex()]);
+        service.pull(id, CommandId::new()).await.unwrap();
+        assert_eq!(
+            service
+                .repository_snapshot(id)
+                .await
+                .unwrap()
+                .state
+                .release_oid,
+            tip
+        );
+        assert!(service.push(id, CommandId::new()).await.is_err());
+        assert_eq!(remote.master(), base.to_hex());
+        assert!(remote.pushed().is_empty());
+        service.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tg_push_publishes_a_frozen_release_push_after_the_release_stage_changes() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (service, id, repository, remote, _base) = staged_release_repository_with_remote(
+            temporary.path(),
+            &[("feature-a", "a.txt", "a\n")],
+            true,
+            PASSING_RELEASE_POLICY,
+        )
+        .await;
+        std::fs::write(&remote.reject, "").unwrap();
+        let tip = approve_and_promote(&service, id, "feature-a").await;
+        wait_for_release_snapshot(&service, id, "the release push to block", |snapshot| {
+            release_codes(&snapshot.state).contains(&"push-blocked")
+        })
+        .await;
+        // The release stage changes while the push Tollgate froze at the advance is owed.
+        std::fs::write(
+            repository.join(".tollgate/config.toml"),
+            "version = 1\n\n[remote]\nenabled = true\n\n[[step]]\nname = \"fast\"\nrun = \"true\"\n\n[[step]]\nname = \"full\"\nstage = \"release\"\nrun = \"true && true\"\n",
+        )
+        .unwrap();
+        service
+            .apply_configuration(id, CommandId::new())
+            .await
+            .unwrap();
+        let runtime = service.runtime(id).await.unwrap();
+        wait_for_quiescent_release_advances(&runtime).await;
+        assert_eq!(
+            release_advance_intents(&runtime),
+            vec![IntentState::NeedsAttention]
+        );
+        std::fs::remove_file(&remote.reject).unwrap();
+        let pushed = service.push(id, CommandId::new()).await.unwrap();
+        assert!(
+            matches!(pushed.action, RemoteSyncAction::Pushed),
+            "{pushed:?}"
+        );
+        assert_eq!(remote.master(), tip.to_hex());
+        assert!(release_advance_intents(&runtime).is_empty());
+        let state = service.repository_snapshot(id).await.unwrap().state;
+        assert!(state.release_block_reasons.is_empty());
+        service.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_owed_release_push_blocks_and_retries_while_the_remote_is_unobservable() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (service, id, _repository, remote, base) = staged_release_repository_with_remote(
+            temporary.path(),
+            &[("feature-a", "a.txt", "a\n")],
+            true,
+            PASSING_RELEASE_POLICY,
+        )
+        .await;
+        let runtime = service.runtime(id).await.unwrap();
+        *runtime.release_fault.lock() = Some((ReleaseFault::AfterLocalAdvance, false));
+        let tip = approve_and_promote(&service, id, "feature-a").await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !runtime.release_fault.lock().is_some_and(|(_, fired)| fired) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the fault never fired"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(
+            release_advance_intents(&runtime),
+            vec![IntentState::ExternalApplied]
+        );
+        drop(runtime);
+        service.shutdown().await.unwrap();
+        drop(service);
+
+        // The service restarts while the remote is unreachable: the owed push is recorded as
+        // blocked instead of staying silently owed.
+        let away = temporary.path().join("remote-away.git");
+        std::fs::rename(&remote.path, &away).unwrap();
+        let recovered = TollgateService::open(temporary.path().join("support"))
+            .await
+            .unwrap();
+        let blocked =
+            wait_for_release_snapshot(&recovered, id, "the owed push to block", |snapshot| {
+                release_codes(&snapshot.state).contains(&"push-blocked")
+            })
+            .await;
+        assert_eq!(blocked.state.release_oid, tip);
+        assert_eq!(
+            blocked.state.execution_state,
+            RepositoryExecutionState::Active
+        );
+        let runtime = recovered.runtime(id).await.unwrap();
+        assert_eq!(
+            release_advance_intents(&runtime),
+            vec![IntentState::NeedsAttention]
+        );
+        let events = runtime.store.events_after(0, 10_000).unwrap();
+        let push_blocked = event_kinds(&events, "release.push-blocked");
+        assert_eq!(push_blocked[0].payload["notify"], true);
+        assert_eq!(push_blocked[0].payload["lease"], serde_json::json!(base));
+
+        // Once the remote is reachable again, a scheduled retry pushes the tested OID with its
+        // frozen lease, with nothing else requesting a pass.
+        std::fs::rename(&away, &remote.path).unwrap();
+        wait_for_remote(&remote, &tip).await;
+        wait_for_settled_release_advances(&runtime).await;
+        let settled =
+            wait_for_release_snapshot(&recovered, id, "the push block to clear", |snapshot| {
+                snapshot.state.release_block_reasons.is_empty()
+            })
+            .await;
+        assert_eq!(settled.state.release_oid, tip);
+        assert_eq!(remote.pushed(), vec![tip.to_hex()]);
+        let events = runtime.store.events_after(0, 10_000).unwrap();
+        let pushed = event_kinds(&events, "release.pushed");
+        assert_eq!(pushed.len(), 1);
+        assert_eq!(pushed[0].payload["recovered"], true);
+        assert_eq!(event_kinds(&events, "release.advanced").len(), 1);
+        recovered.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_release_advance_deferred_by_an_unobservable_remote_is_retried() {
+        let temporary = tempfile::tempdir().unwrap();
+        let gate = temporary.path().join("release-may-finish");
+        let (service, id, _repository, remote, base) = staged_release_repository_with_remote(
+            temporary.path(),
+            &[("feature-a", "a.txt", "a\n")],
+            true,
+            &held_release_policy(&gate),
+        )
+        .await;
+        let tip = approve_and_promote(&service, id, "feature-a").await;
+        let away = temporary.path().join("remote-away.git");
+        std::fs::rename(&remote.path, &away).unwrap();
+        std::fs::write(&gate, "").unwrap();
+        wait_for_release_snapshot(&service, id, "the release run to pass", |snapshot| {
+            release_runs_for(snapshot, &tip)
+                .iter()
+                .any(|view| view.item.state == QueueItemState::CheckPassed)
+        })
+        .await;
+        let runtime = service.runtime(id).await.unwrap();
+        let passes = runtime.release_advance_passes.load(Ordering::Acquire);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        while runtime.release_advance_passes.load(Ordering::Acquire) < passes + 2 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the deferred release advance was never retried"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        // Network unavailability only delays the advance: nothing moved and nothing is held.
+        let state = service.repository_snapshot(id).await.unwrap().state;
+        assert_eq!(state.release_oid, base);
+        assert!(state.release_block_reasons.is_empty());
+        assert!(release_advance_intents(&runtime).is_empty());
+
+        std::fs::rename(&away, &remote.path).unwrap();
+        wait_for_release_snapshot(&service, id, "release to reach the tip", |snapshot| {
+            snapshot.state.release_oid == tip
+        })
+        .await;
+        wait_for_remote(&remote, &tip).await;
+        wait_for_settled_release_advances(&runtime).await;
+        assert_eq!(remote.pushed(), vec![tip.to_hex()]);
+        service.shutdown().await.unwrap();
     }
 }

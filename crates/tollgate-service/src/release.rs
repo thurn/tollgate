@@ -105,6 +105,63 @@ enum ReleasePushSettlement {
     },
 }
 
+/// The delay before the first retry pass after the remote could not be observed, and the cap
+/// that consecutive failures double towards.
+const RELEASE_RETRY_BASE_DELAY: std::time::Duration = if cfg!(test) {
+    std::time::Duration::from_millis(50)
+} else {
+    std::time::Duration::from_secs(5)
+};
+const RELEASE_RETRY_MAX_DELAY: std::time::Duration = if cfg!(test) {
+    std::time::Duration::from_millis(400)
+} else {
+    std::time::Duration::from_secs(600)
+};
+
+/// The remote an advance observed outside the mutation lock: the configured remote and branch,
+/// the push URL they resolved to, and the branch's OID there.
+#[derive(Clone, Debug)]
+struct ObservedReleaseRemote {
+    remote: String,
+    branch: String,
+    push_url: String,
+    oid: Option<GitOid>,
+}
+
+/// Resolves `remote`'s push URL and fetches `branch` from it into the remote-observation ref.
+async fn observe_release_remote(
+    runtime: &RepositoryRuntime,
+    remote: &str,
+    branch: &str,
+) -> Result<ObservedReleaseRemote, GitError> {
+    let push_url = runtime.git.remote_url(remote, true).await?;
+    let oid = runtime
+        .git
+        .fetch_remote_ref(&push_url, branch, &remote_observation_ref(remote, branch))
+        .await?;
+    Ok(ObservedReleaseRemote {
+        remote: remote.to_owned(),
+        branch: branch.to_owned(),
+        push_url,
+        oid,
+    })
+}
+
+/// How the local half of an advance ended.
+enum LocalReleaseAdvance {
+    /// Nothing is owed: the advance completed, was deferred, or was held.
+    Settled,
+    /// `release` advanced and its frozen push is owed.
+    PushOwed(CommandId, serde_json::Value),
+    /// The configured push target differs from the one observed; observe again.
+    RemoteRetargeted,
+}
+
+/// Whether a release-advance intent froze a push to the configured remote.
+pub(crate) fn release_intent_owes_push(evidence: &serde_json::Value) -> bool {
+    evidence.get("push").is_some_and(|push| !push.is_null())
+}
+
 fn evidence_oid(evidence: &serde_json::Value, key: &str) -> Result<GitOid, ServiceError> {
     serde_json::from_value(
         evidence.get(key).cloned().ok_or_else(|| {
@@ -191,54 +248,91 @@ impl TollgateService {
         if !self.resume_release_advance(runtime).await? {
             return Ok(());
         }
-        let plan = {
-            let _mutation = runtime.mutation.lock().await;
-            self.plan_release_advance(runtime).await?
-        };
-        let Some(plan) = plan else {
-            return Ok(());
-        };
-        let observed_remote = match &plan.push {
-            Some((remote, branch)) => {
-                let observed = match runtime.git.remote_url(remote, true).await {
-                    Ok(push_url) => {
-                        runtime
-                            .git
-                            .fetch_remote_ref(
-                                &push_url,
-                                branch,
-                                &remote_observation_ref(remote, branch),
-                            )
-                            .await
-                    }
-                    Err(error) => Err(error),
-                };
-                match observed {
-                    Ok(observed) => Some(observed),
-                    Err(error) => {
-                        eprintln!(
-                            "Tollgate deferred the release advance to {} because the remote could not be observed: {error}",
-                            plan.target.short()
-                        );
-                        return Ok(());
-                    }
-                }
-            }
-            None => None,
-        };
-        let owed_push = {
-            let _mutation = runtime.mutation.lock().await;
-            let Some(plan) = self.plan_release_advance(runtime).await? else {
+        loop {
+            let plan = {
+                let _mutation = runtime.mutation.lock().await;
+                self.plan_release_advance(runtime).await?
+            };
+            let Some(plan) = plan else {
                 return Ok(());
             };
-            self.advance_release_locally(runtime, plan, observed_remote)
-                .await?
-        };
-        if let Some((command_id, evidence)) = owed_push {
-            self.release_push_step(runtime, command_id, &evidence)
-                .await?;
+            let observed = match &plan.push {
+                Some((remote, branch)) => {
+                    match observe_release_remote(runtime, remote, branch).await {
+                        Ok(observed) => {
+                            runtime.release_retry_attempts.store(0, Ordering::Release);
+                            Some(observed)
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "Tollgate deferred the release advance to {} because the remote could not be observed: {error}",
+                                plan.target.short()
+                            );
+                            self.schedule_release_retry(runtime);
+                            return Ok(());
+                        }
+                    }
+                }
+                None => None,
+            };
+            #[cfg(test)]
+            {
+                let gate = runtime.release_observation_gate.lock().take();
+                if let Some((reached, resume)) = gate {
+                    reached.notify_one();
+                    resume.notified().await;
+                }
+            }
+            let local = {
+                let _mutation = runtime.mutation.lock().await;
+                let Some(plan) = self.plan_release_advance(runtime).await? else {
+                    return Ok(());
+                };
+                self.advance_release_locally(runtime, plan, observed)
+                    .await?
+            };
+            match local {
+                LocalReleaseAdvance::Settled => return Ok(()),
+                LocalReleaseAdvance::PushOwed(command_id, evidence) => {
+                    return self.release_push_step(runtime, command_id, &evidence).await;
+                }
+                // The configuration retargeted the remote after the observation: observe the
+                // newly configured remote before classifying it.
+                LocalReleaseAdvance::RemoteRetargeted => {}
+            }
         }
-        Ok(())
+    }
+
+    /// Schedules one delayed release advance pass after the remote could not be observed, so a
+    /// deferred advance or an owed push is retried even when nothing else requests a pass.
+    /// Consecutive unobservable passes back off exponentially up to a cap; a pass that observes
+    /// the remote resets the backoff. The task holds only a weak reference to the service.
+    pub(crate) fn schedule_release_retry(self: &Arc<Self>, runtime: &Arc<RepositoryRuntime>) {
+        if runtime.release_retry_scheduled.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let attempts = runtime
+            .release_retry_attempts
+            .fetch_add(1, Ordering::AcqRel);
+        let delay = RELEASE_RETRY_BASE_DELAY
+            .saturating_mul(1_u32 << attempts.min(16))
+            .min(RELEASE_RETRY_MAX_DELAY);
+        let repository_id = runtime.data.lock().state.id;
+        let service = Arc::downgrade(self);
+        let runtime = Arc::downgrade(runtime);
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let (Some(service), Some(runtime)) = (service.upgrade(), runtime.upgrade()) else {
+                return;
+            };
+            runtime
+                .release_retry_scheduled
+                .store(false, Ordering::Release);
+            if service.shutting_down.load(Ordering::Acquire) {
+                return;
+            }
+            service.spawn_release_advance(repository_id, &runtime);
+        });
     }
 
     /// Settles an unfinished release advance before any newer one: a prepared intent recovers
@@ -470,22 +564,29 @@ impl TollgateService {
 
     /// The local half of an advance under the mutation lock (section 9, steps 2–4): remote
     /// preflight, the release intent with its frozen push, the compare-and-swap, and the persisted
-    /// advance. Returns the intent when a push is owed.
+    /// advance. The preflight classifies only the remote that was observed: when the configured
+    /// remote, branch, or push URL no longer matches the observation, nothing is recorded and the
+    /// caller observes again.
     async fn advance_release_locally(
         self: &Arc<Self>,
         runtime: &Arc<RepositoryRuntime>,
         plan: ReleasePlan,
-        observed_remote: Option<Option<GitOid>>,
-    ) -> Result<Option<(CommandId, serde_json::Value)>, ServiceError> {
+        observed_remote: Option<ObservedReleaseRemote>,
+    ) -> Result<LocalReleaseAdvance, ServiceError> {
         let repository_id = runtime.data.lock().state.id;
         let mut remote_already_published = false;
         let push = match &plan.push {
             None => serde_json::Value::Null,
             Some((remote, branch)) => {
-                // The plan changed to a pushing configuration after the observation was skipped.
-                let Some(observed) = observed_remote.clone() else {
-                    return Ok(None);
+                let push_url = runtime.git.remote_url(remote, true).await.ok();
+                let Some(observation) = observed_remote.as_ref().filter(|observation| {
+                    &observation.remote == remote
+                        && &observation.branch == branch
+                        && push_url.as_deref() == Some(observation.push_url.as_str())
+                }) else {
+                    return Ok(LocalReleaseAdvance::RemoteRetargeted);
                 };
+                let observed = observation.oid.clone();
                 let in_certified_history = match &observed {
                     Some(remote_oid) if remote_oid != &plan.target => {
                         runtime.git.is_ancestor(remote_oid, &plan.target).await?
@@ -513,7 +614,7 @@ impl TollgateService {
                         "remote": remote,
                         "branch": branch,
                         "remote_fetch_url": runtime.git.remote_url(remote, false).await?,
-                        "remote_push_url": runtime.git.remote_url(remote, true).await?,
+                        "remote_push_url": observation.push_url,
                         "expected_remote": expected_remote,
                     }),
                     ReleasePreflight::Mismatch => {
@@ -530,7 +631,7 @@ impl TollgateService {
                             ),
                             "Run `tg pull` to adopt a remote fast-forward of staging, or `tg reconcile` after choosing the authoritative history.",
                         )?;
-                        return Ok(None);
+                        return Ok(LocalReleaseAdvance::Settled);
                     }
                 }
             }
@@ -554,15 +655,15 @@ impl TollgateService {
             command_id,
             &evidence,
         )?;
-        if let Some((remote, branch)) = &plan.push
+        if plan.push.is_some()
             && let Some(observed) = &observed_remote
         {
             runtime.store.record_remote_observation(
                 repository_id,
                 command_id,
-                remote,
-                &format!("refs/heads/{branch}"),
-                observed.as_ref(),
+                &observed.remote,
+                &format!("refs/heads/{}", observed.branch),
+                observed.oid.as_ref(),
                 "release-preflight-fetch",
             )?;
         }
@@ -579,7 +680,7 @@ impl TollgateService {
             eprintln!(
                 "Tollgate deferred a release advance while storage admission is unavailable: {error}"
             );
-            return Ok(None);
+            return Ok(LocalReleaseAdvance::Settled);
         }
         inject_release_fault(runtime, ReleaseFault::AfterIntent)?;
         if let Err(error) = runtime
@@ -603,7 +704,11 @@ impl TollgateService {
         self.finish_local_release_advance(runtime, command_id, &evidence, Actor::App)
             .await?;
         inject_release_fault(runtime, ReleaseFault::AfterLocalAdvance)?;
-        Ok((!evidence["push"].is_null()).then_some((command_id, evidence)))
+        Ok(if release_intent_owes_push(&evidence) {
+            LocalReleaseAdvance::PushOwed(command_id, evidence)
+        } else {
+            LocalReleaseAdvance::Settled
+        })
     }
 
     /// Persists a `release` advance that the compare-and-swap applied: the new projection, the
@@ -710,11 +815,15 @@ impl TollgateService {
             {
                 Ok(observed) => observed,
                 Err(error) => {
-                    eprintln!(
-                        "Tollgate deferred the release push of {} because the remote could not be observed: {error}",
-                        new.short()
-                    );
-                    return Ok(());
+                    return self
+                        .settle_unobserved_release_push(
+                            runtime,
+                            command_id,
+                            &new,
+                            expected_remote.as_ref(),
+                            format!("the remote could not be observed: {error}"),
+                        )
+                        .await;
                 }
             };
             match classify_release_push(expected_remote.as_ref(), &new, observed.as_ref()) {
@@ -768,6 +877,22 @@ impl TollgateService {
                 },
             }
         };
+        if let ReleasePushSettlement::Blocked {
+            observed_remote: None,
+            error,
+        } = settlement
+        {
+            return self
+                .settle_unobserved_release_push(
+                    runtime,
+                    command_id,
+                    &new,
+                    expected_remote.as_ref(),
+                    error,
+                )
+                .await;
+        }
+        runtime.release_retry_attempts.store(0, Ordering::Release);
         self.settle_release_push(
             runtime,
             command_id,
@@ -776,6 +901,36 @@ impl TollgateService {
             settlement,
         )
         .await
+    }
+
+    /// Settles a release push whose remote could not be observed or no longer resolves to the
+    /// frozen push URL: the owed push is recorded `push-blocked`, so the debt is visible, and a
+    /// delayed pass retries it even if nothing else requests one.
+    async fn settle_unobserved_release_push(
+        self: &Arc<Self>,
+        runtime: &Arc<RepositoryRuntime>,
+        command_id: CommandId,
+        new: &GitOid,
+        expected_remote: Option<&GitOid>,
+        error: String,
+    ) -> Result<(), ServiceError> {
+        eprintln!(
+            "Tollgate could not settle the release push of {}: {error}",
+            new.short()
+        );
+        self.settle_release_push(
+            runtime,
+            command_id,
+            new,
+            expected_remote,
+            ReleasePushSettlement::Blocked {
+                observed_remote: None,
+                error,
+            },
+        )
+        .await?;
+        self.schedule_release_retry(runtime);
+        Ok(())
     }
 
     async fn settle_release_push(
@@ -1119,18 +1274,41 @@ impl TollgateService {
         Ok(())
     }
 
-    /// Whether `oid` is the tested OID of a passed release run (any release-stage digest).
-    pub(crate) fn release_certified(runtime: &RepositoryRuntime, oid: &GitOid) -> bool {
+    /// Whether `tg push` may publish `oid` as `release` (R2, R4): `oid` is the tested OID of a
+    /// passed release run whose certificate's release-stage digest equals the active
+    /// configuration's, or the target of an unfinished release advance that froze a push of that
+    /// certificate after checking R2 when it advanced. A certificate under an earlier
+    /// release-stage digest never certifies an externally adopted `release`.
+    pub(crate) fn release_certified(
+        runtime: &RepositoryRuntime,
+        oid: &GitOid,
+    ) -> Result<bool, ServiceError> {
+        let frozen = runtime
+            .store
+            .recoverable_operations(&[RELEASE_ADVANCE_INTENT_KIND])?
+            .into_iter()
+            .filter(|(_, _, evidence, _)| {
+                release_intent_owes_push(evidence)
+                    && evidence_oid(evidence, "new").ok().as_ref() == Some(oid)
+            })
+            .filter_map(|(_, _, evidence, _)| {
+                serde_json::from_value::<CertificateId>(evidence.get("certificate_id")?.clone())
+                    .ok()
+            })
+            .collect::<Vec<_>>();
         let data = runtime.data.lock();
-        data.certificates.iter().any(|certificate| {
+        let active_digest = data.config.release_step_graph_digest.as_deref();
+        Ok(data.certificates.iter().any(|certificate| {
             &certificate.tested_oid == oid
                 && certificate.checkout_verified
+                && (active_digest == Some(certificate.step_graph_digest.as_str())
+                    || frozen.contains(&certificate.id))
                 && data.items.iter().any(|item| {
                     item.id == certificate.queue_item_id
                         && item.kind == QueueItemKind::Release
                         && item.state == QueueItemState::CheckPassed
                 })
-        })
+        }))
     }
 
     /// The `max_release_lag` pause (section 6), re-evaluated before each promotion attempt under
