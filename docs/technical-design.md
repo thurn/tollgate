@@ -658,7 +658,7 @@ With release-stage steps, `tg push` publishes `release` only when it is the test
 
 ### 10.8 Gate-aware Git conveniences
 
-- `tg update`: rebase the current clean, unqueued feature branch onto current gated `staging`, then verify it has one unique source commit and report its new OID.
+- `tg update`: rebase the current clean, unqueued feature branch onto current gated `staging`, then verify it has one unique source commit and report its new OID. When the update fails while the same branch is still checked out at its old OID with no rebase in progress, it cancels its intent at once (`worktree-update-not-applied`, with the error); any other failure leaves the intent to startup recovery.
 - `tg worktree create`: create a feature branch/worktree from the gated tip under the repository's `.worktrees/` directory by default. The conventional `wt/` branch prefix is omitted from the directory name; explicit destinations remain supported by the service API.
 - `tg worktree remove`: apply queued/landed/dirty safety checks before removal.
 
@@ -1291,10 +1291,14 @@ Intent reconciliation uses this evidence matrix:
 | Push | direct remote observation equals recorded tested OID | remote still equals exact expected-old/nonexistence and local promoted chain still verifies | `push-blocked`/divergence |
 | Release advance | prepared: `release` equals the recorded target, which finalizes the advance; external-applied or needs-attention: direct remote observation equals the target | prepared: `release` equals the recorded expected-old OID; a remote still at the frozen lease is pushed again by the next advance pass | prepared: cancel and leave the moved `release` to the external-movement check; push: `push-blocked`, and an unobservable remote also schedules a retry pass |
 | Cleanup | each worktree path, registration, branch ref, and old OID independently matches the completed sub-operation evidence | unchanged owned worktree/ref still matches the pre-cleanup snapshot | `needs-attention`; never recreate or delete by guess |
+| Worktree creation | the destination is a worktree of this repository on the prepared branch at the prepared base OID | destination path is absent | `worktree-create-ambiguous` block |
+| Feature update (`tg update`) | the path is still the root of a worktree of this repository whose checked-out branch ref equals its `HEAD`, a commit whose parent is the recorded `staging` OID | `HEAD` still equals the recorded old OID, or both the path and its Git worktree registration are gone (`worktree-update-path-removed`); an update rewrites only the feature worktree's own branch, index, and files, so a removed worktree leaves nothing to recover | `worktree-update-ambiguous` block, including a path that is absent while Git still registers it |
 | Artifact publication | final path has exclusive ownership marker and manifest/hash/size match | final path absent and only owned staging exists | quarantine conflicting/partial paths |
 | Seed publication | generation path, completed intent, manifest, entry metadata, and per-file clone-success records agree | final generation absent and only owned staging exists | quarantine and provision cold |
 | Pruning | tombstone and owned quarantine path identify the exact generation/artifact selected | original still exists unchanged and quarantine does not | block on identity mismatch; deletion may resume only inside verified quarantine |
 | Migration/backup | schema version, migration journal, and verified online-backup identity agree | old schema and database identity remain intact | preserve both database/backup and block |
+
+Startup re-evaluates worktree creation, worktree removal, feature update, and cleanup intents that already need attention, so a repository blocked by one resolves on the next start once the worktree evidence is exact or the worktree is gone. Each worktree ambiguity block clears once no intent of its kind still needs attention.
 
 Seed generations are unique per repository and profile. A live snapshot never allocates a generation still named by an unfinished seed intent, and a snapshot that fails before its final rename discards its staging at once. A seed intent whose generation another seed already records can never complete exactly, so recovery moves its staging or final path to reclaimable `.pruned-` cache quarantine and cancels the intent; the same applies to a seed path that fails verification.
 

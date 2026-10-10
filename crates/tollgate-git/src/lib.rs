@@ -918,6 +918,23 @@ impl GitRepository {
         Ok((!branch.is_empty()).then_some(branch))
     }
 
+    /// Whether this worktree has an unfinished rebase (`rebase-merge` or `rebase-apply` state).
+    pub async fn rebase_in_progress(&self) -> Result<bool, GitError> {
+        for state in ["rebase-merge", "rebase-apply"] {
+            let path = PathBuf::from(
+                text(
+                    self.git(["rev-parse", "--path-format=absolute", "--git-path", state])
+                        .await?,
+                )?
+                .trim(),
+            );
+            if tokio::fs::try_exists(&path).await? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Registration: creates `staging` and `release` at local `master`'s exact OID in one ref
     /// transaction. An existing Tollgate ref is accepted only at that OID.
     pub async fn initialize_integration_ref_from_master(&self) -> Result<GitOid, GitError> {

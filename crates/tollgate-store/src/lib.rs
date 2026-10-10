@@ -1678,6 +1678,41 @@ impl RepositoryStore {
             .transpose()
     }
 
+    /// Returns the state and observed evidence of the latest intent recorded for a command.
+    pub fn operation_outcome(
+        &self,
+        command_id: CommandId,
+    ) -> Result<Option<(IntentState, Option<serde_json::Value>)>, StoreError> {
+        let row = self
+            .connection
+            .lock()
+            .query_row(
+                "SELECT state, observed_json FROM operation_intents WHERE command_id=?1 ORDER BY created_at DESC LIMIT 1",
+                [command_id.to_string()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()?;
+        row.map(|(state, observed)| {
+            let state = [
+                IntentState::Prepared,
+                IntentState::ExternalApplied,
+                IntentState::Completed,
+                IntentState::Canceled,
+                IntentState::NeedsAttention,
+            ]
+            .into_iter()
+            .find(|candidate| candidate.as_str() == state)
+            .ok_or_else(|| StoreError::Integrity(format!("invalid operation state {state}")))?;
+            Ok((
+                state,
+                observed
+                    .map(|value| serde_json::from_str(&value))
+                    .transpose()?,
+            ))
+        })
+        .transpose()
+    }
+
     pub fn has_command_result(&self, command_id: CommandId) -> Result<bool, StoreError> {
         Ok(self.connection.lock().query_row(
             "SELECT EXISTS(SELECT 1 FROM command_results WHERE command_id=?1)",
