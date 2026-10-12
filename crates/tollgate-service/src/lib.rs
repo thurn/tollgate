@@ -38,7 +38,8 @@ use tollgate_config::{CachePolicy, EffectiveConfig, EffectiveStep, StepStage};
 use tollgate_domain::*;
 use tollgate_git::{
     FileIdentity, GitError, GitRepository, INTEGRATION_BRANCH, INTEGRATION_REF, RELEASE_BRANCH,
-    RELEASE_REF, USER_BRANCH, USER_BRANCH_REF, UserMasterSyncOutcome, is_reserved_branch,
+    RELEASE_REF, SyntheticCommit, USER_BRANCH, USER_BRANCH_REF, UserMasterSyncOutcome,
+    is_reserved_branch,
 };
 use tollgate_runner::apfs::{CloneManifest, force_clone_file, force_clone_tree, verify_clone_tree};
 use tollgate_runner::{
@@ -13651,17 +13652,25 @@ impl TollgateService {
             dependent.terminal_reason = Some(format!("dependency-failed:{failed_id}"));
             self.replace_item(&runtime, dependent)?;
         }
+        // Only gate items that have not crossed local CAS compose the speculative
+        // prefix. Release runs and independent checks never join it, and an item that
+        // is promoting or already promoted (for example awaiting its remote push) has
+        // its change in `staging` or is about to, so replaying its source would be an
+        // empty patch.
+        let surviving = |item: &QueueItem| {
+            item.kind == QueueItemKind::Gate
+                && is_rebuildable_gate_state(item.state)
+                && !removed.contains(&item.id)
+        };
         let survivors = all_items
             .iter()
-            .filter(|item| !removed.contains(&item.id) && !item.state.is_terminal())
+            .filter(|item| surviving(item))
             .cloned()
             .collect::<Vec<_>>();
         let affected_ids = all_items
             .iter()
             .enumerate()
-            .filter(|(index, item)| {
-                *index > failed_index && !removed.contains(&item.id) && !item.state.is_terminal()
-            })
+            .filter(|(index, item)| *index > failed_index && surviving(item))
             .map(|(_, item)| item.id)
             .collect::<Vec<_>>();
         if affected_ids.is_empty() {
@@ -13677,44 +13686,28 @@ impl TollgateService {
         for token in tokens {
             token.cancel();
         }
-        let sources = survivors
-            .iter()
-            .map(|item| item.source_oid.clone())
-            .collect::<Vec<_>>();
         runtime.git.initialize_mirror(&runtime.mirror).await?;
-        let chain = runtime
-            .git
-            .construct_prefix(
-                &runtime.mirror,
-                &runtime.builder,
-                &state.staging_oid,
-                &sources,
-            )
+        let prefixes = self
+            .compose_failure_survivors(&runtime, &state.staging_oid, &survivors, &affected_ids)
             .await?;
         let mut restart = Vec::new();
-        for id in affected_ids {
-            let position = survivors
-                .iter()
-                .position(|item| item.id == id)
-                .ok_or_else(|| {
-                    ServiceError::Invariant(
-                        "affected descendant missing from surviving prefix".into(),
-                    )
-                })?;
-            let synthetic = &chain[position];
+        for prefix in prefixes {
+            let synthetic = prefix
+                .chain
+                .last()
+                .ok_or_else(|| ServiceError::Invariant("surviving prefix is empty".into()))?;
             let generation_config = self
                 .configuration_for_tested_oid(&runtime, &synthetic.oid)
                 .await?;
+            let id = prefix.item.id;
             let generation = ValidationGeneration::derive(
                 ValidationGenerationId::new(),
                 id,
                 state.staging_oid.clone(),
-                survivors[..=position].iter().map(|item| item.id).collect(),
-                survivors[..=position]
-                    .iter()
-                    .map(|item| item.source_oid.clone())
-                    .collect(),
-                chain[..=position]
+                prefix.item_ids,
+                prefix.sources,
+                prefix
+                    .chain
                     .iter()
                     .map(|commit| commit.oid.clone())
                     .collect(),
@@ -13726,7 +13719,7 @@ impl TollgateService {
             );
             retain_speculative_generations(&runtime, std::slice::from_ref(&generation)).await?;
             runtime.store.replace_generation(&generation)?;
-            let mut item = survivors[position].clone();
+            let mut item = prefix.item;
             item.state = item
                 .state
                 .transition(ItemEvent::InputsChanged)
@@ -13748,6 +13741,191 @@ impl TollgateService {
         drop(restart);
         self.spawn_eligible(repository_id, &runtime);
         Ok(())
+    }
+
+    /// Composes the prefix each affected survivor of a failure is rebuilt on.
+    ///
+    /// Normally every survivor composes into one chain on `staging` in queue order.
+    /// When a survivor cannot join that chain (a merge conflict or an empty patch),
+    /// the survivors are composed one at a time instead and each rejection settles
+    /// only its own item, as admission does: an independent survivor gets its own
+    /// `staging`-anchored lane, and becomes `merge-conflict` only when it cannot be
+    /// constructed on `staging` itself; a survivor with active dependencies is
+    /// composed in its dependencies' lane and becomes `merge-conflict` when it
+    /// cannot join it; and its own dependents leave with `dependency-failed`.
+    /// Survivors ahead of the failure keep their current generations either way.
+    async fn compose_failure_survivors(
+        &self,
+        runtime: &Arc<RepositoryRuntime>,
+        staging: &GitOid,
+        survivors: &[QueueItem],
+        affected_ids: &[QueueItemId],
+    ) -> Result<Vec<SurvivorPrefix>, ServiceError> {
+        let sources = survivors
+            .iter()
+            .map(|item| item.source_oid.clone())
+            .collect::<Vec<_>>();
+        match runtime
+            .git
+            .construct_prefix(&runtime.mirror, &runtime.builder, staging, &sources)
+            .await
+        {
+            Ok(chain) => {
+                return affected_ids
+                    .iter()
+                    .map(|id| {
+                        let position = survivors
+                            .iter()
+                            .position(|item| item.id == *id)
+                            .ok_or_else(|| {
+                                ServiceError::Invariant(
+                                    "affected descendant missing from surviving prefix".into(),
+                                )
+                            })?;
+                        Ok(SurvivorPrefix {
+                            item: survivors[position].clone(),
+                            item_ids: survivors[..=position].iter().map(|item| item.id).collect(),
+                            sources: sources[..=position].to_vec(),
+                            chain: chain[..=position].to_vec(),
+                        })
+                    })
+                    .collect();
+            }
+            Err(error) if error.is_synthetic_rejection() => {}
+            Err(error) => return Err(error.into()),
+        }
+
+        // `lanes[0]` is the shared speculative prefix; later lanes are anchored
+        // directly to `staging`.
+        let mut lanes: Vec<Vec<&QueueItem>> = vec![Vec::new()];
+        let mut settled = HashSet::new();
+        let mut prefixes = Vec::new();
+        for item in survivors {
+            let affected = affected_ids.contains(&item.id);
+            if let Some(lost) = item
+                .dependencies
+                .iter()
+                .find(|dependency| settled.contains(*dependency))
+            {
+                settled.insert(item.id);
+                self.settle_failure_survivor(
+                    runtime,
+                    item,
+                    &[ItemEvent::DependencyLost],
+                    format!("dependency-failed:{lost}"),
+                )?;
+                continue;
+            }
+            let dependency_lanes = lanes
+                .iter()
+                .enumerate()
+                .filter(|(_, lane)| {
+                    lane.iter()
+                        .any(|member| item.dependencies.contains(&member.id))
+                })
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            let lane_index = dependency_lanes.first().copied().unwrap_or(0);
+            let mut lane_sources = lanes[lane_index]
+                .iter()
+                .map(|member| member.source_oid.clone())
+                .collect::<Vec<_>>();
+            lane_sources.push(item.source_oid.clone());
+            let rejection = if dependency_lanes.len() > 1 {
+                None
+            } else {
+                match runtime
+                    .git
+                    .construct_prefix(&runtime.mirror, &runtime.builder, staging, &lane_sources)
+                    .await
+                {
+                    Ok(chain) => {
+                        lanes[lane_index].push(item);
+                        if affected {
+                            prefixes.push(SurvivorPrefix {
+                                item: item.clone(),
+                                item_ids: lanes[lane_index]
+                                    .iter()
+                                    .map(|member| member.id)
+                                    .collect(),
+                                sources: lane_sources,
+                                chain,
+                            });
+                        }
+                        continue;
+                    }
+                    Err(error) if error.is_synthetic_rejection() => Some(error),
+                    Err(error) => return Err(error.into()),
+                }
+            };
+            if !affected {
+                // A survivor ahead of the failure keeps its current generation; it
+                // already validates apart from the shared prefix.
+                lanes.push(vec![item]);
+                continue;
+            }
+            if !dependency_lanes.is_empty() {
+                settled.insert(item.id);
+                let reason = match rejection {
+                    Some(error) => format!(
+                        "candidate could not be constructed with its required prefix: {error}"
+                    ),
+                    None => "candidate could not be constructed with its required prefix: its dependencies validate in separate lanes".into(),
+                };
+                self.settle_failure_survivor(
+                    runtime,
+                    item,
+                    &[ItemEvent::InputsChanged, ItemEvent::MergeConflict],
+                    reason,
+                )?;
+                continue;
+            }
+            let standalone = vec![item.source_oid.clone()];
+            match runtime
+                .git
+                .construct_prefix(&runtime.mirror, &runtime.builder, staging, &standalone)
+                .await
+            {
+                Ok(chain) => {
+                    lanes.push(vec![item]);
+                    prefixes.push(SurvivorPrefix {
+                        item: item.clone(),
+                        item_ids: vec![item.id],
+                        sources: standalone,
+                        chain,
+                    });
+                }
+                Err(error) if error.is_synthetic_rejection() => {
+                    settled.insert(item.id);
+                    self.settle_failure_survivor(
+                        runtime,
+                        item,
+                        &[ItemEvent::InputsChanged, ItemEvent::MergeConflict],
+                        staging_construction_failure(&error, staging),
+                    )?;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(prefixes)
+    }
+
+    fn settle_failure_survivor(
+        &self,
+        runtime: &Arc<RepositoryRuntime>,
+        item: &QueueItem,
+        events: &[ItemEvent],
+        reason: String,
+    ) -> Result<(), ServiceError> {
+        let mut item = item.clone();
+        for event in events {
+            item.state = item
+                .state
+                .transition(*event)
+                .map_err(|error| ServiceError::Invariant(error.to_string()))?;
+        }
+        item.terminal_reason = Some(reason);
+        self.replace_item(runtime, item)
     }
 
     async fn reconcile_failed_prefixes(
@@ -17261,6 +17439,15 @@ fn remote_observation_ref(remote: &str, branch: &str) -> String {
         .to_hex()
         .to_string();
     format!("refs/tollgate/remotes/{}", &identity[..24])
+}
+
+/// The prefix an affected survivor of a failure is rebuilt on: its ordered items and
+/// sources through itself and the synthetic chain they compose on `staging`.
+struct SurvivorPrefix {
+    item: QueueItem,
+    item_ids: Vec<QueueItemId>,
+    sources: Vec<GitOid>,
+    chain: Vec<SyntheticCommit>,
 }
 
 const fn is_rebuildable_gate_state(state: QueueItemState) -> bool {
@@ -23763,6 +23950,382 @@ run = "test -f feature.txt"
         assert!(
             !contains_a.success(),
             "failed A must not be in promoted history"
+        );
+    }
+
+    /// A gate step that holds every prefix carrying `fail.txt` until `go` exists and
+    /// every prefix that changed `shared.txt` until `later` exists, then fails exactly
+    /// the prefixes carrying `fail.txt`.
+    fn held_failure_script(go: &Path, later: &Path) -> String {
+        format!(
+            "if [ -f fail.txt ]; then while [ ! -f '{}' ]; do sleep 0.02; done; fi; if ! grep -qx base shared.txt; then while [ ! -f '{}' ]; do sleep 0.02; done; fi; [ ! -f fail.txt ]",
+            go.display(),
+            later.display()
+        )
+    }
+
+    /// A registered repository whose `shared.txt` reads `base` and whose gate runs
+    /// [`held_failure_script`], with one single-commit branch per feature.
+    async fn held_failure_repository(
+        root: &Path,
+        features: &[(&str, &str, &str)],
+        go: &Path,
+        later: &Path,
+    ) -> (Arc<TollgateService>, RepositoryId, PathBuf) {
+        let repository = root.join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("shared.txt"), "base\n").unwrap();
+        git(&repository, &["add", "shared.txt"]);
+        git(&repository, &["commit", "-m", "base"]);
+        for (name, path, content) in features {
+            release_feature(&repository, root, name, path, content);
+        }
+        git(&repository, &["switch", "--detach", USER_BRANCH]);
+        let service = TollgateService::open(root.join("support")).await.unwrap();
+        let initialized = service
+            .initialize_repository(&repository, Some(held_failure_script(go, later)))
+            .await
+            .unwrap();
+        (service, initialized.state.id, repository)
+    }
+
+    fn current_generation_of(
+        runtime: &RepositoryRuntime,
+        item_id: QueueItemId,
+    ) -> ValidationGeneration {
+        let data = runtime.data.lock();
+        let generation_id = data
+            .items
+            .iter()
+            .find(|item| item.id == item_id)
+            .and_then(|item| item.current_generation_id)
+            .unwrap();
+        data.generations
+            .iter()
+            .find(|generation| generation.id == generation_id)
+            .cloned()
+            .unwrap()
+    }
+
+    async fn wait_for_running_items(
+        service: &Arc<TollgateService>,
+        repository_id: RepositoryId,
+        item_ids: &[QueueItemId],
+    ) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            let mut states = Vec::new();
+            for item_id in item_ids {
+                states.push(
+                    service
+                        .item_status(repository_id, *item_id)
+                        .await
+                        .unwrap()
+                        .state,
+                );
+            }
+            if states.iter().all(|state| *state == QueueItemState::Running) {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "candidates did not start running: {states:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
+    /// Waits until `failed_id` has failed and every survivor runs a generation without
+    /// it, or until the repository stops executing; the repository must stay active.
+    async fn wait_for_failure_rebuild(
+        service: &Arc<TollgateService>,
+        repository_id: RepositoryId,
+        failed_id: QueueItemId,
+        survivor_ids: &[QueueItemId],
+    ) {
+        let runtime = service.runtime(repository_id).await.unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            let (state, settled) = {
+                let data = runtime.data.lock();
+                let failed = data
+                    .items
+                    .iter()
+                    .any(|item| item.id == failed_id && item.state == QueueItemState::Failed);
+                let rebuilt = survivor_ids.iter().all(|survivor_id| {
+                    data.items
+                        .iter()
+                        .find(|item| item.id == *survivor_id)
+                        .filter(|item| item.state == QueueItemState::Running)
+                        .and_then(|item| item.current_generation_id)
+                        .and_then(|generation_id| {
+                            data.generations
+                                .iter()
+                                .find(|generation| generation.id == generation_id)
+                        })
+                        .is_some_and(|generation| !generation.ordered_item_ids.contains(&failed_id))
+                });
+                (data.state.clone(), failed && rebuilt)
+            };
+            assert_eq!(
+                state.execution_state,
+                RepositoryExecutionState::Active,
+                "the failure rebuild stopped the repository: {:?}",
+                state.block_reasons
+            );
+            assert!(state.block_reasons.is_empty(), "{:?}", state.block_reasons);
+            if settled {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the failure did not rebuild its survivors"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn failure_rebuild_leaves_a_running_release_run_of_promoted_staging_alone() {
+        let temporary = tempfile::tempdir().unwrap();
+        let go = temporary.path().join("failure-may-finish");
+        let later = temporary.path().join("survivor-may-finish");
+        let release_gate = temporary.path().join("release-may-finish");
+        let (service, id, repository) = staged_release_repository(
+            temporary.path(),
+            &[("shared.txt", "base\n")],
+            &[
+                ("feature-p", "p.txt", "p\n"),
+                ("feature-f", "fail.txt", "fail\n"),
+                ("feature-b", "shared.txt", "b\n"),
+            ],
+            &format!(
+                "\n[[step]]\nname = \"held\"\nrun = \"{}\"\n\n[[step]]\nname = \"full\"\nstage = \"release\"\nrun = \"while [ ! -f '{}' ]; do sleep 0.05; done\"\n",
+                held_failure_script(&go, &later),
+                release_gate.display()
+            ),
+        )
+        .await;
+        let runtime = service.runtime(id).await.unwrap();
+
+        // The promoted tip's release run stays in flight, so its source (already in
+        // `staging`) is a nonterminal queue item while a later gate item fails.
+        let tip_p = approve_and_promote(&service, id, "feature-p").await;
+        wait_for_release_snapshot(&service, id, "the promoted tip's release run", |snapshot| {
+            release_runs_for(snapshot, &tip_p)
+                .iter()
+                .any(|view| view.item.state == QueueItemState::Running)
+        })
+        .await;
+        let release_run = {
+            let data = runtime.data.lock();
+            let run = data
+                .items
+                .iter()
+                .find(|item| item.kind == QueueItemKind::Release && item.source_oid == tip_p)
+                .unwrap();
+            (run.id, run.current_generation_id)
+        };
+        let failing = service
+            .approve(id, "feature-f".into(), CommandId::new())
+            .await
+            .unwrap();
+        let survivor = service
+            .approve(id, "feature-b".into(), CommandId::new())
+            .await
+            .unwrap();
+        wait_for_running_items(&service, id, &[failing.item_id, survivor.item_id]).await;
+        assert!(
+            current_generation_of(&runtime, survivor.item_id)
+                .ordered_item_ids
+                .contains(&failing.item_id)
+        );
+
+        std::fs::write(&go, "go\n").unwrap();
+        wait_for_failure_rebuild(&service, id, failing.item_id, &[survivor.item_id]).await;
+
+        let rebuilt = current_generation_of(&runtime, survivor.item_id);
+        assert_eq!(rebuilt.ordered_item_ids, vec![survivor.item_id]);
+        assert_eq!(rebuilt.expected_parent_oid, tip_p);
+        let run = service.item_status(id, release_run.0).await.unwrap();
+        assert_eq!(run.state, QueueItemState::Running);
+        assert_eq!(run.current_generation_id, release_run.1);
+
+        std::fs::write(&later, "later\n").unwrap();
+        let landed = wait_item_promoted(&service, id, survivor.item_id).await;
+        assert_eq!(
+            git(
+                &repository,
+                &["show", "-s", "--format=%P", &landed.to_hex()]
+            ),
+            tip_p.to_hex()
+        );
+        assert_eq!(
+            service
+                .repository_snapshot(id)
+                .await
+                .unwrap()
+                .state
+                .execution_state,
+            RepositoryExecutionState::Active
+        );
+        std::fs::write(&release_gate, "release\n").unwrap();
+    }
+
+    #[tokio::test]
+    async fn failure_rebuild_leaves_a_promoted_item_awaiting_its_push_alone() {
+        let temporary = tempfile::tempdir().unwrap();
+        let go = temporary.path().join("failure-may-finish");
+        let later = temporary.path().join("survivor-may-finish");
+        let (service, id, _repository) = held_failure_repository(
+            temporary.path(),
+            &[
+                ("feature-p", "p.txt", "p\n"),
+                ("feature-f", "fail.txt", "fail\n"),
+                ("feature-b", "shared.txt", "b\n"),
+            ],
+            &go,
+            &later,
+        )
+        .await;
+        let runtime = service.runtime(id).await.unwrap();
+
+        // Locally promoted but still awaiting its remote push, P stays a nonterminal
+        // gate item whose change `staging` already contains.
+        let promoted = service
+            .approve(id, "feature-p".into(), CommandId::new())
+            .await
+            .unwrap();
+        let tip_p = wait_item_promoted(&service, id, promoted.item_id).await;
+        {
+            let _mutation = runtime.mutation.lock().await;
+            let mut item = service.item_status(id, promoted.item_id).await.unwrap();
+            item.state = QueueItemState::PromotedLocalPushPending;
+            service.replace_item(&runtime, item).unwrap();
+        }
+        let failing = service
+            .approve(id, "feature-f".into(), CommandId::new())
+            .await
+            .unwrap();
+        let survivor = service
+            .approve(id, "feature-b".into(), CommandId::new())
+            .await
+            .unwrap();
+        wait_for_running_items(&service, id, &[failing.item_id, survivor.item_id]).await;
+
+        std::fs::write(&go, "go\n").unwrap();
+        wait_for_failure_rebuild(&service, id, failing.item_id, &[survivor.item_id]).await;
+
+        let rebuilt = current_generation_of(&runtime, survivor.item_id);
+        assert_eq!(rebuilt.ordered_item_ids, vec![survivor.item_id]);
+        assert_eq!(rebuilt.expected_parent_oid, tip_p);
+        assert_eq!(
+            service
+                .item_status(id, promoted.item_id)
+                .await
+                .unwrap()
+                .state,
+            QueueItemState::PromotedLocalPushPending
+        );
+        std::fs::write(&later, "later\n").unwrap();
+    }
+
+    #[tokio::test]
+    async fn failure_rebuild_gives_a_conflicting_survivor_its_own_lane_without_blocking() {
+        let temporary = tempfile::tempdir().unwrap();
+        let go = temporary.path().join("failure-may-finish");
+        let later = temporary.path().join("survivors-may-finish");
+        let (service, id, _repository) = held_failure_repository(
+            temporary.path(),
+            &[
+                ("feature-f", "fail.txt", "fail\n"),
+                ("feature-b", "shared.txt", "b\n"),
+                ("feature-c", "shared.txt", "c\n"),
+            ],
+            &go,
+            &later,
+        )
+        .await;
+        let runtime = service.runtime(id).await.unwrap();
+        let base = runtime.data.lock().state.staging_oid.clone();
+
+        let failing = service
+            .approve(id, "feature-f".into(), CommandId::new())
+            .await
+            .unwrap();
+        let survivor = service
+            .approve(id, "feature-b".into(), CommandId::new())
+            .await
+            .unwrap();
+        // C conflicts with B, so admission validates it in its own `staging` lane.
+        let contender = service
+            .approve(id, "feature-c".into(), CommandId::new())
+            .await
+            .unwrap();
+        wait_for_running_items(&service, id, &[failing.item_id, survivor.item_id]).await;
+        assert!(
+            !service
+                .item_status(id, contender.item_id)
+                .await
+                .unwrap()
+                .state
+                .is_terminal()
+        );
+        assert_eq!(
+            current_generation_of(&runtime, contender.item_id).ordered_item_ids,
+            vec![contender.item_id]
+        );
+
+        std::fs::write(&go, "go\n").unwrap();
+        wait_for_failure_rebuild(
+            &service,
+            id,
+            failing.item_id,
+            &[survivor.item_id, contender.item_id],
+        )
+        .await;
+
+        let rebuilt = current_generation_of(&runtime, survivor.item_id);
+        assert_eq!(rebuilt.ordered_item_ids, vec![survivor.item_id]);
+        assert_eq!(rebuilt.expected_parent_oid, base);
+        let lane = current_generation_of(&runtime, contender.item_id);
+        assert_eq!(lane.ordered_item_ids, vec![contender.item_id]);
+        assert_eq!(lane.expected_parent_oid, base);
+
+        std::fs::write(&later, "later\n").unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        let outcomes = loop {
+            let outcomes = [
+                service.item_status(id, survivor.item_id).await.unwrap(),
+                service.item_status(id, contender.item_id).await.unwrap(),
+            ];
+            if outcomes.iter().all(|item| item.state.is_terminal()) {
+                break outcomes;
+            }
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        };
+        let mut states = outcomes.iter().map(|item| item.state).collect::<Vec<_>>();
+        states.sort_by_key(|state| state.as_str());
+        assert_eq!(
+            states,
+            vec![QueueItemState::MergeConflict, QueueItemState::Promoted]
+        );
+        assert!(
+            outcomes
+                .iter()
+                .filter(|item| item.state == QueueItemState::MergeConflict)
+                .all(|item| item.terminal_reason.is_some())
+        );
+        assert_eq!(
+            service
+                .repository_snapshot(id)
+                .await
+                .unwrap()
+                .state
+                .execution_state,
+            RepositoryExecutionState::Active
         );
     }
 
