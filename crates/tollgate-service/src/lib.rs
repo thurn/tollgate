@@ -9595,7 +9595,8 @@ impl TollgateService {
         }
         if runtime.data.lock().items.iter().any(|item| {
             !item.state.is_terminal()
-                && (item.source_oid == oid
+                // Release runs retain promoted commits through their own refs.
+                && ((item.kind != QueueItemKind::Release && item.source_oid == oid)
                     || item.metadata.worktree_path.as_deref()
                         == Some(path.to_string_lossy().as_ref()))
         }) {
@@ -19714,6 +19715,174 @@ mod tests {
                 .is_none()
         );
         assert!(orphan.join("_metadata.json").exists());
+    }
+
+    #[tokio::test]
+    async fn worktree_remove_allows_an_unused_worktree_at_a_running_release_tip() {
+        let temporary = tempfile::tempdir().unwrap();
+        let release_gate = temporary.path().join("release-may-finish");
+        let (service, id, repository) = staged_release_repository(
+            temporary.path(),
+            &[],
+            &[("feature", "feature.txt", "feature\n")],
+            &format!(
+                "\n[[step]]\nname = \"full\"\nstage = \"release\"\nrun = \"while [ ! -f '{}' ]; do sleep 0.05; done\"\nneeds = [\"fast\"]\n",
+                release_gate.display()
+            ),
+        )
+        .await;
+        let tip = approve_and_promote(&service, id, "feature").await;
+        let snapshot = wait_for_release_snapshot(&service, id, "running release", |snapshot| {
+            release_runs_for(snapshot, &tip)
+                .iter()
+                .any(|view| view.item.state == QueueItemState::Running)
+        })
+        .await;
+        let release = release_runs_for(&snapshot, &tip)[0].item.clone();
+        assert!(release.metadata.worktree_path.is_none());
+        let unused = service
+            .create_worktree(id, "unused".into(), None, CommandId::new())
+            .await
+            .unwrap();
+        assert_eq!(unused.new_oid, Some(tip.clone()));
+
+        let removed = service
+            .remove_worktree(id, unused.path.clone(), CommandId::new())
+            .await;
+        let still_running = service.item_status(id, release.id).await.unwrap();
+        // Settle the fixture worker before asserting the removal result, including
+        // when this regression is run against the original guard.
+        std::fs::write(&release_gate, "go\n").unwrap();
+        wait_for_release_snapshot(&service, id, "released promoted tip", |snapshot| {
+            snapshot.state.release_oid == tip
+        })
+        .await;
+
+        assert_eq!(still_running.state, QueueItemState::Running);
+        assert_eq!(
+            still_running.current_generation_id,
+            release.current_generation_id
+        );
+        let removed = removed.unwrap();
+        assert_eq!(removed.action, "removed");
+        assert_eq!(removed.old_oid, Some(tip));
+        assert!(!Path::new(&unused.path).exists());
+        assert_eq!(
+            git(
+                &repository,
+                &["for-each-ref", "--format=%(refname)", "refs/heads/unused"]
+            ),
+            ""
+        );
+    }
+
+    #[tokio::test]
+    async fn worktree_remove_preserves_active_gate_and_check_source_oid_and_path() {
+        for kind in [QueueItemKind::Gate, QueueItemKind::IndependentCheck] {
+            let temporary = tempfile::tempdir().unwrap();
+            let repository = temporary.path().join("repository");
+            let worker_gate = temporary.path().join("worker-may-finish");
+            std::fs::create_dir(&repository).unwrap();
+            git(&repository, &["init", "-b", USER_BRANCH]);
+            std::fs::write(repository.join("base.txt"), "base\n").unwrap();
+            git(&repository, &["add", "base.txt"]);
+            git(&repository, &["commit", "-m", "base"]);
+            let service = TollgateService::open(temporary.path().join("support"))
+                .await
+                .unwrap();
+            let initialized = service
+                .initialize_repository_with_options(
+                    &repository,
+                    Some(format!(
+                        "while [ ! -f '{}' ]; do sleep 0.05; done",
+                        worker_gate.display()
+                    )),
+                    false,
+                )
+                .await
+                .unwrap();
+            let id = initialized.state.id;
+            let source = service
+                .create_worktree(id, "retained-source".into(), None, CommandId::new())
+                .await
+                .unwrap();
+            let source_path = Path::new(&source.path);
+            std::fs::write(source_path.join("feature.txt"), "feature\n").unwrap();
+            git(source_path, &["add", "feature.txt"]);
+            git(source_path, &["commit", "-m", "feature"]);
+            let submitted = if kind == QueueItemKind::Gate {
+                service
+                    .submit_candidate_from(
+                        id,
+                        "HEAD".into(),
+                        Some(source.path.clone()),
+                        CommandId::new(),
+                    )
+                    .await
+                    .unwrap()
+            } else {
+                service
+                    .check_from(
+                        id,
+                        "HEAD".into(),
+                        Some(source.path.clone()),
+                        CommandId::new(),
+                    )
+                    .await
+                    .unwrap()
+            };
+            wait_for_running_items(&service, id, &[submitted.item_id]).await;
+            let alias = temporary.path().join("same-source-oid");
+            git(
+                &repository,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    "same-source-oid",
+                    alias.to_str().unwrap(),
+                    &submitted.source_oid.to_hex(),
+                ],
+            );
+            let oid_removal = service
+                .remove_worktree(id, alias.to_string_lossy().into_owned(), CommandId::new())
+                .await;
+            std::fs::write(source_path.join("next.txt"), "next\n").unwrap();
+            git(source_path, &["add", "next.txt"]);
+            git(source_path, &["commit", "-m", "next"]);
+            let path_removal = service
+                .remove_worktree(id, source.path.clone(), CommandId::new())
+                .await;
+            let still_running = service.item_status(id, submitted.item_id).await.unwrap();
+            std::fs::write(&worker_gate, "go\n").unwrap();
+            let final_state = if kind == QueueItemKind::Gate {
+                QueueItemState::Ready
+            } else {
+                QueueItemState::CheckPassed
+            };
+            wait_for_item_state(&service, id, submitted.item_id, final_state).await;
+            if kind == QueueItemKind::Gate {
+                let revision = service
+                    .repository_snapshot(id)
+                    .await
+                    .unwrap()
+                    .state
+                    .queue_revision;
+                service
+                    .cancel(id, submitted.item_id, revision)
+                    .await
+                    .unwrap();
+            }
+
+            assert_eq!(still_running.state, QueueItemState::Running);
+            assert!(oid_removal.is_err(), "{kind:?} must retain its source OID");
+            assert!(
+                path_removal.is_err(),
+                "{kind:?} must retain its source path"
+            );
+            assert!(source_path.exists());
+            assert!(alias.exists());
+        }
     }
 
     #[tokio::test]
