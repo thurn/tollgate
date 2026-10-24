@@ -2225,18 +2225,7 @@ async fn wait_for_item_until(
             repository_id,
             item_id,
         };
-        let value = match client.request(command()).await {
-            Ok(value) => value,
-            Err(first_error) => {
-                if !json {
-                    eprintln!("\nConnection interrupted ({first_error}); waiting for Tollgate…");
-                }
-                reconnect_wait_client(client).await?;
-                client.request(command()).await.with_context(|| {
-                    format!("item wait status failed after reconnect: {first_error}")
-                })?
-            }
-        };
+        let value = wait_request(client, command, json, "item wait status").await?;
         let status: ItemWaitStatus = serde_json::from_value(value)?;
         if wait_status_changed(&mut previous_status, &status) {
             if json {
@@ -2273,6 +2262,53 @@ fn wait_status_changed(previous: &mut Option<ItemWaitStatus>, current: &ItemWait
     }
     *previous = Some(current.clone());
     true
+}
+
+/// How many dropped connections one wait request survives before the wait fails.
+const WAIT_RECONNECTS: u8 = 3;
+
+/// Is this the service saying the repository is still activating (as it is for a while after a
+/// Tollgate restart)?
+fn is_repository_activating(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<IpcRequestError>()
+        .is_some_and(|error| error.0.code == "repository-activating")
+}
+
+/// One status request of a wait loop. A wait outlives a Tollgate restart: on a failed request it
+/// reconnects (up to [`WAIT_RECONNECTS`] times), and while the restarted service is still
+/// activating the repository it keeps polling until activation ends. `quiet` suppresses the
+/// progress lines (JSON output and replay checks).
+async fn wait_request(
+    client: &mut IpcClient,
+    command: impl Fn() -> IpcCommand,
+    quiet: bool,
+    what: &str,
+) -> anyhow::Result<serde_json::Value> {
+    let mut reconnects = 0_u8;
+    let mut announced_activation = false;
+    loop {
+        let error = match client.request(command()).await {
+            Ok(value) => return Ok(value),
+            Err(error) => error,
+        };
+        if is_repository_activating(&error) {
+            if !quiet && !announced_activation {
+                eprintln!("\n{error}; waiting…");
+                announced_activation = true;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            continue;
+        }
+        if reconnects >= WAIT_RECONNECTS {
+            return Err(error).context(format!("{what} failed after {reconnects} reconnects"));
+        }
+        if !quiet {
+            eprintln!("\nConnection interrupted ({error}); waiting for Tollgate…");
+        }
+        reconnect_wait_client(client).await?;
+        reconnects += 1;
+    }
 }
 
 async fn reconnect_wait_client(client: &mut IpcClient) -> anyhow::Result<()> {
@@ -2604,21 +2640,8 @@ async fn wait_for_release(
 ) -> anyhow::Result<u8> {
     let mut previous: Option<ReleaseWaitStatus> = None;
     loop {
-        let value = match client.request(selector.command(repository_id)).await {
-            Ok(value) => value,
-            Err(first_error) => {
-                if !json {
-                    eprintln!("\nConnection interrupted ({first_error}); waiting for Tollgate…");
-                }
-                reconnect_wait_client(client).await?;
-                client
-                    .request(selector.command(repository_id))
-                    .await
-                    .with_context(|| {
-                        format!("release wait status failed after reconnect: {first_error}")
-                    })?
-            }
-        };
+        let command = selector.command(repository_id);
+        let value = wait_request(client, || command.clone(), json, "release wait status").await?;
         let status: ReleaseWaitStatus = serde_json::from_value(value)?;
         selector.freeze(&status);
         if previous.as_ref() != Some(&status) {
@@ -2866,15 +2889,7 @@ async fn wait_for_terminal_checks(
                 repository_id,
                 item_id: *item_id,
             };
-            let value = match client.request(command()).await {
-                Ok(value) => value,
-                Err(first_error) => {
-                    reconnect_wait_client(client).await?;
-                    client.request(command()).await.with_context(|| {
-                        format!("diagnostic replay status failed after reconnect: {first_error}")
-                    })?
-                }
-            };
+            let value = wait_request(client, command, true, "diagnostic replay status").await?;
             let status: ItemWaitStatus = serde_json::from_value(value)?;
             if observed.insert(*item_id, status.item.state) != Some(status.item.state) {
                 if !json {
@@ -3230,6 +3245,95 @@ mod tests {
             },
         };
         (snapshot, activation)
+    }
+
+    /// A client wired to a fake app that answers each request with the next of `responses`, then
+    /// hangs up. The app's task returns how many requests it saw.
+    fn client_of_app_answering(
+        responses: Vec<IpcResponse>,
+    ) -> (IpcClient, tokio::task::JoinHandle<usize>) {
+        let (client, app) = UnixStream::pair().unwrap();
+        let app = tokio::spawn(async move {
+            let mut framed = Framed::new(app, FrameCodec);
+            let mut seen = 0;
+            for response in responses {
+                let Some(Ok(request)) = framed.next().await else {
+                    break;
+                };
+                seen += 1;
+                framed
+                    .send(
+                        Frame::control(FrameKind::Response, request.correlation_id, &response)
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            seen
+        });
+        let client = IpcClient {
+            framed: Framed::new(client, FrameCodec),
+            no_launch: true,
+            client_instance_id: tollgate_domain::ClientInstanceId::new(),
+        };
+        (client, app)
+    }
+
+    fn error_response(code: &str) -> IpcResponse {
+        IpcResponse {
+            ok: false,
+            result: None,
+            error: Some(StructuredError {
+                code: code.into(),
+                message: format!("{code} (test)"),
+                retryable: true,
+                details: None,
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_item_wait_outlasts_the_repository_activating_after_a_restart() {
+        let mut item = repository_with_candidate("019ffe40-a60d-7722-a369-2635222d1203")
+            .queue
+            .remove(0)
+            .item;
+        item.state = tollgate_domain::QueueItemState::Promoted;
+        let status = ItemWaitStatus {
+            item: item.clone(),
+            repository_execution_state: tollgate_domain::RepositoryExecutionState::Active,
+            block_reasons: Vec::new(),
+        };
+        let done = IpcResponse {
+            ok: true,
+            result: Some(serde_json::to_value(&status).unwrap()),
+            error: None,
+        };
+        let (mut client, app) = client_of_app_answering(vec![
+            error_response("repository-activating"),
+            error_response("repository-activating"),
+            done,
+        ]);
+        let exit = wait_for_item_until(&mut client, item.repository_id, item.id, true, false)
+            .await
+            .unwrap();
+        assert_eq!(exit, 0);
+        assert_eq!(app.await.unwrap(), 3);
+    }
+
+    #[test]
+    fn only_an_activating_repository_is_waited_out() {
+        let activating = |code: &str| {
+            anyhow!(IpcRequestError(error_response(code).error.unwrap()))
+                .context("item wait status")
+        };
+        assert!(is_repository_activating(&activating(
+            "repository-activating"
+        )));
+        assert!(!is_repository_activating(&activating("item-not-found")));
+        assert!(!is_repository_activating(&anyhow!(
+            "app closed without responding"
+        )));
     }
 
     /// Handshakes with a fake app that acknowledges speaking `app_schema`, as an app from
