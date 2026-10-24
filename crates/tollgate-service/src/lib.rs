@@ -36,10 +36,10 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::task_tracker::TaskTrackerToken;
 use tollgate_config::{CachePolicy, EffectiveConfig, EffectiveStep, StepStage};
 use tollgate_domain::*;
+pub use tollgate_git::GitError;
 use tollgate_git::{
-    FileIdentity, GitError, GitRepository, INTEGRATION_BRANCH, INTEGRATION_REF, RELEASE_BRANCH,
-    RELEASE_REF, SyntheticCommit, USER_BRANCH, USER_BRANCH_REF, UserMasterSyncOutcome,
-    is_reserved_branch,
+    FileIdentity, GitRepository, INTEGRATION_BRANCH, INTEGRATION_REF, RELEASE_BRANCH, RELEASE_REF,
+    SyntheticCommit, USER_BRANCH, USER_BRANCH_REF, UserMasterSyncOutcome, is_reserved_branch,
 };
 use tollgate_runner::apfs::{CloneManifest, force_clone_file, force_clone_tree, verify_clone_tree};
 use tollgate_runner::{

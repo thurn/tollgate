@@ -48,6 +48,13 @@ pub enum GitError {
     #[error("Git could not rebase the requested commit")]
     Unmergeable,
     #[error(
+        "rebase conflict updating onto `staging` {onto}: merge conflicts in {conflicting_paths:?}. The rebase was aborted, so the worktree is unchanged. Rebase the commit by hand (`git rebase staging`), resolve those paths, `git rebase --continue`, rerun the checks, then resubmit"
+    )]
+    UpdateConflict {
+        onto: GitOid,
+        conflicting_paths: Vec<String>,
+    },
+    #[error(
         "cannot speculatively combine source {source_oid} with the current internal queue prefix {prefix_oid}: merge conflicts in {conflicting_paths:?} (source base {source_parent_oid}). Keep the source commit based only on promoted `staging`; never rebase it onto a speculative prefix. Retry after the conflicting earlier candidate is promoted, canceled, or reordered. If promoted `staging` itself has advanced incompatibly, rebase onto the latest `staging`, resolve and regenerate, then resubmit"
     )]
     SyntheticConflict {
@@ -1095,11 +1102,26 @@ impl GitRepository {
             .output()
             .await?;
         if !output.status.success() {
+            // The unmerged paths, read before the abort discards them.
+            let conflicting_paths: Vec<String> = match self
+                .git(["diff", "--name-only", "--diff-filter=U"])
+                .await
+                .and_then(text)
+            {
+                Ok(paths) => paths.lines().map(str::to_owned).collect(),
+                Err(_) => Vec::new(),
+            };
             let _ = internal_command(&self.profile.executable, &self.worktree_root)
                 .args(["rebase", "--abort"])
                 .status()
                 .await;
-            return Err(GitError::Unmergeable);
+            if conflicting_paths.is_empty() {
+                return Err(GitError::Unmergeable);
+            }
+            return Err(GitError::UpdateConflict {
+                onto: master,
+                conflicting_paths,
+            });
         }
         let new = self.resolve_oid("HEAD").await?;
         if self.commit_parent_oid(&new).await? != master {
@@ -2387,6 +2409,63 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8_lossy(&output.stdout).trim().into()
+    }
+
+    #[tokio::test]
+    async fn a_conflicting_feature_update_names_its_paths_and_leaves_the_worktree_unchanged() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        let feature = temporary.path().join("feature");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("plan.md"), "base\n").unwrap();
+        std::fs::write(repository.join("other.txt"), "base\n").unwrap();
+        git(&repository, &["add", "."]);
+        git(&repository, &["commit", "-m", "base"]);
+        let adapter = GitRepository::discover(&repository).await.unwrap();
+        adapter
+            .initialize_integration_ref_from_master()
+            .await
+            .unwrap();
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                feature.to_str().unwrap(),
+                INTEGRATION_BRANCH,
+            ],
+        );
+        std::fs::write(feature.join("plan.md"), "feature appendix\n").unwrap();
+        git(&feature, &["commit", "-am", "feature"]);
+        let old = git(&feature, &["rev-parse", "HEAD"]);
+        // A peer's promotion appends to the same file.
+        git(
+            &repository,
+            &["checkout", "-q", "-b", "peer", INTEGRATION_BRANCH],
+        );
+        std::fs::write(repository.join("plan.md"), "peer appendix\n").unwrap();
+        git(&repository, &["commit", "-am", "peer"]);
+        let peer = git(&repository, &["rev-parse", "HEAD"]);
+        git(&repository, &["checkout", "-q", USER_BRANCH]);
+        git(&repository, &["update-ref", INTEGRATION_REF, &peer]);
+
+        let worktree = GitRepository::discover(&feature).await.unwrap();
+        match worktree.update_one_commit_feature().await {
+            Err(GitError::UpdateConflict {
+                onto,
+                conflicting_paths,
+            }) => {
+                assert_eq!(onto.to_hex(), peer);
+                assert_eq!(conflicting_paths, vec!["plan.md".to_string()]);
+            }
+            other => panic!("expected an update conflict, got {other:?}"),
+        }
+        assert_eq!(git(&feature, &["rev-parse", "HEAD"]), old);
+        assert!(!worktree.rebase_in_progress().await.unwrap());
+        assert_eq!(git(&feature, &["status", "--porcelain"]), "");
     }
 
     #[tokio::test]

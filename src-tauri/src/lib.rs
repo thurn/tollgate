@@ -2252,6 +2252,19 @@ fn encode_service_error(error: ServiceError) -> String {
                 "release_oid": release_oid,
             })),
         }),
+        ServiceError::Git(tollgate_service::GitError::UpdateConflict {
+            onto,
+            conflicting_paths,
+        }) => Some(StructuredError {
+            code: "update-conflict".into(),
+            message: message.clone(),
+            retryable: false,
+            details: Some(serde_json::json!({
+                "onto_oid": onto,
+                "conflicting_paths": conflicting_paths,
+                "retry": "Rebase the commit onto staging by hand, resolve the conflicting paths, rerun the checks, then resubmit."
+            })),
+        }),
         ServiceError::CandidateTerminal {
             item_id,
             state,
@@ -2324,6 +2337,31 @@ mod ipc_error_tests {
         .unwrap();
         assert_eq!(error.code, "shutting-down");
         assert!(error.retryable);
+    }
+
+    #[test]
+    fn an_update_conflict_crosses_ipc_with_its_conflicting_paths() {
+        let onto = GitOid::from_hex("3333333333333333333333333333333333333333").unwrap();
+        let encoded = encode_service_error(ServiceError::Git(
+            tollgate_service::GitError::UpdateConflict {
+                onto,
+                conflicting_paths: vec!["docs/design/native-app.md".into()],
+            },
+        ));
+        let error: StructuredError = serde_json::from_str(
+            encoded
+                .strip_prefix(STRUCTURED_SERVICE_ERROR_PREFIX)
+                .expect("an update conflict must cross IPC as a structured error"),
+        )
+        .unwrap();
+        assert_eq!(error.code, "update-conflict");
+        assert!(error.message.contains("docs/design/native-app.md"));
+        let details = error.details.unwrap();
+        assert_eq!(details["conflicting_paths"][0], "docs/design/native-app.md");
+        assert_eq!(
+            details["onto_oid"]["bytes"],
+            "3333333333333333333333333333333333333333"
+        );
     }
 
     #[test]
