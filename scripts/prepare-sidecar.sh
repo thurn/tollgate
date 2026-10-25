@@ -9,6 +9,8 @@ case "$profile" in
 esac
 
 workspace_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+# (A slot seeded from another holds build outputs naming that slot's paths.)
+"$workspace_root/scripts/clean-relocated-builds.sh"
 target_triple=${TOLLGATE_TARGET:-${TAURI_ENV_TARGET_TRIPLE:-$(rustc -vV | sed -n 's/^host: //p')}}
 cargo_target_args="--target $target_triple"
 if [ -n "$cargo_args" ]; then
