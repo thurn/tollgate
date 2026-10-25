@@ -442,6 +442,21 @@ pub enum IpcCommand {
         offset: usize,
         limit: usize,
     },
+    /// A page of the repository's events, oldest first.
+    History {
+        repository_id: RepositoryId,
+        #[serde(default)]
+        after: u64,
+        #[serde(default)]
+        before: Option<u64>,
+        #[serde(default)]
+        since_nanos: Option<i64>,
+        #[serde(default)]
+        kinds: Vec<String>,
+        limit: u32,
+        #[serde(default)]
+        newest: bool,
+    },
     Logs {
         repository_id: RepositoryId,
         item_id: QueueItemId,

@@ -338,6 +338,8 @@ pub struct ArtifactPage {
     pub offset: usize,
 }
 
+pub use tollgate_store::EventQuery;
+
 const SNAPSHOT_HISTORY_PAYLOAD_BUDGET: usize = 512 * 1024;
 
 fn compact_snapshot_history(mut events: Vec<DomainEvent>) -> Vec<DomainEvent> {
@@ -6430,6 +6432,17 @@ impl TollgateService {
             // without bound as repositories retained more build outputs.
             artifacts: Vec::new(),
         })
+    }
+
+    /// A page of the repository's events (`tg history`), at most 1000.
+    pub async fn history_page(
+        &self,
+        repository_id: RepositoryId,
+        mut query: EventQuery,
+    ) -> Result<Vec<DomainEvent>, ServiceError> {
+        let runtime = self.runtime(repository_id).await?;
+        query.limit = query.limit.clamp(1, 1000);
+        Ok(runtime.store.events_page(&query)?)
     }
 
     pub async fn artifacts_page(

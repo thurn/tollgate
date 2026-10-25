@@ -116,8 +116,47 @@ enum TopCommand {
     Storage(StorageCommand),
     #[command(subcommand)]
     Artifact(ArtifactCommand),
-    History,
+    /// The repository's events, oldest first: the newest 500, or every event matching the filters.
+    History(HistoryArgs),
     Doctor,
+}
+
+#[derive(Args)]
+struct HistoryArgs {
+    /// Only events of these kinds (repeat the flag, or separate with commas).
+    #[arg(long = "kind", value_delimiter = ',')]
+    kinds: Vec<String>,
+    /// Only events created at or after this time: RFC 3339, or an age such as 90s, 30m, 3h, 2d.
+    #[arg(long)]
+    since: Option<String>,
+    /// Only events after this sequence number.
+    #[arg(long)]
+    after: Option<u64>,
+    /// At most this many events (with --since or --after, the oldest; otherwise the newest).
+    /// Defaults to 500 without --since or --after, and to every match with them.
+    #[arg(long)]
+    limit: Option<usize>,
+}
+
+/// `--since`: RFC 3339, or an age (a number and s, m, h or d) before `now`.
+fn parse_since(text: &str, now: time::OffsetDateTime) -> anyhow::Result<time::OffsetDateTime> {
+    if let Ok(at) =
+        time::OffsetDateTime::parse(text, &time::format_description::well_known::Rfc3339)
+    {
+        return Ok(at);
+    }
+    let (number, unit) = text.split_at(text.len().saturating_sub(1));
+    let amount: f64 = number
+        .parse()
+        .map_err(|_| anyhow::anyhow!("--since {text}: use RFC 3339 or an age such as 30m"))?;
+    let seconds = match unit {
+        "s" => amount,
+        "m" => amount * 60.0,
+        "h" => amount * 3600.0,
+        "d" => amount * 86400.0,
+        _ => anyhow::bail!("--since {text}: an age ends in s, m, h or d"),
+    };
+    Ok(now - time::Duration::seconds_f64(seconds))
 }
 
 #[derive(Args)]
@@ -1400,15 +1439,62 @@ async fn run(cli: Cli) -> anyhow::Result<u8> {
                 Ok(())
             })?;
         }
-        TopCommand::History => {
+        TopCommand::History(args) => {
             let repository = select_repository(&mut client, cli.repository).await?;
+            let since_nanos = match &args.since {
+                Some(text) => Some(
+                    i64::try_from(
+                        parse_since(text, time::OffsetDateTime::now_utc())?.unix_timestamp_nanos(),
+                    )
+                    .map_err(|_| anyhow::anyhow!("--since {text} is out of range"))?,
+                ),
+                None => None,
+            };
+            // Forward from --after or --since through every match, or back from the newest.
+            let forward = args.since.is_some() || args.after.is_some();
+            let limit = args.limit.unwrap_or(if forward { usize::MAX } else { 500 });
+            let mut events: Vec<tollgate_domain::DomainEvent> = Vec::new();
+            let (mut after, mut before) = (args.after.unwrap_or(0), None);
+            while events.len() < limit {
+                let page: Vec<tollgate_domain::DomainEvent> = serde_json::from_value(
+                    client
+                        .request(IpcCommand::History {
+                            repository_id: repository.state.id,
+                            after,
+                            before,
+                            since_nanos,
+                            kinds: args.kinds.clone(),
+                            limit: u32::try_from((limit - events.len()).min(1000)).unwrap_or(1000),
+                            newest: !forward,
+                        })
+                        .await?,
+                )?;
+                let Some((first, last)) = page.first().zip(page.last()) else {
+                    break;
+                };
+                if forward {
+                    after = last.sequence;
+                    events.extend(page);
+                } else {
+                    before = Some(first.sequence);
+                    let mut older = page;
+                    older.append(&mut events);
+                    events = older;
+                }
+            }
             if cli.json {
-                println!("{}", serde_json::to_string_pretty(&repository.history)?);
+                println!("{}", serde_json::to_string_pretty(&events)?);
             } else {
-                for event in repository.history.iter().rev().take(100) {
+                for event in &events {
                     println!(
-                        "#{:<6} {:<28} {:?}",
-                        event.sequence, event.kind, event.actor
+                        "#{:<6} {} {:<28} {:?}",
+                        event.sequence,
+                        event
+                            .created_at
+                            .format(&time::format_description::well_known::Rfc3339)
+                            .unwrap_or_default(),
+                        event.kind,
+                        event.actor
                     );
                 }
             }
@@ -3214,6 +3300,27 @@ fn classify_exit(error: &anyhow::Error) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_since_takes_rfc3339_or_an_age() {
+        let now = time::OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        assert_eq!(
+            parse_since("90s", now).unwrap(),
+            now - time::Duration::seconds(90)
+        );
+        assert_eq!(
+            parse_since("3h", now).unwrap(),
+            now - time::Duration::hours(3)
+        );
+        assert_eq!(
+            parse_since("2d", now).unwrap(),
+            now - time::Duration::days(2)
+        );
+        // (1 800 000 000 s after the epoch is 2027-01-15T08:00:00Z.)
+        assert_eq!(parse_since("2027-01-15T08:00:00Z", now).unwrap(), now);
+        assert!(parse_since("yesterday", now).is_err());
+        assert!(parse_since("5w", now).is_err());
+    }
 
     #[test]
     fn missing_tested_oid_is_rendered_as_unavailable() {

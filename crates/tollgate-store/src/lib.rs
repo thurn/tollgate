@@ -2321,6 +2321,49 @@ impl RepositoryStore {
         rows.map(|row| decode(&row?)).collect()
     }
 
+    /// A page of events matching `query`, oldest first: the oldest after `query.after` (or the
+    /// newest before `query.before`, with `newest`), of the given kinds, created at or after
+    /// `since_nanos`, at most `limit`.
+    pub fn events_page(&self, query: &EventQuery) -> Result<Vec<DomainEvent>, StoreError> {
+        use rusqlite::types::Value;
+        let mut sql = String::from("SELECT event_json FROM events WHERE sequence > ?1");
+        let mut values = vec![Value::Integer(query.after as i64)];
+        if let Some(before) = query.before {
+            values.push(Value::Integer(before as i64));
+            sql += &format!(" AND sequence < ?{}", values.len());
+        }
+        if let Some(since) = query.since_nanos {
+            values.push(Value::Integer(since));
+            sql += &format!(" AND CAST(created_at AS INTEGER) >= ?{}", values.len());
+        }
+        if !query.kinds.is_empty() {
+            let mut marks = Vec::new();
+            for kind in &query.kinds {
+                values.push(Value::Text(kind.clone()));
+                marks.push(format!("?{}", values.len()));
+            }
+            sql += &format!(" AND kind IN ({})", marks.join(","));
+        }
+        values.push(Value::Integer(i64::from(query.limit)));
+        sql += &format!(
+            " ORDER BY sequence {} LIMIT ?{}",
+            if query.newest { "DESC" } else { "ASC" },
+            values.len()
+        );
+        let connection = self.connection.lock();
+        let mut statement = connection.prepare(&sql)?;
+        let rows = statement.query_map(rusqlite::params_from_iter(values), |row| {
+            row.get::<_, String>(0)
+        })?;
+        let mut events = rows
+            .map(|row| decode(&row?))
+            .collect::<Result<Vec<DomainEvent>, _>>()?;
+        if query.newest {
+            events.reverse();
+        }
+        Ok(events)
+    }
+
     pub fn stored_command_response<T: DeserializeOwned>(
         &self,
         command_id: CommandId,
@@ -2632,6 +2675,17 @@ impl RepositoryStore {
         }
         Ok(hasher.finalize().to_hex().to_string())
     }
+}
+
+/// Which events a history page holds.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EventQuery {
+    pub after: u64,
+    pub before: Option<u64>,
+    pub since_nanos: Option<i64>,
+    pub kinds: Vec<String>,
+    pub limit: u32,
+    pub newest: bool,
 }
 
 fn insert_event(
@@ -3258,6 +3312,91 @@ mod tests {
             release_block_reasons: Vec::new(),
             promotion_pause: None,
         }
+    }
+
+    #[test]
+    fn history_pages_filter_by_kind_time_and_sequence() {
+        let store = RepositoryStore::open_in_memory().unwrap();
+        let state = test_state("demo");
+        store.initialize_repository(&state).unwrap();
+        let t0 = time::OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        for k in 1..=10u64 {
+            store
+                .append_event(&DomainEvent {
+                    id: EventId::new(),
+                    repository_id: state.id,
+                    sequence: k,
+                    actor: Actor::Cli,
+                    command_id: None,
+                    kind: if k % 2 == 0 { "even" } else { "odd" }.into(),
+                    payload: serde_json::json!({ "k": k }),
+                    created_at: t0 + time::Duration::minutes(k as i64),
+                })
+                .unwrap();
+        }
+        let seqs = |q: EventQuery| -> Vec<u64> {
+            store
+                .events_page(&q)
+                .unwrap()
+                .iter()
+                .map(|e| e.sequence)
+                .collect()
+        };
+        let all = EventQuery {
+            limit: 100,
+            ..EventQuery::default()
+        };
+        assert_eq!(seqs(all.clone()), (1..=10).collect::<Vec<_>>());
+        // Paging forward, and the newest page (still oldest first), and back from it.
+        assert_eq!(
+            seqs(EventQuery {
+                after: 4,
+                limit: 3,
+                ..all.clone()
+            }),
+            vec![5, 6, 7]
+        );
+        assert_eq!(
+            seqs(EventQuery {
+                limit: 3,
+                newest: true,
+                ..all.clone()
+            }),
+            vec![8, 9, 10]
+        );
+        assert_eq!(
+            seqs(EventQuery {
+                limit: 3,
+                newest: true,
+                before: Some(8),
+                ..all.clone()
+            }),
+            vec![5, 6, 7]
+        );
+        // By kind, and from a time on.
+        assert_eq!(
+            seqs(EventQuery {
+                kinds: vec!["even".into()],
+                ..all.clone()
+            }),
+            vec![2, 4, 6, 8, 10]
+        );
+        let since = (t0 + time::Duration::minutes(7)).unix_timestamp_nanos() as i64;
+        assert_eq!(
+            seqs(EventQuery {
+                since_nanos: Some(since),
+                ..all.clone()
+            }),
+            vec![7, 8, 9, 10]
+        );
+        assert_eq!(
+            seqs(EventQuery {
+                since_nanos: Some(since),
+                kinds: vec!["odd".into()],
+                ..all
+            }),
+            vec![7, 9]
+        );
     }
 
     #[test]

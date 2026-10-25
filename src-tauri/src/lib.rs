@@ -2080,6 +2080,31 @@ async fn execute_ipc_command(service: &Service, command: IpcCommand) -> IpcRespo
                     .map_err(encode_service_error)?,
             )
             .map_err(|error| error.to_string()),
+            IpcCommand::History {
+                repository_id,
+                after,
+                before,
+                since_nanos,
+                kinds,
+                limit,
+                newest,
+            } => serde_json::to_value(
+                service
+                    .history_page(
+                        repository_id,
+                        tollgate_service::EventQuery {
+                            after,
+                            before,
+                            since_nanos,
+                            kinds,
+                            limit,
+                            newest,
+                        },
+                    )
+                    .await
+                    .map_err(encode_service_error)?,
+            )
+            .map_err(|error| error.to_string()),
             IpcCommand::Artifacts {
                 repository_id,
                 offset,
