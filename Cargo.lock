@@ -4194,6 +4194,7 @@ dependencies = [
  "time",
  "tokio",
  "tokio-util",
+ "tollgate-config",
  "tollgate-domain",
  "tollgate-git",
  "tollgate-ipc",

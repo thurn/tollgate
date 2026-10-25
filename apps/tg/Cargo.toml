@@ -14,6 +14,7 @@ serde_json.workspace = true
 time = { workspace = true, features = ["parsing"] }
 tokio.workspace = true
 tokio-util.workspace = true
+tollgate-config = { path = "../../crates/tollgate-config" }
 tollgate-domain = { path = "../../crates/tollgate-domain" }
 tollgate-git = { path = "../../crates/tollgate-git" }
 tollgate-ipc = { path = "../../crates/tollgate-ipc" }

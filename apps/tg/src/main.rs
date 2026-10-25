@@ -281,10 +281,44 @@ enum EnvCommand {
 }
 #[derive(Subcommand)]
 enum ConfigCommand {
-    Validate,
-    Explain,
+    Validate(ConfigSource),
+    Explain(ConfigSource),
     Regenerate,
     Apply,
+}
+
+/// The configuration to validate or explain: the active repository's main checkout by default.
+#[derive(Args)]
+struct ConfigSource {
+    /// A config file anywhere (a worktree's `.tollgate/config.toml`, a draft).
+    #[arg(long, conflicts_with = "rev")]
+    file: Option<std::path::PathBuf>,
+    /// `.tollgate/config.toml` at a Git revision of the repository in the current directory
+    /// (a candidate's commit, a branch).
+    #[arg(long)]
+    rev: Option<String>,
+}
+
+/// A config file's text from `--file` or `--rev`, or None for the main checkout's.
+fn config_source_text(source: &ConfigSource) -> anyhow::Result<Option<String>> {
+    if let Some(path) = &source.file {
+        return Ok(Some(std::fs::read_to_string(path).map_err(|error| {
+            anyhow::anyhow!("{}: {error}", path.display())
+        })?));
+    }
+    let Some(rev) = &source.rev else {
+        return Ok(None);
+    };
+    let output = std::process::Command::new("git")
+        .args(["show", &format!("{rev}:.tollgate/config.toml")])
+        .output()?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git show {rev}:.tollgate/config.toml: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(Some(String::from_utf8(output.stdout)?))
 }
 #[derive(Subcommand)]
 enum SlotCommand {
@@ -1207,13 +1241,22 @@ async fn run(cli: Cli) -> anyhow::Result<u8> {
                 );
             }
         }
-        TopCommand::Config(ConfigCommand::Validate | ConfigCommand::Explain) => {
-            let repository = select_repository(&mut client, cli.repository).await?;
-            let candidate = client
-                .request(IpcCommand::ValidateConfiguration {
-                    repository_id: repository.state.id,
-                })
-                .await?;
+        TopCommand::Config(ConfigCommand::Validate(source) | ConfigCommand::Explain(source)) => {
+            // A file or revision is parsed here, as the service parses the main checkout's.
+            let candidate = match config_source_text(&source)? {
+                Some(text) => serde_json::to_value(
+                    tollgate_config::EffectiveConfig::parse(&text)
+                        .map_err(|error| anyhow::anyhow!("configuration invalid: {error}"))?,
+                )?,
+                None => {
+                    let repository = select_repository(&mut client, cli.repository).await?;
+                    client
+                        .request(IpcCommand::ValidateConfiguration {
+                            repository_id: repository.state.id,
+                        })
+                        .await?
+                }
+            };
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&candidate)?);
             } else {
@@ -3300,6 +3343,31 @@ fn classify_exit(error: &anyhow::Error) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_source_reads_a_file_or_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "version = 1\n").unwrap();
+        let file = ConfigSource {
+            file: Some(path.clone()),
+            rev: None,
+        };
+        assert_eq!(
+            config_source_text(&file).unwrap().as_deref(),
+            Some("version = 1\n")
+        );
+        let none = ConfigSource {
+            file: None,
+            rev: None,
+        };
+        assert_eq!(config_source_text(&none).unwrap(), None);
+        let missing = ConfigSource {
+            file: Some(dir.path().join("absent.toml")),
+            rev: None,
+        };
+        assert!(config_source_text(&missing).is_err());
+    }
 
     #[test]
     fn history_since_takes_rfc3339_or_an_age() {
