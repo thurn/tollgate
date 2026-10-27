@@ -660,6 +660,17 @@ With release-stage steps, `tg push` publishes `release` only when it is the test
 ### 10.8 Gate-aware Git conveniences
 
 - `tg update`: rebase the current clean, unqueued feature branch onto current gated `staging`, then verify it has one unique source commit and report its new OID. When the update fails while the same branch is still checked out at its old OID with no rebase in progress, it cancels its intent at once (`worktree-update-not-applied`, with the error); any other failure leaves the intent to startup recovery.
+
+  A pristine feature worktree has no source commit for `tg update` to rebase.
+  The command leaves its branch, index, files and saved stashes unchanged and
+  explains how to refresh it: from that clean worktree, run
+  `git merge --ff-only staging`. This only advances the feature branch to the
+  already gated tip; it does not move `staging` or submit a candidate. Preserve
+  any stash used to make the worktree clean, restore it with `git stash apply
+  <stash-id>`, and drop it only after checking the restored changes. If the
+  fast-forward refuses, inspect the branch and local commits rather than
+  resetting or forcing it. Once the task has one source commit, use `tg update`
+  and rerun the project's required checks after a successful rebase.
 - `tg worktree create`: create a feature branch/worktree from the gated tip under the repository's `.worktrees/` directory by default. The conventional `wt/` branch prefix is omitted from the directory name; explicit destinations remain supported by the service API.
 - `tg worktree remove`: apply queued/landed/dirty safety checks before removal.
 

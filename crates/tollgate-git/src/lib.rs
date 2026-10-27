@@ -1073,11 +1073,7 @@ impl GitRepository {
             ));
         }
         let old = self.resolve_oid("HEAD").await?;
-        let old_parent = self.commit_parent_oid(&old).await?;
         let master = self.integration_oid().await?;
-        if old_parent == master {
-            return Ok((old.clone(), old));
-        }
         let unique = text(
             self.git([
                 "rev-list",
@@ -1086,10 +1082,19 @@ impl GitRepository {
             ])
             .await?,
         )?;
+        if unique.trim() == "0" {
+            return Err(GitError::InvalidOutput(
+                "feature update found no source commit on this clean branch; tg update rebases exactly one source commit. To refresh this pristine worktree, run `git merge --ff-only staging` here; keep any saved stash until its changes are restored".into(),
+            ));
+        }
         if unique.trim() != "1" {
             return Err(GitError::InvalidOutput(
                 "feature update requires exactly one unique source commit".into(),
             ));
+        }
+        let old_parent = self.commit_parent_oid(&old).await?;
+        if old_parent == master {
+            return Ok((old.clone(), old));
         }
         let output = internal_command(&self.profile.executable, &self.worktree_root)
             .args([
@@ -2409,6 +2414,129 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8_lossy(&output.stdout).trim().into()
+    }
+
+    #[tokio::test]
+    async fn a_pristine_feature_update_explains_refresh_without_touching_work_or_stash() {
+        for advance in [false, true] {
+            let temporary = tempfile::tempdir().unwrap();
+            let repository = temporary.path().join("repository");
+            let feature = temporary.path().join("feature");
+            std::fs::create_dir(&repository).unwrap();
+            git(&repository, &["init", "-b", USER_BRANCH]);
+            std::fs::write(repository.join("plan.md"), "base\n").unwrap();
+            git(&repository, &["add", "."]);
+            git(&repository, &["commit", "-m", "base"]);
+            let adapter = GitRepository::discover(&repository).await.unwrap();
+            adapter
+                .initialize_integration_ref_from_master()
+                .await
+                .unwrap();
+            git(
+                &repository,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    "feature",
+                    feature.to_str().unwrap(),
+                    INTEGRATION_BRANCH,
+                ],
+            );
+            std::fs::write(feature.join("plan.md"), "saved local work\n").unwrap();
+            git(&feature, &["stash", "push", "-m", "owned work"]);
+            let stash = git(&feature, &["rev-parse", "refs/stash"]);
+            let old = git(&feature, &["rev-parse", "HEAD"]);
+            let tree = git(&feature, &["write-tree"]);
+            if advance {
+                // A peer promotes independently; the feature still has zero source commits.
+                std::fs::write(repository.join("peer.txt"), "peer\n").unwrap();
+                git(&repository, &["add", "peer.txt"]);
+                git(&repository, &["commit", "-m", "peer"]);
+                let peer = git(&repository, &["rev-parse", "HEAD"]);
+                git(&repository, &["update-ref", INTEGRATION_REF, &peer]);
+            }
+            let worktree = GitRepository::discover(&feature).await.unwrap();
+            let error = worktree
+                .update_one_commit_feature()
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("no source commit"), "{error}");
+            assert!(error.contains("git merge --ff-only staging"), "{error}");
+            assert!(error.contains("keep any saved stash"), "{error}");
+            assert_eq!(git(&feature, &["rev-parse", "HEAD"]), old);
+            assert_eq!(git(&feature, &["write-tree"]), tree);
+            assert_eq!(git(&feature, &["branch", "--show-current"]), "feature");
+            assert_eq!(git(&feature, &["rev-parse", "refs/stash"]), stash);
+            assert_eq!(git(&feature, &["status", "--porcelain"]), "");
+            assert!(!worktree.rebase_in_progress().await.unwrap());
+            // Execute the exact advised command and then restore without deleting the stash.
+            git(&feature, &["merge", "--ff-only", INTEGRATION_BRANCH]);
+            assert_eq!(
+                git(&feature, &["rev-parse", "HEAD"]),
+                git(&repository, &["rev-parse", INTEGRATION_BRANCH])
+            );
+            git(&feature, &["stash", "apply", &stash]);
+            assert_eq!(
+                std::fs::read_to_string(feature.join("plan.md")).unwrap(),
+                "saved local work\n"
+            );
+            assert_eq!(git(&feature, &["rev-parse", "refs/stash"]), stash);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_one_commit_feature_update_still_rebases_onto_staging() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("repository");
+        let feature = temporary.path().join("feature");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "-b", USER_BRANCH]);
+        std::fs::write(repository.join("base.txt"), "base\n").unwrap();
+        git(&repository, &["add", "."]);
+        git(&repository, &["commit", "-m", "base"]);
+        let adapter = GitRepository::discover(&repository).await.unwrap();
+        adapter
+            .initialize_integration_ref_from_master()
+            .await
+            .unwrap();
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                feature.to_str().unwrap(),
+                INTEGRATION_BRANCH,
+            ],
+        );
+        std::fs::write(feature.join("task.txt"), "task\n").unwrap();
+        git(&feature, &["add", "task.txt"]);
+        git(&feature, &["commit", "-m", "task"]);
+        let worktree = GitRepository::discover(&feature).await.unwrap();
+        let (old, current) = worktree.update_one_commit_feature().await.unwrap();
+        assert_eq!(old, current);
+        std::fs::write(repository.join("peer.txt"), "peer\n").unwrap();
+        git(&repository, &["add", "peer.txt"]);
+        git(&repository, &["commit", "-m", "peer"]);
+        let peer = git(&repository, &["rev-parse", "HEAD"]);
+        git(&repository, &["update-ref", INTEGRATION_REF, &peer]);
+        let (before, updated) = worktree.update_one_commit_feature().await.unwrap();
+        assert_eq!(before, old);
+        assert_ne!(before, updated);
+        assert_eq!(git(&feature, &["rev-parse", "HEAD^"]), peer);
+        assert_eq!(
+            git(&feature, &["rev-list", "--count", "staging..HEAD"]),
+            "1"
+        );
+        assert_eq!(
+            std::fs::read_to_string(feature.join("task.txt")).unwrap(),
+            "task\n"
+        );
+        assert!(feature.join("peer.txt").is_file());
+        assert_eq!(git(&feature, &["status", "--porcelain"]), "");
     }
 
     #[tokio::test]
